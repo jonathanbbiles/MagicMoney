@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+# Block committing likely Alpaca secrets
+if git diff --cached -G'APCA_API_SECRET_KEY|AK[A-Z0-9]{10,}' --name-only | grep -q .; then
+  echo "⛔ Looks like Alpaca secrets may be in this commit. Remove them before committing."
+  exit 1
+fi
+exit 0

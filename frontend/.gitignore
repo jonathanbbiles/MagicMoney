@@ -1,0 +1,15 @@
+node_modules/
+
+.expo/
+
+.expo-shared/
+
+.env
+
+npm-debug.log*
+
+.DS_Store
+
+.env
+.env.*
+!.env.example
