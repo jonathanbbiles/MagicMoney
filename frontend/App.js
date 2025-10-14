@@ -22,7 +22,7 @@ const EX = Constants?.expoConfig?.extra || Constants?.manifest?.extra || {};
 const ALPACA_KEY = 'AKANN0IP04IH45Z6FG3L';
 const ALPACA_SECRET = 'qvaKRqP9Q3XMVMEYqVnq2BEgPGhQQQfWg1JT7bWV';
 // Force LIVE trading endpoint, ignoring EX/APCA overrides
-const ALPACA_BASE_URL = 'https://api.alpaca.markets/v2';
+const ALPACA_BASE_URL = EX.APCA_API_BASE || 'https://api.alpaca.markets/v2';
 
 const DATA_ROOT_CRYPTO = 'https://data.alpaca.markets/v1beta3/crypto';
 // IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
@@ -207,7 +207,7 @@ async function __takeToken() {
   return __takeToken();
 }
 
-async function f(url, opts = {}, timeoutMs = 8000, retries = 2) {
+async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
   let lastErr = null;
   for (let i = 0; i <= retries; i++) {
     await __takeToken();
@@ -1295,14 +1295,17 @@ async function getAccountSummaryRaw() {
 
   const equity = num(a.equity ?? a.portfolio_value);
 
-  // Pull all buckets explicitly
-  const cryptoBP = num(a.crypto_buying_power ?? a.non_marginable_buying_power);
+  // Buckets from Alpaca
   const stockBP  = num(a.buying_power);
+  const cryptoBP = num(a.crypto_buying_power);
+  const nmbp     = num(a.non_marginable_buying_power);
   const cash     = num(a.cash);
+  const dtbp     = num(a.daytrade_buying_power);
 
-  // Prefer crypto BP for our crypto-first app; fall back to cash, then stock BP
-  const buyingPower =
+  // Crypto-first display for a crypto-focused app
+  const buyingPowerDisplay =
     Number.isFinite(cryptoBP) ? cryptoBP :
+    Number.isFinite(nmbp)     ? nmbp     :
     Number.isFinite(cash)     ? cash     :
     stockBP;
 
@@ -1316,8 +1319,14 @@ async function getAccountSummaryRaw() {
   const daytradeCount = Number.isFinite(+a.daytrade_count) ? +a.daytrade_count : null;
 
   return {
-    equity, buyingPower, changeUsd, changePct, patternDayTrader, daytradeCount,
-    cryptoBuyingPower: cryptoBP, stockBuyingPower: stockBP, cash
+    equity,
+    buyingPower: buyingPowerDisplay,
+    changeUsd, changePct,
+    patternDayTrader, daytradeCount,
+    cryptoBuyingPower: (Number.isFinite(cryptoBP) ? cryptoBP : (Number.isFinite(nmbp) ? nmbp : cash)),
+    stockBuyingPower: stockBP,
+    daytradeBuyingPower: dtbp,
+    cash
   };
 }
 function capNotional(symbol, proposed, equity) {
@@ -1476,8 +1485,11 @@ const PortfolioChangeChart = ({ acctSummary }) => {
         const rawPct = (hist.profit_loss_pct || hist.pnl_pct || []).map((x) => +x);
         let seeded = [];
         if (rawPct.length && ts.length) {
-          const scale = rawPct.some((v) => Math.abs(v) <= 1.5) ? 100 : 1;
-          seeded = rawPct.map((v, i) => ({ t: ts[i] || (Date.now() - (rawPct.length - i) * 300000), pct: v * scale }));
+          // Alpaca returns decimals (e.g., 0.0048 for 0.48%). Convert to percent.
+          seeded = rawPct.map((v, i) => ({
+            t: ts[i] || (Date.now() - (rawPct.length - i) * 300000),
+            pct: v * 100,
+          }));
         } else if (Array.isArray(hist.equity)) {
           const eq = hist.equity.map((x) => +x).filter(Number.isFinite);
           const base = Number.isFinite(+hist.base_value) ? +hist.base_value : (eq[0] || 1);
@@ -1570,8 +1582,7 @@ const DailyPortfolioValueChart = () => {
     return (
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Portfolio Value (Daily)</Text>
-        <View style={{ height: 100, borderRadius: 8, backgroundColor: '#e0f8ff' }} />
-        <Text style={styles.smallNote}>Waiting for account data…</Text>
+        <Text style={styles.smallNote}>No history yet from /account/portfolio/history (1‑D).</Text>
       </View>
     );
   }
@@ -1787,8 +1798,16 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
 
 async function marketSell(symbol, qty) {
   try { await cancelOpenOrdersForSymbol(symbol, 'sell'); } catch {}
+  // Re-check availability right before selling to avoid 403s
+  let latest = null;
+  try { latest = await getPositionInfo(symbol); } catch {}
+  const usableQty = Number(latest?.available ?? qty ?? 0);
+  if (!(usableQty > 0)) {
+    logTradeAction('tp_limit_error', symbol, { error: 'SELL mkt skipped — no available qty' });
+    return null;
+  }
   const tif = isStock(symbol) ? 'day' : 'gtc';
-  const mkt = { symbol, qty, side: 'sell', type: 'market', time_in_force: tif };
+  const mkt = { symbol, qty: usableQty, side: 'sell', type: 'market', time_in_force: tif };
   try {
     const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(mkt) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
@@ -3067,9 +3086,12 @@ export default function App() {
             <View style={styles.inlineBP}>
               <Text style={styles.bpLabel}>Buying Power</Text>
               <Text style={styles.bpValue}>
-                {fmtUSD(bp)} {isUpdatingAcct && <Text style={styles.badgeUpdating}>↻</Text>}
+                {fmtUSD(acctSummary.buyingPower)} <Text style={styles.subtle}>crypto</Text>
                 <Text style={styles.dot}> • </Text>
-                <Text style={styles.dayBadge}>Day {fmtPct(chPct)}</Text>
+                {fmtUSD(acctSummary.stockBuyingPower)} <Text style={styles.subtle}>stk</Text>
+                {isUpdatingAcct && <Text style={styles.badgeUpdating}>↻</Text>}
+                <Text style={styles.dot}> • </Text>
+                <Text style={styles.dayBadge}>Day {fmtPct(acctSummary.dailyChangePct)}</Text>
               </Text>
             </View>
           </View>
