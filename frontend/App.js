@@ -15,7 +15,7 @@ import {
 import Constants from 'expo-constants';
 
 /* ──────────────────────────────── 1) VERSION / CONFIG ──────────────────────────────── */
-const VERSION = 'v1.15.0';
+const VERSION = 'v1';
 const EX = Constants?.expoConfig?.extra || Constants?.manifest?.extra || {};
 
 // (per user request: do not change keys)
@@ -2550,7 +2550,7 @@ export default function App() {
         <View style={styles.header}>
           <View style={styles.headerTopRow}>
             <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
-            <Text style={[styles.appTitle, darkMode && styles.titleDark]}>Bullish or Bust</Text>
+            <Text style={[styles.appTitle, darkMode && styles.titleDark]}>Magic $$</Text>
             <Text style={styles.versionTag}>{VERSION}</Text>
             <TouchableOpacity onPress={() => setShowSettings((v) => !v)} style={[styles.pillToggle, { marginLeft: 8 }]}>
               <Text style={styles.pillText}>⚙️ Settings</Text>
