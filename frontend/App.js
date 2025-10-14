@@ -55,6 +55,7 @@ const MIN_PRICE_FOR_TICK_SANE_USD = 0.001; // keep low, but still skip micro-pri
 const DUST_FLATTEN_MAX_USD = 0.75;
 const DUST_SWEEP_MINUTES = 12;
 const MIN_BID_SIZE_LOOSE = 1;
+const MIN_BID_NOTIONAL_LOOSE_USD = 5; // gate by ~$ value, not raw size
 
 const MAX_EQUITIES = 400;
 const MAX_CRYPTOS = 400;
@@ -197,7 +198,7 @@ async function __takeToken() {
 }
 
 async function f(url, opts = {}, timeoutMs = 8000, retries = 2) {
-  let lastErr;
+  let lastErr = null;
   for (let i = 0; i <= retries; i++) {
     await __takeToken();
     const ac = new AbortController();
@@ -218,8 +219,7 @@ async function f(url, opts = {}, timeoutMs = 8000, retries = 2) {
       await sleep(300 * Math.pow(2, i) + Math.floor(Math.random() * 250));
     }
   }
-  if (lastErr) throw lastErr;
-  return fetch(url, opts);
+  throw lastErr || new Error('fetch failed');
 }
 
 /* ─────────────────────────── 5) TIME / PARSE / FORMATTING ─────────────────────────── */
@@ -711,6 +711,59 @@ async function getCryptoBars1m(symbol, limit = 6) {
   return [];
 }
 
+async function getCryptoBars1mBatch(symbols = [], limit = 6) {
+  const uniqSyms = Array.from(new Set(symbols.filter(Boolean)));
+  if (!uniqSyms.length) return new Map();
+  const dsymList = uniqSyms.map((s) => toDataSymbol(s));
+  const out = new Map();
+  const now = Date.now();
+
+  const missing = [];
+  for (const dsym of dsymList) {
+    const cached = barsCache.get(dsym);
+    if (cached && (now - cached.ts) < barsCacheTTL) {
+      out.set(dsym.replace('/', ''), cached.bars.slice(0, limit));
+    } else {
+      missing.push(dsym);
+    }
+  }
+  if (!missing.length) return out;
+
+  for (const loc of DATA_LOCATIONS) {
+    try {
+      const sp = new URLSearchParams({ timeframe: '1Min', limit: String(limit), symbols: missing.join(',') });
+      const url = `${DATA_ROOT_CRYPTO}/${loc}/bars?${sp.toString()}`;
+      const r = await f(url, { headers: HEADERS });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        logTradeAction('quote_http_error', 'BARS', { status: r.status, loc, body: body?.slice?.(0, 120) });
+        continue;
+      }
+      const j = await r.json().catch(() => null);
+      const raw = j?.bars || {};
+      for (const dsym of missing) {
+        const arr = raw[dsym];
+        if (Array.isArray(arr) && arr.length) {
+          const bars = arr.map((b) => ({
+            open: Number(b.o ?? b.open),
+            high: Number(b.h ?? b.high),
+            low: Number(b.l ?? b.low),
+            close: Number(b.c ?? b.close),
+            vol: Number(b.v ?? b.volume ?? 0),
+            tms: parseTsMs(b.t),
+          })).filter((x) => Number.isFinite(x.close) && x.close > 0);
+          barsCache.set(dsym, { ts: now, bars: bars.slice() });
+          out.set(dsym.replace('/', ''), bars.slice(0, limit));
+        }
+      }
+      break;
+    } catch (e) {
+      logTradeAction('quote_http_error', 'BARS', { status: 'exception', loc, body: e?.message || '' });
+    }
+  }
+  return out;
+}
+
 /* ──────────────────────────────── 13) STOCKS DATA API ─────────────────────────────── */
 async function stocksLatestQuotesBatch(symbols = []) {
   if (!symbols.length) return new Map();
@@ -1185,9 +1238,26 @@ const getOpenOrders = async () => {
     return Array.isArray(arr) ? arr : [];
   } catch { return []; }
 };
+let __openOrdersCache = { ts: 0, items: [] };
+async function getOpenOrdersCached(ttlMs = 2000) {
+  const now = Date.now();
+  if (now - __openOrdersCache.ts < ttlMs) return __openOrdersCache.items.slice();
+  const items = await getOpenOrders();
+  __openOrdersCache = { ts: now, items };
+  return items.slice();
+}
+
+let __positionsCache = { ts: 0, items: [] };
+async function getAllPositionsCached(ttlMs = 2000) {
+  const now = Date.now();
+  if (now - __positionsCache.ts < ttlMs) return __positionsCache.items.slice();
+  const items = await getAllPositions();
+  __positionsCache = { ts: now, items };
+  return items.slice();
+}
 const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
   try {
-    const open = await getOpenOrders();
+    const open = await getOpenOrdersCached();
     const targets = (open || []).filter(
       (o) => o.symbol === symbol && (!side || (o.side || '').toLowerCase() === String(side).toLowerCase())
     );
@@ -1196,12 +1266,14 @@ const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
         f(`${ALPACA_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null)
       )
     );
+    __openOrdersCache = { ts: 0, items: [] };
   } catch {}
 };
 const cancelAllOrders = async () => {
   try {
-    const orders = await getOpenOrders();
+    const orders = await getOpenOrdersCached();
     await Promise.all((orders || []).map((o) => f(`${ALPACA_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null)));
+    __openOrdersCache = { ts: 0, items: [] };
   } catch {}
 };
 
@@ -1234,7 +1306,7 @@ function capNotional(symbol, proposed, equity) {
 }
 async function cleanupStaleBuyOrders(maxAgeSec = 30) {
   try {
-    const [open, positions] = await Promise.all([getOpenOrders(), getAllPositions()]);
+    const [open, positions] = await Promise.all([getOpenOrdersCached(), getAllPositionsCached()]);
     const held = new Set((positions || []).map((p) => p.symbol));
     const now = Date.now();
     const tooOld = (o) => {
@@ -1250,6 +1322,9 @@ async function cleanupStaleBuyOrders(maxAgeSec = 30) {
         await f(`${ALPACA_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null);
       })
     );
+    if (stale.length) {
+      __openOrdersCache = { ts: 0, items: [] };
+    }
   } catch {}
 }
 
@@ -1596,6 +1671,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
     if (needReplace && (nowTs - lastReplaceAt) > 1800) {
       if (lastOrderId) {
         try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
+        __openOrdersCache = { ts: 0, items: [] };
       }
       const order = {
         symbol, qty, side: 'buy', type: 'limit', time_in_force: 'gtc',
@@ -1607,6 +1683,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
         if (res.ok && data.id) {
           lastOrderId = data.id; placedLimit = join; lastReplaceAt = nowTs;
           logTradeAction('buy_camped', symbol, { limit: order.limit_price });
+          __openOrdersCache = { ts: 0, items: [] };
         }
       } catch (e) {
         logTradeAction('quote_exception', symbol, { error: e.message });
@@ -1617,10 +1694,13 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
     if (pos && pos.qty > 0) {
       if (lastOrderId) {
         try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
+        __openOrdersCache = { ts: 0, items: [] };
       }
       logTradeAction('buy_success', symbol, {
         qty: pos.qty, limit: placedLimit != null ? formatLimit(placedLimit) : placedLimit,
       });
+      __positionsCache = { ts: 0, items: [] };
+      __openOrdersCache = { ts: 0, items: [] };
       return { filled: true, entry: pos.basis ?? placedLimit, qty: pos.qty, liquidity: 'maker' };
     }
     await sleep(1200);
@@ -1628,6 +1708,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
 
   if (lastOrderId) {
     try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
+    __openOrdersCache = { ts: 0, items: [] };
     logTradeAction('buy_unfilled_canceled', symbol, {});
   }
 
@@ -1651,6 +1732,8 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         if (res.ok && data.id) {
           logTradeAction('buy_success', symbol, { qty: mQty, limit: 'mkt' });
+          __positionsCache = { ts: 0, items: [] };
+          __openOrdersCache = { ts: 0, items: [] };
           return { filled: true, entry: q.ask, qty: mQty, liquidity: 'taker' };
         } else {
           logTradeAction('quote_exception', symbol, { error: `BUY mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 80) || ''}` });
@@ -1670,7 +1753,11 @@ async function marketSell(symbol, qty) {
   try {
     const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(mkt) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
-    if (res.ok && data.id) return data;
+    if (res.ok && data.id) {
+      __positionsCache = { ts: 0, items: [] };
+      __openOrdersCache = { ts: 0, items: [] };
+      return data;
+    }
     logTradeAction('tp_limit_error', symbol, { error: `SELL mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 120) || ''}` });
     return null;
   } catch (e) {
@@ -1707,8 +1794,7 @@ const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
   const slipEw = (symStats[symbol]?.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[SETTINGS.riskLevel] ?? 1));
   const effStopBps = Math.max(
     SETTINGS.stopLossBps,
-    Math.floor((spreadBpsNow * 0.5) + SETTINGS.feeBpsMaker + SETTINGS.feeBpsTaker + 6),
-    Math.min(SETTINGS.stopLossBps, Math.ceil(slipEw + spreadBpsNow))
+    Math.floor((spreadBpsNow * 0.5) + SETTINGS.feeBpsMaker + SETTINGS.feeBpsTaker + 6)
   );
 
   if (!state.stopPx) {
@@ -1792,9 +1878,12 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
         const nearFeeFloor = q.bid >= (feeFloor - (2 * tick)); // prefer scratch
         if (net >= 0 || (nearFeeFloor && net >= -Math.abs(SETTINGS.netMinProfitUSD)) || net >= -Math.abs(SETTINGS.maxTimeLossUSD)) {
           try {
-            const open = await getOpenOrders();
+            const open = await getOpenOrdersCached();
             const ex = open.find((o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol);
-            if (ex) { await f(`${ALPACA_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null); }
+            if (ex) {
+              await f(`${ALPACA_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null);
+              __openOrdersCache = { ts: 0, items: [] };
+            }
           } catch {}
           const mkt = await marketSell(symbol, qty);
           if (mkt) {
@@ -1839,9 +1928,12 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
         const timedForce = ageSec >= Math.max(2, SETTINGS.touchFlipTimeoutSec) && okByFee;
         if ((memo.count >= SETTINGS.touchTicksRequired && okProfit) || timedForce) {
           try {
-            const open = await getOpenOrders();
+            const open = await getOpenOrdersCached();
             const ex = open.find((o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol);
-            if (ex) { await f(`${ALPACA_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null); }
+            if (ex) {
+              await f(`${ALPACA_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null);
+              __openOrdersCache = { ts: 0, items: [] };
+            }
           } catch {}
           const mkt = await marketSell(symbol, qty);
           if (mkt) {
@@ -2041,7 +2133,7 @@ export default function App() {
         portfolioValue: a.equity, buyingPower: a.buyingPower, dailyChangeUsd: a.changeUsd, dailyChangePct: a.changePct,
         patternDayTrader: a.patternDayTrader, daytradeCount: a.daytradeCount, updatedAt: new Date().toISOString()
       });
-      if (shouldHaltTrading(a.changePct, a.equity)) {
+      if (shouldHaltTrading(a.changePct)) {
         TRADING_HALTED = true;
         logTradeAction('daily_halt', 'SYSTEM', { reason: HALT_REASON });
         showNotification(`⛔ Trading halted: ${HALT_REASON}`);
@@ -2095,12 +2187,14 @@ export default function App() {
     }
   }
 
-  async function computeEntrySignal(asset, d, riskLvl, preQuoteMap = null) {
+  async function computeEntrySignal(asset, d, riskLvl, preQuoteMap = null, preBarsMap = null) {
     let bars1 = [];
     if (SETTINGS.enforceMomentum) {
-      try {
+      if (preBarsMap && preBarsMap.has(asset.symbol)) {
+        bars1 = preBarsMap.get(asset.symbol) || [];
+      } else {
         bars1 = await getCryptoBars1m(asset.symbol, 6);
-      } catch {}
+      }
     }
     const closes = Array.isArray(bars1) ? bars1.map((b) => b.close) : [];
 
@@ -2115,12 +2209,11 @@ export default function App() {
       return { entryReady: false, why: 'no_quote', meta: { freshSec } };
     }
 
-    if (q.bs != null && Number.isFinite(q.bs) && q.bs < MIN_BID_SIZE_LOOSE) {
-      return { entryReady: false, why: 'illiquid', meta: { bs: q.bs, min: MIN_BID_SIZE_LOOSE } };
+    if (q.bs != null && Number.isFinite(q.bs) && (q.bs * q.bid) < MIN_BID_NOTIONAL_LOOSE_USD) {
+      return { entryReady: false, why: 'illiquid', meta: { bsUSD: q.bs * q.bid, minUSD: MIN_BID_NOTIONAL_LOOSE_USD } };
     }
 
     const mid = 0.5 * (q.bid + q.ask);
-
     if (BLACKLIST.has(asset.symbol)) return { entryReady: false, why: 'blacklist', meta: {} };
     if (mid < eff(asset.symbol, 'minPriceUsd')) return { entryReady: false, why: 'tiny_price', meta: { mid } };
 
@@ -2141,13 +2234,13 @@ export default function App() {
     const slopeUp = ema5.length >= 2 ? ema5.at(-1) > ema5.at(-2) : true;
     const v0 = closes.length >= 2 ? closes.at(-1) - closes.at(-2) : 0;
     const breakout = closes.length >= 6 ? closes.at(-1) >= Math.max(...closes.slice(-6, -1)) * 1.001 : true;
-    const accelOk = v0 >= 0 || slopeUp || breakout;
-    if (SETTINGS.enforceMomentum && !accelOk) {
+    if (SETTINGS.enforceMomentum && !(v0 >= 0 || slopeUp || breakout)) {
       return { entryReady: false, why: 'nomomo', meta: { v0, emaLast: ema5.at(-1), emaPrev: ema5.at(-2) } };
     }
 
-    const sst = symStats[asset.symbol] || {};
-    const slipEw = Number.isFinite(sst.slipEwmaBps) ? sst.slipEwmaBps : (SETTINGS.slipBpsByRisk?.[riskLvl] ?? 1);
+    (symStats[asset.symbol] ||= {}).spreadEwmaBps = ewma(symStats[asset.symbol].spreadEwmaBps, spreadBps, 0.2);
+    const slipEw = symStats[asset.symbol]?.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[riskLvl] ?? 1);
+
     const needBps = Math.max(
       requiredProfitBpsForSymbol(asset.symbol, riskLvl),
       exitFloorBps(asset.symbol) + 0.5 + slipEw,
@@ -2156,12 +2249,11 @@ export default function App() {
     const spreadEw = symStats[asset.symbol]?.spreadEwmaBps ?? spreadBps;
     const needBpsCapped = Math.min(needBps, Math.max(exitFloorBps(asset.symbol) + 1, Math.round((spreadEw || 0) * 1.6)));
     const tpBase = q.bid * (1 + needBpsCapped / 10000);
-    const ok = tpBase > q.bid * 1.00005;
-    if (!ok) {
+    if (!(tpBase > q.bid * 1.00005)) {
       return { entryReady: false, why: 'edge_negative', meta: { tpBps: needBpsCapped, bid: q.bid, tp: tpBase } };
     }
 
-    (symStats[asset.symbol] ||= {}).spreadEwmaBps = ewma(symStats[asset.symbol].spreadEwmaBps, spreadBps, 0.2);
+    const sst = symStats[asset.symbol] || {};
     const drag_g = Math.max(1e-6, sst.drag_g ?? 8);
     const runway = v0 > 0 ? (v0 * v0) / (2 * drag_g) : 0;
 
@@ -2178,7 +2270,7 @@ export default function App() {
     await cleanupStaleBuyOrders(30);
 
     try {
-      const allPos = await getAllPositions();
+      const allPos = await getAllPositionsCached();
       const nonStableOpen = (allPos || []).filter((p) => Number(p.qty) > 0 && Number(p.market_value || p.marketValue || 0) > 1).length;
       const cap = concurrencyCapBySpread(globalSpreadAvgRef.current);
       if (nonStableOpen >= cap) {
@@ -2193,7 +2285,7 @@ export default function App() {
       return false;
     }
 
-    const sig = sigPre || (await computeEntrySignal({ symbol, cc: ccSymbol }, d, SETTINGS.riskLevel, preQuoteMap));
+    const sig = sigPre || (await computeEntrySignal({ symbol, cc: ccSymbol }, d, SETTINGS.riskLevel, preQuoteMap, null));
     if (!sig.entryReady) return false;
 
     let equity = acctSummary.portfolioValue, buyingPower = acctSummary.buyingPower;
@@ -2263,7 +2355,7 @@ export default function App() {
     let timer = null;
     const run = async () => {
       try {
-        const [positions, openOrders] = await Promise.all([getAllPositions(), getOpenOrders()]);
+        const [positions, openOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached()]);
         const posBySym = new Map((positions || []).map((p) => [p.symbol, p]));
         const openSellBySym = new Map(
           (openOrders || [])
@@ -2305,7 +2397,7 @@ export default function App() {
     let stopped = false;
     const sweep = async () => {
       try {
-        const [positions, openOrders] = await Promise.all([getAllPositions(), getOpenOrders()]);
+        const [positions, openOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached()]);
         const openSellBySym = new Map(
           (openOrders || [])
             .filter((o) => (o.side || '').toLowerCase() === 'sell')
@@ -2320,7 +2412,11 @@ export default function App() {
             const mkt = { symbol: sym, qty: avail, side: 'sell', type: 'market', time_in_force: 'gtc' };
             try {
               const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(mkt) });
-              if (res.ok) logTradeAction('dust_flattened', sym, { usd: mv });
+              if (res.ok) {
+                __positionsCache = { ts: 0, items: [] };
+                __openOrdersCache = { ts: 0, items: [] };
+                logTradeAction('dust_flattened', sym, { usd: mv });
+              }
             } catch {}
           }
         }
@@ -2415,7 +2511,7 @@ export default function App() {
     try {
       await getAccountSummaryThrottled();
 
-      const [positions, allOpenOrders] = await Promise.all([getAllPositions(), getOpenOrders()]);
+      const [positions, allOpenOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached()]);
       const posBySym = new Map((positions || []).map((p) => [p.symbol, p]));
       const openCount = (positions || []).filter((p) => {
         const sym = p.symbol;
@@ -2431,6 +2527,8 @@ export default function App() {
       const cStart = cIdx * SETTINGS.stockPageSize;
       const cryptoSlice = cryptosAll.slice(cStart, Math.min(cStart + SETTINGS.stockPageSize, cryptosAll.length));
       cryptoPageRef.current += 1;
+
+      const barsMap = SETTINGS.enforceMomentum ? await getCryptoBars1mBatch(cryptoSlice.map(t => t.symbol), 6) : null;
 
       setOpenMeta({ positions: openCount, orders: (allOpenOrders || []).length, allowed: cryptosAll.length, universe: cryptosAll.length });
       logTradeAction('scan_start', 'STATIC', { batch: cryptoSlice.length });
@@ -2461,7 +2559,7 @@ export default function App() {
           const isHolding = !!(posNow && Number(posNow.qty) > 0);
           tradeStateRef.current[asset.symbol] = { ...prevState, wasHolding: isHolding };
 
-          const sig = await computeEntrySignal(asset, d, SETTINGS.riskLevel, batchMap);
+          const sig = await computeEntrySignal(asset, d, SETTINGS.riskLevel, batchMap, barsMap);
           token.entryReady = sig.entryReady;
 
           if (sig?.quote && sig.quote.bid > 0 && sig.quote.ask > 0) {
