@@ -1284,9 +1284,17 @@ async function getAccountSummaryRaw() {
   const num = (x) => { const n = parseFloat(x); return Number.isFinite(n) ? n : NaN; };
 
   const equity = num(a.equity ?? a.portfolio_value);
-  const candidates = [num(a.buying_power), num(a.crypto_buying_power), num(a.non_marginable_buying_power), num(a.cash)];
-  const firstPositive = candidates.find((v) => Number.isFinite(v) && v > 0);
-  const buyingPower = Number.isFinite(firstPositive) ? firstPositive : candidates.find(Number.isFinite) ?? NaN;
+
+  // Pull all buckets explicitly
+  const cryptoBP = num(a.crypto_buying_power ?? a.non_marginable_buying_power);
+  const stockBP  = num(a.buying_power);
+  const cash     = num(a.cash);
+
+  // Prefer crypto BP for our crypto-first app; fall back to cash, then stock BP
+  const buyingPower =
+    Number.isFinite(cryptoBP) ? cryptoBP :
+    Number.isFinite(cash)     ? cash     :
+    stockBP;
 
   const prevClose = num(a.equity_previous_close);
   const lastEq = num(a.last_equity);
@@ -1297,7 +1305,10 @@ async function getAccountSummaryRaw() {
   const patternDayTrader = !!a.pattern_day_trader;
   const daytradeCount = Number.isFinite(+a.daytrade_count) ? +a.daytrade_count : null;
 
-  return { equity, buyingPower, changeUsd, changePct, patternDayTrader, daytradeCount };
+  return {
+    equity, buyingPower, changeUsd, changePct, patternDayTrader, daytradeCount,
+    cryptoBuyingPower: cryptoBP, stockBuyingPower: stockBP, cash
+  };
 }
 function capNotional(symbol, proposed, equity) {
   const hardCap = SETTINGS.absMaxNotionalUSD;
@@ -1602,7 +1613,7 @@ async function fetchAssetMeta(symbol) {
     return a;
   } catch { return null; }
 }
-async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
+async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usableBP = null) {
   await cancelOpenOrdersForSymbol(symbol, 'buy');
   const meta = await fetchAssetMeta(symbol);
   const rawTick = meta?._price_inc ?? (isStock(symbol) ? 0.01 : 1e-5);
@@ -1652,6 +1663,17 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
       targetLimit = Math.min(targetLimit, Math.max(TICK, askNow - TICK));
     }
     const join = targetLimit;
+    // Debug (optional): comment out if noisy
+    // console.log('JOIN', symbol, { join, qty, usableBP });
+
+    // Ensure we never exceed usable non‑marginable/crypto BP
+    if (usableBP && join > 0) {
+      const feeFracMaker = (SETTINGS.feeBpsMaker || 15) / 10000;
+      // Max qty allowed at this limit including buy fees
+      const maxQty = Math.floor(((usableBP / (join * (1 + feeFracMaker))) / QINC) + 1e-9) * QINC;
+      qty = quantizeQty(Math.min(qty, maxQty));
+      if (!(qty > 0)) return { filled: false };
+    }
 
     const notionalPx = Number.isFinite(bidNow) && bidNow > 0
       ? bidNow
@@ -1720,6 +1742,13 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
         mQty = Math.floor(mQty);
       }
       mQty = quantizeQty(mQty);
+      if (usableBP && q && q.ask > 0) {
+        const feeFracTaker = (SETTINGS.feeBpsTaker || 25) / 10000;
+        const pxRef = q.ask;
+        const maxQty = Math.floor(((usableBP / (pxRef * (1 + feeFracTaker))) / QINC) + 1e-9) * QINC;
+        mQty = quantizeQty(Math.min(mQty, maxQty));
+        if (!(mQty > 0)) return { filled: false };
+      }
       if (!(mQty > 0)) return { filled: false };
       if (meta && meta._min_notional > 0) {
         const pxRef = Number.isFinite(q.bid) && q.bid > 0 ? q.bid : q.ask;
@@ -2037,7 +2066,8 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [acctSummary, setAcctSummary] = useState({
     portfolioValue: null, buyingPower: null, dailyChangeUsd: null, dailyChangePct: null,
-    patternDayTrader: null, daytradeCount: null, updatedAt: null
+    patternDayTrader: null, daytradeCount: null, updatedAt: null,
+    cryptoBuyingPower: null, stockBuyingPower: null, cash: null
   });
   const [pnlSnap, setPnlSnap] = useState({ last7Sum: null, last7UpDays: null, last7DownDays: null, last30Sum: null, fees30: null, fillsCount30: null, updatedAt: null, error: null });
 
@@ -2131,7 +2161,8 @@ export default function App() {
       const a = await getAccountSummaryRaw();
       setAcctSummary({
         portfolioValue: a.equity, buyingPower: a.buyingPower, dailyChangeUsd: a.changeUsd, dailyChangePct: a.changePct,
-        patternDayTrader: a.patternDayTrader, daytradeCount: a.daytradeCount, updatedAt: new Date().toISOString()
+        patternDayTrader: a.patternDayTrader, daytradeCount: a.daytradeCount, updatedAt: new Date().toISOString(),
+        cryptoBuyingPower: a.cryptoBuyingPower, stockBuyingPower: a.stockBuyingPower, cash: a.cash
       });
       if (shouldHaltTrading(a.changePct)) {
         TRADING_HALTED = true;
@@ -2288,14 +2319,21 @@ export default function App() {
     const sig = sigPre || (await computeEntrySignal({ symbol, cc: ccSymbol }, d, SETTINGS.riskLevel, preQuoteMap, null));
     if (!sig.entryReady) return false;
 
-    let equity = acctSummary.portfolioValue, buyingPower = acctSummary.buyingPower;
+    let equity = acctSummary.portfolioValue;
+    let buyingPower = isCrypto(symbol)
+      ? (acctSummary.cryptoBuyingPower ?? acctSummary.buyingPower)
+      : (acctSummary.stockBuyingPower  ?? acctSummary.buyingPower);
     if (!Number.isFinite(equity) || !Number.isFinite(buyingPower)) {
       try {
         const a = await getAccountSummaryRaw();
-        equity = a.equity; buyingPower = a.buyingPower;
+        equity = a.equity;
+        buyingPower = isCrypto(symbol)
+          ? (a.cryptoBuyingPower ?? a.buyingPower)
+          : (a.stockBuyingPower  ?? a.buyingPower);
         setAcctSummary((s) => ({
           portfolioValue: a.equity, buyingPower: a.buyingPower, dailyChangeUsd: a.changeUsd, dailyChangePct: a.changePct,
-          patternDayTrader: a.patternDayTrader, daytradeCount: a.daytradeCount, updatedAt: new Date().toISOString()
+          patternDayTrader: a.patternDayTrader, daytradeCount: a.daytradeCount, updatedAt: new Date().toISOString(),
+          cryptoBuyingPower: a.cryptoBuyingPower, stockBuyingPower: a.stockBuyingPower, cash: a.cash
         }));
       } catch {}
     }
@@ -2313,13 +2351,20 @@ export default function App() {
     }
 
     if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig.quote.bid;
-    let qty = +(notional / entryPx).toFixed(6);
+
+    // Size using ask (or join) + fees + a tiny cushion
+    const pxForSizing = (sig?.quote?.ask ?? sig?.quote?.bid);
+    const feeFrac = (SETTINGS.feeBpsMaker || 15) / 10000; // assume maker for entry
+    const cushion = 0.0008; // 8 bps headroom
+    const denom = Math.max(pxForSizing * (1 + feeFrac + cushion), 1e-9);
+    let qty = +(notional / denom).toFixed(6);
     if (!Number.isFinite(qty) || qty <= 0) {
       logTradeAction('skip_small_order', symbol);
       return false;
     }
 
-    const result = await placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap);
+    // console.log('USABLE BP', symbol, buyingPower);
+    const result = await placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap, buyingPower);
     if (!result.filled) return false;
 
     const actualEntry = result.entry ?? entryPx;
