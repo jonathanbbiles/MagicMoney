@@ -351,14 +351,14 @@ async function getPnLAndFeesSnapshot() {
 async function getStockClock() {
   try {
     const r = await f(`${ALPACA_BASE_URL}/clock`, { headers: HEADERS });
-    if (!r.ok) return { is_open: true };
+    if (!r.ok) return { is_open: false };
     const j = await r.json();
     return { is_open: !!j.is_open, next_open: j.next_open, next_close: j.next_close };
   } catch {
-    return { is_open: true };
+    return { is_open: false };
   }
 }
-let STOCK_CLOCK_CACHE = { value: { is_open: true }, ts: 0 };
+let STOCK_CLOCK_CACHE = { value: { is_open: false }, ts: 0 };
 async function getStockClockCached(ttlMs = 30000) {
   const now = Date.now();
   if (now - STOCK_CLOCK_CACHE.ts < ttlMs) return STOCK_CLOCK_CACHE.value;
@@ -602,7 +602,7 @@ function markUnsupported(sym, mins = 120) { unsupportedSymbols.set(sym, Date.now
 // -------------------------------------------------------------------------
 // BAR CACHE
 const barsCache = new Map();
-const barsCacheTTL = 60000; // 60 seconds
+const barsCacheTTL = 30000; // 30 seconds
 
 /* ─────────────────────────────── 12) CRYPTO DATA API ─────────────────────────────── */
 const buildURLCrypto = (loc, what, symbolsCSV, params = {}) => {
@@ -894,6 +894,7 @@ const logTradeAction = async (type, symbol, details = {}) => {
 const FRIENDLY = {
   quote_ok: { sev: 'info', msg: (d) => `Quote OK (${(d.spreadBps ?? 0).toFixed(1)} bps)` },
   quote_http_error: { sev: 'warn', msg: (d) => `Alpaca ${d.symbol || 'quotes'} ${d.status}${d.loc ? ' • ' + d.loc : ''}${d.body ? ' • ' + d.body : ''}` },
+  quote_exception:  { sev: 'error', msg: (d) => `Quote/Order exception: ${d?.error ?? ''}` },
   trade_http_error: { sev: 'warn', msg: (d) => `Alpaca ${d.symbol || 'trades'} ${d.status}${d.loc ? ' • ' + d.loc : ''}${d.body ? ' • ' + d.body : ''}` },
   unsupported_symbol: { sev: 'warn', msg: (d) => `Unsupported symbol: ${d.sym}` },
   buy_camped: { sev: 'info', msg: (d) => `Camping bid @ ${d.limit}` },
@@ -901,6 +902,7 @@ const FRIENDLY = {
   buy_success: { sev: 'success', msg: (d) => `BUY filled qty ${d.qty} @≤${d.limit}` },
   buy_unfilled_canceled: { sev: 'warn', msg: () => `BUY unfilled — canceled bid` },
   tp_limit_set: { sev: 'success', msg: (d) => `TP set @ ${d.limit}` },
+  taker_force_flip: { sev: 'warn', msg: (d) => `TAKER force flip @~${d?.limit ?? ''}` },
   tp_limit_error: { sev: 'error', msg: (d) => `TP set error: ${d.error}` },
   scan_start: { sev: 'info', msg: (d) => `Scan start (batch ${d.batch})` },
   scan_summary: { sev: 'info', msg: (d) => `Scan: ready ${d.readyCount} / attempts ${d.attemptCount} / fills ${d.successCount}` },
@@ -1508,13 +1510,53 @@ async function fetchAssetMeta(symbol) {
   try {
     const r = await f(`${ALPACA_BASE_URL}/assets/${encodeURIComponent(symbol)}`, { headers: HEADERS });
     if (!r.ok) return null;
-    return await r.json();
+    const a = await r.json();
+    if (a && typeof a === 'object') {
+      const num = (v, fallback) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? n : fallback;
+      };
+      const priceInc = num(a.price_increment ?? a.min_price_increment ?? 1e-5, 1e-5);
+      const qtyInc = num(a.min_trade_increment ?? a.min_order_size ?? 0.000001, 0.000001);
+      const minNotionalRaw = Number(a.min_order_notional ?? 0);
+      a._price_inc = priceInc;
+      a._qty_inc = qtyInc;
+      a._fractionable = a.fractionable !== false;
+      a._min_notional = Number.isFinite(minNotionalRaw) && minNotionalRaw > 0 ? minNotionalRaw : 0;
+    }
+    return a;
   } catch { return null; }
 }
 async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
   await cancelOpenOrdersForSymbol(symbol, 'buy');
+  const meta = await fetchAssetMeta(symbol);
+  const rawTick = meta?._price_inc ?? (isStock(symbol) ? 0.01 : 1e-5);
+  const TICK = Number.isFinite(rawTick) && rawTick > 0 ? rawTick : (isStock(symbol) ? 0.01 : 1e-5);
+  const rawQtyInc = meta?._qty_inc ?? 0.000001;
+  const QINC = Number.isFinite(rawQtyInc) && rawQtyInc > 0 ? rawQtyInc : 0.000001;
+  const qtyStepDecimals = Math.min(8, (QINC.toString().split('.')[1] || '').length || 6);
+  const quantizeQty = (value) => {
+    if (!(value > 0) || !(QINC > 0)) return 0;
+    const scaled = Math.floor(value / QINC + 1e-9);
+    if (!(scaled > 0)) return 0;
+    return Number((scaled * QINC).toFixed(qtyStepDecimals));
+  };
+  let plannedQty = quantizeQty(qty);
+  if (isStock(symbol) && meta && meta._fractionable === false) {
+    plannedQty = Math.floor(plannedQty);
+  }
+  plannedQty = quantizeQty(plannedQty);
+  if (!(plannedQty > 0)) return { filled: false };
+  qty = plannedQty;
+
   let lastOrderId = null, placedLimit = null, lastReplaceAt = 0;
   const t0 = Date.now(), CAMP_SEC = SETTINGS.makerCampSec;
+  const tickDecimals = (() => {
+    const frac = (TICK.toString().split('.')[1] || '');
+    if (!frac.length) return isStock(symbol) ? 2 : 5;
+    return Math.min(6, Math.max(frac.length, isStock(symbol) ? 2 : 5));
+  })();
+  const formatLimit = (px) => Number(px).toFixed(tickDecimals);
 
   while ((Date.now() - t0) / 1000 < CAMP_SEC) {
     const q = await getQuoteSmart(symbol, preQuoteMap);
@@ -1522,20 +1564,30 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
     const bidNow = q.bid, askNow = q.ask;
     if (!Number.isFinite(bidNow) || bidNow <= 0) { await sleep(250); continue; }
 
-    const TICK = isStock(symbol) ? 0.01 : 1e-5;
     const spread = (Number.isFinite(askNow) && askNow > bidNow) ? (askNow - bidNow) : 0;
     let targetLimit = bidNow + Math.max(TICK, spread * 0.25);
-    if (Number.isFinite(askNow) && askNow > 0) targetLimit = Math.min(targetLimit, askNow - TICK);
+    targetLimit = Math.max(targetLimit, TICK);
+    if (Number.isFinite(askNow) && askNow > 0) {
+      targetLimit = Math.min(targetLimit, Math.max(TICK, askNow - TICK));
+    }
+    targetLimit = Math.round(targetLimit / TICK) * TICK;
+    targetLimit = Number.isFinite(targetLimit) && targetLimit > 0 ? targetLimit : bidNow;
+    targetLimit = Math.max(targetLimit, TICK);
+    if (Number.isFinite(askNow) && askNow > 0) {
+      targetLimit = Math.min(targetLimit, Math.max(TICK, askNow - TICK));
+    }
     const join = targetLimit;
 
-    if (isStock(symbol)) {
-      const meta = await fetchAssetMeta(symbol);
-      if (meta && meta.fractionable === false) {
-        const px = bidNow || askNow || 0;
-        const whole = Math.floor(qty);
-        if (whole <= 0 || whole * px < 5) return { filled: false };
-        qty = Math.floor(qty);
-      }
+    const notionalPx = Number.isFinite(bidNow) && bidNow > 0
+      ? bidNow
+      : (Number.isFinite(askNow) && askNow > 0 ? askNow : join);
+    if (meta && meta._min_notional > 0 && Number.isFinite(notionalPx) && notionalPx > 0) {
+      if (qty * notionalPx < meta._min_notional) return { filled: false };
+    }
+
+    if (isStock(symbol) && meta && meta._fractionable === false) {
+      const px = notionalPx;
+      if (!(qty > 0) || !(px > 0) || qty * px < 5) return { filled: false };
     }
 
     const nowTs = Date.now();
@@ -1546,7 +1598,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
       }
       const order = {
         symbol, qty, side: 'buy', type: 'limit', time_in_force: 'gtc',
-        limit_price: join.toFixed(isStock(symbol) ? 2 : 5),
+        limit_price: formatLimit(join),
       };
       try {
         const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(order) });
@@ -1566,7 +1618,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
         try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
       }
       logTradeAction('buy_success', symbol, {
-        qty: pos.qty, limit: placedLimit?.toFixed ? placedLimit.toFixed(isStock(symbol) ? 2 : 5) : placedLimit,
+        qty: pos.qty, limit: placedLimit != null ? formatLimit(placedLimit) : placedLimit,
       });
       return { filled: true, entry: pos.basis ?? placedLimit, qty: pos.qty, liquidity: 'maker' };
     }
@@ -1582,10 +1634,14 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
     const q = await getQuoteSmart(symbol, preQuoteMap);
     if (q && q.ask > 0) {
       let mQty = qty;
-      if (isStock(symbol)) {
-        const meta = await fetchAssetMeta(symbol);
-        if (meta && meta.fractionable === false) mQty = Math.floor(qty);
-        if (mQty <= 0) return { filled: false };
+      if (isStock(symbol) && meta && meta._fractionable === false) {
+        mQty = Math.floor(mQty);
+      }
+      mQty = quantizeQty(mQty);
+      if (!(mQty > 0)) return { filled: false };
+      if (meta && meta._min_notional > 0) {
+        const pxRef = Number.isFinite(q.bid) && q.bid > 0 ? q.bid : q.ask;
+        if (Number.isFinite(pxRef) && pxRef > 0 && mQty * pxRef < meta._min_notional) return { filled: false };
       }
       const tif = isStock(symbol) ? 'day' : 'gtc';
       const order = { symbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif };
@@ -1706,7 +1762,7 @@ const ensureRiskExits = async (symbol, { tradeStateRef }) => {
 /**
  * Fee-aware TP posting + taker touch exit using *dynamic buy bps* (maker/taker).
  */
-const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef }) => {
+const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, openSellBySym } = {}) => {
   const pos = await getPositionInfo(symbol);
   if (!pos || pos.available <= 0) return;
 
@@ -1799,28 +1855,29 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef }
   }
 
   const limitTIF = isStock(symbol) ? 'day' : 'gtc';
-  const open = await getOpenOrders();
-  const existing = open.find(
-    (o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol
-  );
+  let existing = openSellBySym?.get?.(symbol) || null;
+  if (existing && (existing.type || '').toLowerCase() !== 'limit') existing = null;
   const now = Date.now();
   const lastTs = state.lastLimitPostTs || 0;
-  const needsPost = !existing ||
-    Math.abs(parseFloat(existing.limit_price) - finalLimit) / Math.max(1, finalLimit) > 0.001 ||
-    now - lastTs > 1000 * 10;
+  const existingLimit = existing ? parseFloat(existing.limit_price ?? existing.limitPrice) : NaN;
+  const priceDrift = Number.isFinite(existingLimit)
+    ? Math.abs(existingLimit - finalLimit) / Math.max(1, finalLimit)
+    : Infinity;
+  const needsPost = !existing || priceDrift > 0.001 || now - lastTs > 1000 * 10;
   if (!needsPost) return;
 
   try {
-    if (existing) { await f(`${ALPACA_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null); }
-    const order = { symbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit.toFixed(isStock(symbol) ? 2 : 5) };
+    const decimals = isStock(symbol) ? 2 : 5;
+    const order = { symbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit.toFixed(decimals) };
     const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(order) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     if (res.ok && data.id) {
       tradeStateRef.current[symbol] = { ...(state || {}), lastLimitPostTs: now };
+      if (existing) { await f(`${ALPACA_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null); }
       logTradeAction('tp_limit_set', symbol, { id: data.id, limit: order.limit_price });
     } else {
       const msg = data?.message || data?.raw?.slice?.(0, 100) || '';
-      logTradeAction('tp_limit_error', symbol, { error: `POST ${res.status} ${msg} (TIF=${limitTIF}, qty=${qty})` });
+      logTradeAction('tp_limit_error', symbol, { error: `POST ${res.status} ${msg}` });
     }
   } catch (e) {
     logTradeAction('tp_limit_error', symbol, { error: e.message });
@@ -2179,7 +2236,12 @@ export default function App() {
     let timer = null;
     const run = async () => {
       try {
-        const positions = await getAllPositions();
+        const [positions, openOrders] = await Promise.all([getAllPositions(), getOpenOrders()]);
+        const openSellBySym = new Map(
+          (openOrders || [])
+            .filter((o) => (o.side || '').toLowerCase() === 'sell')
+            .map((o) => [o.symbol, o])
+        );
         for (const p of positions || []) {
           const symbol = p.symbol;
           const qty = Number(p.qty || 0);
@@ -2200,7 +2262,7 @@ export default function App() {
           const tp = Math.max(Math.min(tpBase, entryBase + (s.runway ?? 0)), feeFloor);
           s.tp = tp; s.feeFloor = feeFloor;
 
-          await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef });
+          await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym });
         }
       } finally {
         timer = setTimeout(run, 1000 * 5);
@@ -2215,7 +2277,11 @@ export default function App() {
     const sweep = async () => {
       try {
         const [positions, openOrders] = await Promise.all([getAllPositions(), getOpenOrders()]);
-        const openSellBySym = new Set((openOrders || []).filter((o) => (o.side || '').toLowerCase() === 'sell').map((o) => o.symbol));
+        const openSellBySym = new Map(
+          (openOrders || [])
+            .filter((o) => (o.side || '').toLowerCase() === 'sell')
+            .map((o) => [o.symbol, o])
+        );
         for (const p of positions || []) {
           const sym = p.symbol;
           if (STABLES.has(sym) || BLACKLIST.has(sym)) continue;
@@ -2255,20 +2321,29 @@ export default function App() {
           lastAutoTuneRef.current.set(sym, m);
         };
         const entries = Array.from(skipHistoryRef.current.entries());
+        const overrides = SETTINGS_OVERRIDES || {};
         let changed = 0;
         for (const [sym, arr] of entries) {
           const recent = arr.filter((a) => now - a.ts <= windowMs);
           if (!recent.length) continue;
           const count = (reason) => recent.filter((a) => a.reason === reason).length;
           if (count('spread') >= thr && cooled(sym, 'spread')) {
-            bumpOv(sym, 'spreadMaxBps', +settings.autoTuneSpreadStepBps, { max: settings.autoTuneMaxSpreadBps });
-            mark(sym, 'spread');
-            changed++;
+            const ov = overrides[sym] || {};
+            const currentSpreadMax = ov.spreadMaxBps ?? settings.spreadMaxBps;
+            if (currentSpreadMax < settings.autoTuneMaxSpreadBps) {
+              bumpOv(sym, 'spreadMaxBps', +settings.autoTuneSpreadStepBps, { max: settings.autoTuneMaxSpreadBps });
+              mark(sym, 'spread');
+              changed++;
+            }
           }
           if (count('spread_fee_gate') >= thr && cooled(sym, 'spread_fee_gate')) {
-            bumpOv(sym, 'spreadOverFeesMinBps', -settings.autoTuneFeesGuardStepBps, { min: settings.autoTuneMinSpreadOverFeesBps });
-            mark(sym, 'spread_fee_gate');
-            changed++;
+            const ov = overrides[sym] || {};
+            const currentFeesGuard = ov.spreadOverFeesMinBps ?? settings.spreadOverFeesMinBps;
+            if (currentFeesGuard > settings.autoTuneMinSpreadOverFeesBps) {
+              bumpOv(sym, 'spreadOverFeesMinBps', -settings.autoTuneFeesGuardStepBps, { min: settings.autoTuneMinSpreadOverFeesBps });
+              mark(sym, 'spread_fee_gate');
+              changed++;
+            }
           }
           if (count('edge_negative') >= thr && cooled(sym, 'edge_negative')) {
             bumpOv(sym, 'netMinProfitBps', -settings.autoTuneNetMinStepBps, { min: settings.autoTuneMinNetMinBps });
