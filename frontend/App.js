@@ -755,7 +755,10 @@ function perShareFixedOnSell(qty, model) {
 function roundTripFeeBpsEstimateWithBuy(symbol, buyBpsOverride) {
   const m = feeModelFor(symbol);
   const buyBps = Number.isFinite(buyBpsOverride) ? buyBpsOverride : (m.buyBps || 0);
-  return buyBps + (m.sellBps || 0);
+  const sellBps = isCrypto(symbol)
+    ? (SETTINGS.takerExitOnTouch ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker)
+    : (m.sellBps || 0);
+  return buyBps + sellBps;
 }
 function dynamicMinProfitPerShare({ symbol, entryPx, buyBpsOverride }) {
   const feesBps = roundTripFeeBpsEstimateWithBuy(symbol, buyBpsOverride);
@@ -770,7 +773,10 @@ function minExitPriceFeeAwareDynamic({ symbol, entryPx, qty, buyBpsOverride }) {
   const buyBps = Number.isFinite(buyBpsOverride) ? buyBpsOverride : (model.buyBps || 0);
   const buyFeePS = entryPx * (buyBps / 10000);
   const fixedSellPS = perShareFixedOnSell(qty, model);
-  const sellBpsFrac = (model.sellBps || 0) / 10000;
+  const sellBps = isCrypto(symbol)
+    ? (SETTINGS.takerExitOnTouch ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker)
+    : (model.sellBps || 0);
+  const sellBpsFrac = sellBps / 10000;
   const minNetPerShare = dynamicMinProfitPerShare({ symbol, entryPx, buyBpsOverride });
   const raw = (entryPx + buyFeePS + fixedSellPS + minNetPerShare) / Math.max(1e-9, 1 - sellBpsFrac);
   return roundToTick(raw, model.tick);
@@ -779,8 +785,11 @@ function projectedNetPnlUSDWithBuy({ symbol, entryPx, qty, sellPx, buyBpsOverrid
   const m = feeModelFor(symbol);
   const buyBps = Number.isFinite(buyBpsOverride) ? buyBpsOverride : (m.buyBps || 0);
   const buyFeesUSD = qty * entryPx * (buyBps / 10000);
+  const sellBps = isCrypto(symbol)
+    ? (SETTINGS.takerExitOnTouch ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker)
+    : (m.sellBps || 0);
   const sellFeesUSD =
-    qty * sellPx * (m.sellBps / 10000) +
+    qty * sellPx * (sellBps / 10000) +
     (m.cls === 'equity'
       ? Math.min(m.tafPerShare * qty, m.tafCap) + m.commissionUSD
       : 0);
@@ -1079,7 +1088,18 @@ async function getQuoteSmart(symbol, preloadedMap = null) {
       return qObj;
     }
 
-    // No synthetic fallback when liveRequireQuote=true
+    // Fallback: synthesize a quote from last trade if allowed
+    if (!SETTINGS.liveRequireQuote) {
+      const tm = await getCryptoTradesBatch([dsym]);
+      const t = tm.get(dsym);
+      if (t && isFresh(t.tms, SETTINGS.liveFreshTradeMsCrypto)) {
+        const synth = synthQuoteFromTrade(t.price, SETTINGS.syntheticTradeSpreadBps);
+        if (synth) {
+          quoteCache.set(symbol, { ts: Date.now(), q: synth });
+          return synth;
+        }
+      }
+    }
     return null;
   } catch {
     return null;
@@ -1088,7 +1108,14 @@ async function getQuoteSmart(symbol, preloadedMap = null) {
 
 /* ─────────────────────────────── 18) SIGNAL / ENTRY MATH ─────────────────────────────── */
 const SPREAD_EPS_BPS = 0.3;
-const exitFloorBps = (symbol) => (isStock(symbol) ? 1.0 : (SETTINGS.feeBpsMaker + SETTINGS.feeBpsTaker));
+// Exit floor uses the intended exit liquidity:
+// - If we plan to flip to taker on touch, assume taker fees on sell.
+// - Otherwise assume maker fees on sell (resting limit TP).
+const exitFloorBps = (symbol) => {
+  if (isStock(symbol)) return 1.0;
+  const sellBps = SETTINGS.takerExitOnTouch ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker;
+  return SETTINGS.feeBpsMaker + sellBps; // buy (maker) + planned sell
+};
 function requiredProfitBpsForSymbol(symbol, riskLevel) {
   const arr = SETTINGS.slipBpsByRisk || [];
   const slip = Number.isFinite(arr[riskLevel]) ? arr[riskLevel] : (arr[0] ?? 1);
@@ -2373,6 +2400,23 @@ export default function App() {
     }
   };
 
+  // Auto-scan loop: run loadData repeatedly based on settings.scanMs.
+  // Respects scanningRef so we never overlap scans.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        if (!scanningRef.current) {
+          await loadData();
+        }
+      } finally {
+        if (!cancelled) setTimeout(tick, Math.max(1000, SETTINGS.scanMs));
+      }
+    };
+    tick();
+    return () => { cancelled = true; };
+  }, [settings.scanMs, tracked?.length]);
+
   const onRefresh = () => {
     setRefreshing(true);
     loadData();
@@ -2620,6 +2664,17 @@ export default function App() {
             )}
 
             <View style={styles.line} />
+
+            {/* Toggle: require spread ≥ fees + guard */}
+            <View style={styles.rowSpace}>
+              <Text style={styles.label}>💸 Require spread ≥ fees + guard</Text>
+              <TouchableOpacity
+                style={[styles.chip, { backgroundColor: settings.requireSpreadOverFees ? '#4caf50' : '#2b2b2b' }]}
+                onPress={() => setSettings((s) => ({ ...s, requireSpreadOverFees: !s.requireSpreadOverFees }))}
+              >
+                <Text style={styles.chipText}>{settings.requireSpreadOverFees ? 'ON' : 'OFF'}</Text>
+              </TouchableOpacity>
+            </View>
 
             {/* Fees (bps): Maker/Taker */}
             <View style={styles.rowSpace}>
