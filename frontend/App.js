@@ -21,7 +21,8 @@ const EX = Constants?.expoConfig?.extra || Constants?.manifest?.extra || {};
 // (per user request: do not change keys)
 const ALPACA_KEY = 'AKANN0IP04IH45Z6FG3L';
 const ALPACA_SECRET = 'qvaKRqP9Q3XMVMEYqVnq2BEgPGhQQQfWg1JT7bWV';
-const ALPACA_BASE_URL = EX.APCA_API_BASE || 'https://api.alpaca.markets/v2';
+// Force LIVE trading endpoint, ignoring EX/APCA overrides
+const ALPACA_BASE_URL = 'https://api.alpaca.markets/v2';
 
 const DATA_ROOT_CRYPTO = 'https://data.alpaca.markets/v1beta3/crypto';
 // IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
@@ -34,8 +35,17 @@ const HEADERS = {
   Accept: 'application/json',
   'Content-Type': 'application/json',
 };
+// Safety guard: crash loudly if a paper endpoint is ever used
+if (typeof ALPACA_BASE_URL === 'string' && /paper-api\.alpaca\.markets/i.test(ALPACA_BASE_URL)) {
+  throw new Error('Paper trading endpoint detected. LIVE ONLY is enforced. Fix ALPACA_BASE_URL.');
+}
+console.log('[Alpaca ENV]', { base: ALPACA_BASE_URL, mode: 'LIVE' });
 
-console.log('[Alpaca LIVE ENV]', { base: ALPACA_BASE_URL });
+getAccountSummaryRaw().then(() => {
+  console.log('✅ Connected to Alpaca LIVE endpoint:', ALPACA_BASE_URL);
+}).catch((e) => {
+  console.log('❌ Alpaca connection error:', e?.message || e);
+});
 
 /* ───────────────────────────── 2) CORE CONSTANTS / STRATEGY ───────────────────────────── */
 // Fee constants retained for compatibility but no longer used for gating logic.
@@ -2826,6 +2836,9 @@ export default function App() {
             <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
             <Text style={[styles.appTitle, darkMode && styles.titleDark]}>Magic $$</Text>
             <Text style={styles.versionTag}>{VERSION}</Text>
+            <View style={[styles.pillToggle, { marginLeft: 6, backgroundColor: '#7fd180' }]}>
+              <Text style={styles.pillText}>LIVE</Text>
+            </View>
             <TouchableOpacity onPress={() => setShowSettings((v) => !v)} style={[styles.pillToggle, { marginLeft: 8 }]}>
               <Text style={styles.pillText}>⚙️ Settings</Text>
             </TouchableOpacity>
