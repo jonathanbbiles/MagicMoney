@@ -35,11 +35,7 @@ const HEADERS = {
   'Content-Type': 'application/json',
 };
 
-console.log('[Alpaca LIVE ENV]', {
-  base: ALPACA_BASE_URL,
-  keyPrefix: (ALPACA_KEY || '').slice(0, 4),
-  hasSecret: Boolean(ALPACA_SECRET),
-});
+console.log('[Alpaca LIVE ENV]', { base: ALPACA_BASE_URL });
 
 /* ───────────────────────────── 2) CORE CONSTANTS / STRATEGY ───────────────────────────── */
 // Fee constants retained for compatibility but no longer used for gating logic.
@@ -95,7 +91,7 @@ const DEFAULT_SETTINGS = {
   slipBpsByRisk: [1, 2, 3, 4, 5],
 
   // Quote handling
-  liveRequireQuote: true,
+  liveRequireQuote: true, // live quotes only; no synthetic fallback unless user disables this
   quoteTtlMs: 15000,
   liveFreshMsCrypto: 15000,
   liveFreshMsStock: 15000,
@@ -179,9 +175,31 @@ function eff(symbol, key) {
 /* ─────────────────────────────── 4) UTILITIES / HTTP ─────────────────────────────── */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// --- Global request rate limiter (simple token bucket) ---
+let __TOKENS = 180; // ~180 req/min default budget
+let __LAST_REFILL = Date.now();
+const __REFILL_RATE = 180 / 60000; // tokens/ms
+const __MAX_TOKENS = 180;
+async function __takeToken() {
+  const now = Date.now();
+  const elapsed = now - __LAST_REFILL;
+  if (elapsed > 0) {
+    __TOKENS = Math.min(__MAX_TOKENS, __TOKENS + elapsed * __REFILL_RATE);
+    __LAST_REFILL = now;
+  }
+  if (__TOKENS >= 1) {
+    __TOKENS -= 1;
+    return;
+  }
+  const waitMs = Math.ceil((1 - __TOKENS) / __REFILL_RATE);
+  await sleep(Math.min(1500, Math.max(50, waitMs)));
+  return __takeToken();
+}
+
 async function f(url, opts = {}, timeoutMs = 8000, retries = 2) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
+    await __takeToken();
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), timeoutMs);
     try {
@@ -189,7 +207,7 @@ async function f(url, opts = {}, timeoutMs = 8000, retries = 2) {
       clearTimeout(t);
       if (res.status === 429 || res.status >= 500) {
         if (i === retries) return res;
-        await sleep(500 * Math.pow(2, i));
+        await sleep(400 * Math.pow(2, i) + Math.floor(Math.random() * 300));
         continue;
       }
       return res;
@@ -197,7 +215,7 @@ async function f(url, opts = {}, timeoutMs = 8000, retries = 2) {
       clearTimeout(t);
       lastErr = e;
       if (i === retries) throw e;
-      await sleep(350 * Math.pow(2, i));
+      await sleep(300 * Math.pow(2, i) + Math.floor(Math.random() * 250));
     }
   }
   if (lastErr) throw lastErr;
@@ -280,9 +298,9 @@ async function getPortfolioHistory({ period = '1M', timeframe = '1D' } = {}) {
   return res.json().catch(() => null);
 }
 
-async function getActivities({ afterISO, untilISO, pageToken } = {}) {
+async function getActivities({ afterISO, untilISO, pageToken, types } = {}) {
   const params = new URLSearchParams({
-    activity_types: 'FILL,FEE,CFEE,PTC',
+    activity_types: types || 'FILL,CFEE,FEE,PTC',
     direction: 'desc',
     page_size: '100',
   });
@@ -363,7 +381,7 @@ const TxnHistoryCSVViewer = () => {
     let token = null;
     let all = [];
     for (let i = 0; i < 20; i++) {
-      const { items, next } = await getActivities({ afterISO, untilISO, pageToken: token });
+      const { items, next } = await getActivities({ afterISO, untilISO, pageToken: token, types });
       all = all.concat(items);
       if (!next || all.length >= max) break;
       token = next;
@@ -1495,7 +1513,7 @@ async function fetchAssetMeta(symbol) {
 }
 async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
   await cancelOpenOrdersForSymbol(symbol, 'buy');
-  let lastOrderId = null, placedLimit = null;
+  let lastOrderId = null, placedLimit = null, lastReplaceAt = 0;
   const t0 = Date.now(), CAMP_SEC = SETTINGS.makerCampSec;
 
   while ((Date.now() - t0) / 1000 < CAMP_SEC) {
@@ -1520,7 +1538,9 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
       }
     }
 
-    if (!lastOrderId || Math.abs(join - placedLimit) / Math.max(1, join) > 0.0001) {
+    const nowTs = Date.now();
+    const needReplace = !lastOrderId || Math.abs(join - placedLimit) / Math.max(1, join) > 0.0001;
+    if (needReplace && (nowTs - lastReplaceAt) > 900) {
       if (lastOrderId) {
         try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
       }
@@ -1532,7 +1552,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
         const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         if (res.ok && data.id) {
-          lastOrderId = data.id; placedLimit = join;
+          lastOrderId = data.id; placedLimit = join; lastReplaceAt = nowTs;
           logTradeAction('buy_camped', symbol, { limit: order.limit_price });
         }
       } catch (e) {
@@ -1828,7 +1848,7 @@ export default function App() {
   const [data, setData] = useState([]);
   const [refreshing, setRefreshing] = useState(false);
   const [darkMode] = useState(true);
-  const autoTrade = true;
+  const [autoTrade, setAutoTrade] = useState(true);
   const [notification, setNotification] = useState(null);
   const [logHistory, setLogHistory] = useState([]);
 
@@ -2770,6 +2790,12 @@ export default function App() {
             </TouchableOpacity>
             <TouchableOpacity onPress={cancelAllOrders} style={[styles.pillToggle, styles.btnWarn]}>
               <Text style={styles.pillText}>Cancel Orders</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setAutoTrade((v) => !v)}
+              style={[styles.pillToggle, { backgroundColor: autoTrade ? '#7fd180' : '#e0d8f6' }]}
+            >
+              <Text style={styles.pillText}>{autoTrade ? 'Auto-Trade: ON' : 'Auto-Trade: OFF'}</Text>
             </TouchableOpacity>
             <View style={styles.inlineBP}>
               <Text style={styles.bpLabel}>Buying Power</Text>
