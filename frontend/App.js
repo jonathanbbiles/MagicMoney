@@ -1591,8 +1591,9 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null) {
     }
 
     const nowTs = Date.now();
-    const needReplace = !lastOrderId || Math.abs(join - placedLimit) / Math.max(1, join) > 0.0001;
-    if (needReplace && (nowTs - lastReplaceAt) > 900) {
+    const ticksDrift = placedLimit != null ? Math.abs(join - placedLimit) / TICK : Infinity;
+    const needReplace = !lastOrderId || ticksDrift >= 2 || join < (placedLimit - TICK);
+    if (needReplace && (nowTs - lastReplaceAt) > 1800) {
       if (lastOrderId) {
         try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
       }
@@ -1683,14 +1684,14 @@ const SELL_EPS_BPS = 0.2;
 /**
  * Dynamic, spread-aware stops with a grace window to avoid instant stop-outs.
  */
-const ensureRiskExits = async (symbol, { tradeStateRef }) => {
+const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
   if (!SETTINGS.enableStops) return false;
   const state = tradeStateRef?.current?.[symbol];
   if (!state) return false;
 
-  const pos = await getPositionInfo(symbol);
-  const qty = Number(pos?.available ?? pos?.qty ?? state.qty ?? 0);
-  const entryPx = state.entry ?? pos?.basis ?? pos?.mark ?? 0;
+  const posInfo = pos ?? await getPositionInfo(symbol);
+  const qty = Number(posInfo?.available ?? posInfo?.qty ?? state.qty ?? 0);
+  const entryPx = state.entry ?? posInfo?.basis ?? posInfo?.mark ?? 0;
   if (!(qty > 0) || !(entryPx > 0)) return false;
 
   const q = await getQuoteSmart(symbol);
@@ -1703,9 +1704,11 @@ const ensureRiskExits = async (symbol, { tradeStateRef }) => {
     ? ((q.ask - q.bid) / mid) * 10000
     : 0;
 
+  const slipEw = (symStats[symbol]?.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[SETTINGS.riskLevel] ?? 1));
   const effStopBps = Math.max(
     SETTINGS.stopLossBps,
-    spreadBpsNow + SETTINGS.feeBpsMaker + SETTINGS.feeBpsTaker + 10
+    Math.floor((spreadBpsNow * 0.5) + SETTINGS.feeBpsMaker + SETTINGS.feeBpsTaker + 6),
+    Math.min(SETTINGS.stopLossBps, Math.ceil(slipEw + spreadBpsNow))
   );
 
   if (!state.stopPx) {
@@ -1762,16 +1765,16 @@ const ensureRiskExits = async (symbol, { tradeStateRef }) => {
 /**
  * Fee-aware TP posting + taker touch exit using *dynamic buy bps* (maker/taker).
  */
-const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, openSellBySym } = {}) => {
-  const pos = await getPositionInfo(symbol);
-  if (!pos || pos.available <= 0) return;
+const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, openSellBySym, pos } = {}) => {
+  const posInfo = pos ?? await getPositionInfo(symbol);
+  if (!posInfo || posInfo.available <= 0) return;
 
   const state = (tradeStateRef?.current?.[symbol]) || {};
-  const entryPx = state.entry ?? pos.basis ?? pos.mark ?? 0;
-  const qty = Number(pos.available ?? pos.qty ?? state.qty ?? 0);
+  const entryPx = state.entry ?? posInfo.basis ?? posInfo.mark ?? 0;
+  const qty = Number(posInfo.available ?? posInfo.qty ?? state.qty ?? 0);
   if (!(entryPx > 0) || !(qty > 0)) return;
 
-  const riskExited = await ensureRiskExits(symbol, { tradeStateRef });
+  const riskExited = await ensureRiskExits(symbol, { tradeStateRef, pos: posInfo });
   if (riskExited) return;
 
   const heldMinutes = (Date.now() - (state.entryTs || 0)) / 60000;
@@ -1782,7 +1785,12 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
         const net = projectedNetPnlUSDWithBuy({
           symbol, entryPx, qty, sellPx: q.bid, buyBpsOverride: state.buyBpsApplied
         });
-        if (net >= 0 || net >= -Math.abs(SETTINGS.maxTimeLossUSD)) {
+        const feeFloor = minExitPriceFeeAwareDynamic({
+          symbol, entryPx, qty, buyBpsOverride: state.buyBpsApplied
+        });
+        const tick = isStock(symbol) ? 0.01 : 1e-5;
+        const nearFeeFloor = q.bid >= (feeFloor - (2 * tick)); // prefer scratch
+        if (net >= 0 || (nearFeeFloor && net >= -Math.abs(SETTINGS.netMinProfitUSD)) || net >= -Math.abs(SETTINGS.maxTimeLossUSD)) {
           try {
             const open = await getOpenOrders();
             const ex = open.find((o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol);
@@ -1885,13 +1893,26 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
 };
 
 /* ───────────────────────── 25) CONCURRENCY / PDT ───────────────────────────── */
+function __recentHitRate() {
+  let h = 0, t = 0;
+  for (const s of Object.values(symStats)) {
+    for (const b of (s.hitByHour || [])) { h += b.h || 0; t += b.t || 0; }
+  }
+  const r = t > 0 ? h / t : 0.5;
+  return clamp(r, 0, 1);
+}
 const concurrencyCapBySpread = (avgBps) => {
   const base = SETTINGS.maxConcurrentPositions;
-  if (!Number.isFinite(avgBps)) return base;
-  if (avgBps < 6) return base + 4;
-  if (avgBps < 10) return base + 2;
-  if (avgBps < 16) return base;
-  return Math.max(2, base - 2);
+  const hit = __recentHitRate();
+  let cap = base;
+  if (Number.isFinite(avgBps)) {
+    if (avgBps < 6) cap += 4;
+    else if (avgBps < 10) cap += 2;
+    else if (avgBps >= 16) cap -= 2;
+  }
+  if (hit < 0.45) cap -= 2;
+  else if (hit > 0.60) cap += 1;
+  return Math.max(2, cap);
 };
 function pdtBlockedForEquities(eq, flagged, dt) { return false; } // crypto-only
 
@@ -2094,6 +2115,10 @@ export default function App() {
       return { entryReady: false, why: 'no_quote', meta: { freshSec } };
     }
 
+    if (q.bs != null && Number.isFinite(q.bs) && q.bs < MIN_BID_SIZE_LOOSE) {
+      return { entryReady: false, why: 'illiquid', meta: { bs: q.bs, min: MIN_BID_SIZE_LOOSE } };
+    }
+
     const mid = 0.5 * (q.bid + q.ask);
 
     if (BLACKLIST.has(asset.symbol)) return { entryReady: false, why: 'blacklist', meta: {} };
@@ -2128,17 +2153,19 @@ export default function App() {
       exitFloorBps(asset.symbol) + 0.5 + slipEw,
       eff(asset.symbol, 'netMinProfitBps')
     );
-    const tpBase = q.bid * (1 + needBps / 10000);
+    const spreadEw = symStats[asset.symbol]?.spreadEwmaBps ?? spreadBps;
+    const needBpsCapped = Math.min(needBps, Math.max(exitFloorBps(asset.symbol) + 1, Math.round((spreadEw || 0) * 1.6)));
+    const tpBase = q.bid * (1 + needBpsCapped / 10000);
     const ok = tpBase > q.bid * 1.00005;
     if (!ok) {
-      return { entryReady: false, why: 'edge_negative', meta: { tpBps: needBps, bid: q.bid, tp: tpBase } };
+      return { entryReady: false, why: 'edge_negative', meta: { tpBps: needBpsCapped, bid: q.bid, tp: tpBase } };
     }
 
     (symStats[asset.symbol] ||= {}).spreadEwmaBps = ewma(symStats[asset.symbol].spreadEwmaBps, spreadBps, 0.2);
     const drag_g = Math.max(1e-6, sst.drag_g ?? 8);
     const runway = v0 > 0 ? (v0 * v0) / (2 * drag_g) : 0;
 
-    return { entryReady: true, spreadBps, quote: q, tpBps: needBps, tp: tpBase, v0, runway, meta: {} };
+    return { entryReady: true, spreadBps, quote: q, tpBps: needBpsCapped, tp: tpBase, v0, runway, meta: {} };
   }
 
   const placeOrder = async (symbol, ccSymbol = symbol, d, sigPre = null, preQuoteMap = null, refs) => {
@@ -2155,7 +2182,7 @@ export default function App() {
       const nonStableOpen = (allPos || []).filter((p) => Number(p.qty) > 0 && Number(p.market_value || p.marketValue || 0) > 1).length;
       const cap = concurrencyCapBySpread(globalSpreadAvgRef.current);
       if (nonStableOpen >= cap) {
-        logTradeAction('concurrency_guard', symbol, { cap, avg: globalSpreadAvgRef.current });
+        logTradeAction('concurrency_guard', symbol, { cap, avg: globalSpreadAvgRef.current, hitRate: (function(){let h=0,t=0;for(const s of Object.values(symStats)){for(const b of (s.hitByHour||[])){h+=b.h||0;t+=b.t||0;}}return t>0?(h/t):null;})() });
         return false;
       }
     } catch {}
@@ -2237,6 +2264,7 @@ export default function App() {
     const run = async () => {
       try {
         const [positions, openOrders] = await Promise.all([getAllPositions(), getOpenOrders()]);
+        const posBySym = new Map((positions || []).map((p) => [p.symbol, p]));
         const openSellBySym = new Map(
           (openOrders || [])
             .filter((o) => (o.side || '').toLowerCase() === 'sell')
@@ -2244,25 +2272,26 @@ export default function App() {
         );
         for (const p of positions || []) {
           const symbol = p.symbol;
-          const qty = Number(p.qty || 0);
+          const basePos = posBySym.get(symbol) || p;
+          const qty = Number(basePos.qty || 0);
           if (qty <= 0) continue;
 
           const s = tradeStateRef.current[symbol] || {
-            entry: Number(p.avg_entry_price || p.basis || 0),
-            qty: Number(p.qty || 0),
+            entry: Number(basePos.avg_entry_price || basePos.basis || 0),
+            qty: Number(basePos.qty || 0),
             entryTs: Date.now(), lastLimitPostTs: 0, runway: 0, wasHolding: true, feeFloor: null,
           };
           tradeStateRef.current[symbol] = s;
 
           const slipEw = symStats[symbol]?.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[SETTINGS.riskLevel] ?? 1);
           const needAdj = Math.max(requiredProfitBpsForSymbol(symbol, SETTINGS.riskLevel), exitFloorBps(symbol) + 0.5 + slipEw, eff(symbol, 'netMinProfitBps'));
-          const entryBase = Number(s.entry || p.avg_entry_price || p.mark || 0);
+          const entryBase = Number(s.entry || basePos.avg_entry_price || basePos.mark || 0);
           const tpBase = entryBase * (1 + needAdj / 10000);
-          const feeFloor = minExitPriceFeeAwareDynamic({ symbol, entryPx: entryBase, qty: Number(p.available ?? p.qty ?? 0), buyBpsOverride: s.buyBpsApplied });
+          const feeFloor = minExitPriceFeeAwareDynamic({ symbol, entryPx: entryBase, qty: Number(basePos.available ?? basePos.qty ?? 0), buyBpsOverride: s.buyBpsApplied });
           const tp = Math.max(Math.min(tpBase, entryBase + (s.runway ?? 0)), feeFloor);
           s.tp = tp; s.feeFloor = feeFloor;
 
-          await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym });
+          await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos: basePos });
         }
       } finally {
         timer = setTimeout(run, 1000 * 5);
@@ -2532,17 +2561,24 @@ export default function App() {
       return { ...s, [key]: next };
     });
 
-  const bumpOv = (sym, key, delta, bounds = {}) => {
-    setOverrides((o) => {
-      const cur = o?.[sym]?.[key];
-      const nextVal = clamp((Number(cur) || 0) + delta, bounds.min ?? -1e9, bounds.max ?? 1e9);
-      const oo = { ...(o || {}) };
-      const row = { ...(oo[sym] || {}) };
-      row[key] = nextVal;
-      oo[sym] = row;
-      return oo;
-    });
-  };
+    const bumpOv = (sym, key, delta, bounds = {}) => {
+      setOverrides((o) => {
+        const cur = o?.[sym]?.[key];
+        let nextVal = clamp((Number(cur) || 0) + delta, bounds.min ?? -1e9, bounds.max ?? 1e9);
+
+        // Safety rails for auto‑tune
+        const feesSum = (SETTINGS.feeBpsMaker + SETTINGS.feeBpsTaker);
+        if (key === 'dynamicMinProfitBps' && nextVal < (feesSum + 5)) nextVal = feesSum + 5;
+        if (key === 'spreadOverFeesMinBps' && nextVal < 0) nextVal = 0;
+        if (key === 'netMinProfitBps' && nextVal < SETTINGS.autoTuneMinNetMinBps) nextVal = SETTINGS.autoTuneMinNetMinBps;
+
+        const oo = { ...(o || {}) };
+        const row = { ...(oo[sym] || {}) };
+        row[key] = nextVal;
+        oo[sym] = row;
+        return oo;
+      });
+    };
   const clearOv = (sym) => {
     setOverrides((o) => {
       const oo = { ...(o || {}) };
