@@ -1265,6 +1265,48 @@ async function getAllPositionsCached(ttlMs = 2000) {
   __positionsCache = { ts: now, items };
   return items.slice();
 }
+
+// ---- Usable Buying Power (fresh snapshot minus pending BUY notional) ----
+async function getUsableBuyingPower({ forCrypto = true } = {}) {
+  // 1) fresh account
+  const a = await getAccountSummaryRaw();
+
+  // 2) start from the correct bucket
+  let base = forCrypto
+    ? (Number.isFinite(a.cryptoBuyingPower) ? a.cryptoBuyingPower : (Number.isFinite(a.cash) ? a.cash : a.buyingPower))
+    : (Number.isFinite(a.stockBuyingPower) ? a.stockBuyingPower : a.buyingPower);
+
+  base = Number.isFinite(base) ? base : 0;
+
+  // 3) subtract pending BUY notional (open orders) to avoid double-spending
+  let pending = 0;
+  try {
+    const open = await getOpenOrdersCached();
+    for (const o of open || []) {
+      const side = String(o.side || '').toLowerCase();
+      if (side !== 'buy') continue;
+
+      const sym = o.symbol || '';
+      const isCryptoSym = /USD$/.test(sym);
+      if (forCrypto !== isCryptoSym) continue;
+
+      const qty  = +o.qty || +o.quantity || NaN;
+      const lim  = +o.limit_price || +o.limitPrice || NaN;
+      const notl = +o.notional || NaN;
+
+      if (Number.isFinite(notl) && notl > 0) {
+        pending += notl;
+      } else if (Number.isFinite(qty) && qty > 0 && Number.isFinite(lim) && lim > 0) {
+        pending += qty * lim;
+      }
+      // market BUY with no notional: skip (cannot reserve safely)
+    }
+  } catch {}
+
+  const usable = Math.max(0, base - pending);
+  return { usable, base, pending, snapshot: a };
+}
+
 const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
   try {
     const open = await getOpenOrdersCached();
@@ -2365,29 +2407,30 @@ export default function App() {
     const sig = sigPre || (await computeEntrySignal({ symbol, cc: ccSymbol }, d, SETTINGS.riskLevel, preQuoteMap, null));
     if (!sig.entryReady) return false;
 
-    let equity = acctSummary.portfolioValue;
-    let buyingPower = isCrypto(symbol)
-      ? (acctSummary.cryptoBuyingPower ?? acctSummary.buyingPower)
-      : (acctSummary.stockBuyingPower  ?? acctSummary.buyingPower);
-    if (!Number.isFinite(equity) || !Number.isFinite(buyingPower)) {
-      try {
-        const a = await getAccountSummaryRaw();
-        equity = a.equity;
-        buyingPower = isCrypto(symbol)
-          ? (a.cryptoBuyingPower ?? a.buyingPower)
-          : (a.stockBuyingPower  ?? a.buyingPower);
-        setAcctSummary((s) => ({
-          portfolioValue: a.equity, buyingPower: a.buyingPower, dailyChangeUsd: a.changeUsd, dailyChangePct: a.changePct,
-          patternDayTrader: a.patternDayTrader, daytradeCount: a.daytradeCount, updatedAt: new Date().toISOString(),
-          cryptoBuyingPower: a.cryptoBuyingPower, stockBuyingPower: a.stockBuyingPower, cash: a.cash
-        }));
-      } catch {}
+    // Fetch fresh, pending-aware BP to avoid 403s
+    const bpInfo = await getUsableBuyingPower({ forCrypto: isCrypto(symbol) });
+    let equity   = Number.isFinite(acctSummary.portfolioValue) ? acctSummary.portfolioValue : (bpInfo.snapshot?.equity ?? NaN);
+    if (bpInfo.snapshot) {
+      const a = bpInfo.snapshot;
+      setAcctSummary((s) => ({
+        portfolioValue: a.equity, buyingPower: a.buyingPower, dailyChangeUsd: a.changeUsd, dailyChangePct: a.changePct,
+        patternDayTrader: a.patternDayTrader, daytradeCount: a.daytradeCount, updatedAt: new Date().toISOString(),
+        cryptoBuyingPower: a.cryptoBuyingPower, stockBuyingPower: a.stockBuyingPower, cash: a.cash,
+      }));
     }
     if (!Number.isFinite(equity) || equity <= 0) equity = 1000;
-    if (!Number.isFinite(buyingPower) || buyingPower <= 0) return false;
 
-    const desired = Math.min(buyingPower, (SETTINGS.maxPosPctEquity / 100) * equity);
+    const buyingPower = bpInfo.usable; // this is the only number we size from
+    if (!Number.isFinite(buyingPower) || buyingPower <= 0) {
+      logTradeAction('entry_skipped', symbol, { entryReady: true, reason: 'skip_small_order', note: 'no usable BP' });
+      return false;
+    }
+
+    // Cap per position
+    const desired  = Math.min(buyingPower, (SETTINGS.maxPosPctEquity / 100) * equity);
     const notional = capNotional(symbol, desired, equity);
+
+    logTradeAction('quote_ok', symbol, { spreadBps: (sig?.spreadBps ?? 0), bp_base: bpInfo.base, bp_pending: bpInfo.pending, bp_usable: buyingPower });
 
     let entryPx = sig?.quote?.bid;
     if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig?.quote?.ask;
