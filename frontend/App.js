@@ -1146,6 +1146,8 @@ async function getQuotesBatch(symbols) {
 /* ─────────────────────────────── 17) SMART QUOTE ─────────────────────────────── */
 async function getQuoteSmart(symbol, preloadedMap = null) {
   try {
+    // This build is crypto-first. Do not hit crypto data API with equities.
+    if (isStock(symbol)) { markUnsupported(symbol, 60); return null; }
     if (isUnsupported(symbol)) return null;
 
     // Always use cached real quotes if within TTL
@@ -1894,9 +1896,10 @@ const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
   if (!state) return false;
 
   const posInfo = pos ?? await getPositionInfo(symbol);
-  const qty = Number(posInfo?.available ?? posInfo?.qty ?? state.qty ?? 0);
+  const qty = Number(posInfo?.available ?? 0);
+  if (!(qty > 0)) return false;
   const entryPx = state.entry ?? posInfo?.basis ?? posInfo?.mark ?? 0;
-  if (!(qty > 0) || !(entryPx > 0)) return false;
+  if (!(entryPx > 0)) return false;
 
   const q = await getQuoteSmart(symbol);
   if (!q || !(q.bid > 0)) return false;
@@ -1974,7 +1977,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
 
   const state = (tradeStateRef?.current?.[symbol]) || {};
   const entryPx = state.entry ?? posInfo.basis ?? posInfo.mark ?? 0;
-  const qty = Number(posInfo.available ?? posInfo.qty ?? state.qty ?? 0);
+  const qty = Number(posInfo.available ?? 0);
   if (!(entryPx > 0) || !(qty > 0)) return;
 
   const riskExited = await ensureRiskExits(symbol, { tradeStateRef, pos: posInfo });
@@ -2498,9 +2501,15 @@ export default function App() {
         );
         for (const p of positions || []) {
           const symbol = p.symbol;
+          if (isStock(symbol)) { continue; } // crypto-only build: skip equities like RKLB
+
           const basePos = posBySym.get(symbol) || p;
-          const qty = Number(basePos.qty || 0);
-          if (qty <= 0) continue;
+          const avail = Number(basePos.qty_available ?? basePos.available ?? basePos.qty ?? 0);
+          if (!(avail > 0)) {
+            // clear stale state so we don’t try to set TPs later
+            delete tradeStateRef.current[symbol];
+            continue;
+          }
 
           const s = tradeStateRef.current[symbol] || {
             entry: Number(basePos.avg_entry_price || basePos.basis || 0),
@@ -2513,7 +2522,7 @@ export default function App() {
           const needAdj = Math.max(requiredProfitBpsForSymbol(symbol, SETTINGS.riskLevel), exitFloorBps(symbol) + 0.5 + slipEw, eff(symbol, 'netMinProfitBps'));
           const entryBase = Number(s.entry || basePos.avg_entry_price || basePos.mark || 0);
           const tpBase = entryBase * (1 + needAdj / 10000);
-          const feeFloor = minExitPriceFeeAwareDynamic({ symbol, entryPx: entryBase, qty: Number(basePos.available ?? basePos.qty ?? 0), buyBpsOverride: s.buyBpsApplied });
+          const feeFloor = minExitPriceFeeAwareDynamic({ symbol, entryPx: entryBase, qty: avail, buyBpsOverride: s.buyBpsApplied });
           const tp = Math.max(Math.min(tpBase, entryBase + (s.runway ?? 0)), feeFloor);
           s.tp = tp; s.feeFloor = feeFloor;
 
