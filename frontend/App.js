@@ -94,7 +94,7 @@ const DEFAULT_SETTINGS = {
 
   // Entry gates
   spreadMaxBps: 120,
-  spreadOverFeesMinBps: 5,
+  spreadOverFeesMinBps: 0,
   dynamicMinProfitBps: 60,
   extraOverFeesBps: 10,
   netMinProfitBps: 2.0,
@@ -153,7 +153,7 @@ const DEFAULT_SETTINGS = {
   pdtEquityThresholdUSD: 10000,
 
   // Gates
-  requireSpreadOverFees: true,
+  requireSpreadOverFees: false,
 
   // Auto‑tune settings
   autoTuneEnabled: false,
@@ -2402,7 +2402,10 @@ export default function App() {
     } catch {}
 
     const held = await getPositionInfo(symbol);
-    if (held && Number(held.qty) > 0) {
+    const avail = Number(held?.available ?? 0);
+    const mv    = Number(held?.marketValue ?? 0);
+    const trulyHeld = avail > 0 || mv >= SETTINGS.dustFlattenMaxUsd;
+    if (trulyHeld) {
       logTradeAction('entry_skipped', symbol, { entryReady: false, reason: 'held' });
       return false;
     }
@@ -2505,8 +2508,9 @@ export default function App() {
 
           const basePos = posBySym.get(symbol) || p;
           const avail = Number(basePos.qty_available ?? basePos.available ?? basePos.qty ?? 0);
-          if (!(avail > 0)) {
-            // clear stale state so we don’t try to set TPs later
+          const mv    = Number(basePos.market_value ?? basePos.marketValue ?? 0);
+          if (!(avail > 0 || mv >= SETTINGS.dustFlattenMaxUsd)) {
+            // Not truly held → don’t maintain TP/stop; also clear stale trade state
             delete tradeStateRef.current[symbol];
             continue;
           }
