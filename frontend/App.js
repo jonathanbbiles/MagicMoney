@@ -1302,12 +1302,14 @@ async function getAccountSummaryRaw() {
   const cash     = num(a.cash);
   const dtbp     = num(a.daytrade_buying_power);
 
-  // Crypto-first display for a crypto-focused app
-  const buyingPowerDisplay =
-    Number.isFinite(cryptoBP) ? cryptoBP :
-    Number.isFinite(nmbp)     ? nmbp     :
-    Number.isFinite(cash)     ? cash     :
-    stockBP;
+  // Prefer NMBP, then cash, then cryptoBP
+  const cashish = Number.isFinite(nmbp) ? nmbp
+                : Number.isFinite(cash) ? cash
+                : Number.isFinite(cryptoBP) ? cryptoBP
+                : NaN;
+
+  // For display, show cash-like funds as buying power
+  const buyingPowerDisplay = Number.isFinite(cashish) ? cashish : stockBP;
 
   const prevClose = num(a.equity_previous_close);
   const lastEq = num(a.last_equity);
@@ -1323,8 +1325,8 @@ async function getAccountSummaryRaw() {
     buyingPower: buyingPowerDisplay,
     changeUsd, changePct,
     patternDayTrader, daytradeCount,
-    cryptoBuyingPower: (Number.isFinite(cryptoBP) ? cryptoBP : (Number.isFinite(nmbp) ? nmbp : cash)),
-    stockBuyingPower: stockBP,
+    cryptoBuyingPower: cashish,
+    stockBuyingPower: Number.isFinite(stockBP) ? stockBP : cashish,
     daytradeBuyingPower: dtbp,
     cash
   };
@@ -1549,7 +1551,7 @@ const PortfolioChangeChart = ({ acctSummary }) => {
 };
 
 /* ─────────────────────────── 23) CHART: DAILY PORTFOLIO VALUE ─────────────────────────── */
-const DailyPortfolioValueChart = () => {
+const DailyPortfolioValueChart = ({ acctSummary }) => {
   const [pts, setPts] = useState([]);
   const seededRef = useRef(false);
 
@@ -1577,6 +1579,21 @@ const DailyPortfolioValueChart = () => {
       } catch {}
     })();
   }, []);
+
+  // NEW: keep last point in sync with current equity
+  useEffect(() => {
+    const v = Number(acctSummary?.portfolioValue);
+    if (!Number.isFinite(v)) return;
+    setPts((prev) => {
+      if (!prev.length) return [{ t: Date.now(), val: v }];
+      const now = Date.now();
+      const last = prev[prev.length - 1];
+      const sameDay = new Date(last.t).toDateString() === new Date(now).toDateString();
+      const next = sameDay ? prev.slice(0, -1).concat({ t: now, val: v })
+                           : prev.concat({ t: now, val: v });
+      return next.slice(-30);
+    });
+  }, [acctSummary?.portfolioValue]);
 
   if (!pts.length) {
     return (
@@ -1606,7 +1623,7 @@ const DailyPortfolioValueChart = () => {
         <Text style={styles.subtle}>{new Date(last.t).toLocaleDateString()}</Text>
       </View>
       <Text style={styles.smallNote}>
-        Daily portfolio value at midnight (approx). Seeded from <Text style={{ fontWeight: '800' }}>/account/portfolio/history</Text> (1‑D).
+        Latest point = current equity; earlier points from <Text style={{ fontWeight: '800' }}>/account/portfolio/history</Text> (1‑D).
       </Text>
     </View>
   );
@@ -3098,7 +3115,7 @@ export default function App() {
         </View>
 
         <PortfolioChangeChart acctSummary={acctSummary} />
-        <DailyPortfolioValueChart />
+        <DailyPortfolioValueChart acctSummary={acctSummary} />
         <TxnHistoryCSVViewer />
 
         <LiveLogsCopyViewer logs={logHistory} />
