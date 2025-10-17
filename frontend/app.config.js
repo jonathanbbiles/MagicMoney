@@ -12,6 +12,7 @@ module.exports = {
   expo: {
     name: "Bullish or Bust",
     slug: "bullish-or-bust",
+    plugins: ["react-native-svg"],
     extra: {
       APCA_API_KEY_ID: process.env.APCA_API_KEY_ID || "",
       APCA_API_SECRET_KEY: process.env.APCA_API_SECRET_KEY || "",
