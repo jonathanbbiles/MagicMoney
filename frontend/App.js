@@ -1673,6 +1673,93 @@ const DailyPortfolioValueChart = ({ acctSummary }) => {
   );
 };
 
+/* ─────────────────────────── 23b) CHART: HOLDINGS % CHANGE (LIVE) ─────────────────────────── */
+const HoldingsChangeBarChart = () => {
+  const [rows, setRows] = useState([]);
+  const [lastAt, setLastAt] = useState(null);
+
+  useEffect(() => {
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const positions = await getAllPositionsCached();
+        const items = (positions || [])
+          .filter((p) => {
+            const qty = +p.qty || 0;
+            const mv  = +(p.market_value ?? p.marketValue ?? 0);
+            return qty > 0 && mv >= (SETTINGS.dustFlattenMaxUsd || 0.75) && !STABLES.has(p.symbol);
+          })
+          .map((p) => {
+            const symbol = p.symbol;
+            const qty    = +p.qty || 0;
+            const basis  = +(p.avg_entry_price ?? p.basis ?? NaN);
+            const mv     = +(p.market_value ?? p.marketValue ?? NaN);
+            const curRaw = +(p.current_price ?? p.asset_current_price ?? NaN);
+            const mark   = Number.isFinite(curRaw) ? curRaw : (Number.isFinite(mv) && qty > 0 ? mv / qty : NaN);
+            const pct    = (Number.isFinite(basis) && basis > 0 && Number.isFinite(mark))
+              ? ((mark / basis) - 1) * 100
+              : NaN;
+            return { symbol, pct, basis, mark };
+          })
+          .sort((a, b) => Math.abs(b.pct || 0) - Math.abs(a.pct || 0));
+
+        setRows(items);
+        setLastAt(new Date().toISOString());
+      } catch {}
+      if (!stopped) setTimeout(poll, 4000);
+    };
+    poll();
+    return () => { stopped = true; };
+  }, []);
+
+  if (!rows.length) {
+    return (
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Holdings % Change (Live)</Text>
+        <Text style={styles.smallNote}>No active positions detected (or only dust/stables).</Text>
+      </View>
+    );
+  }
+
+  const maxAbs = Math.max(0.5, ...rows.map((r) => Math.abs(Number(r.pct) || 0)));
+
+  return (
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>Holdings % Change (Live)</Text>
+      <View style={{ gap: 8 }}>
+        {rows.map((r) => {
+          const pct = Number(r.pct);
+          const posWidth = pct > 0 ? Math.min(1, pct / maxAbs) : 0;
+          const negWidth = pct < 0 ? Math.min(1, Math.abs(pct) / maxAbs) : 0;
+          return (
+            <View key={r.symbol} style={styles.holdRow}>
+              <Text style={styles.holdLabel}>{r.symbol}</Text>
+              <View style={styles.holdBarWrap}>
+                <View style={styles.holdZero} />
+                <View style={[styles.holdSide, styles.holdNeg, { flex: negWidth }]} />
+                <View style={{ width: 1 }} />
+                <View style={[styles.holdSide, styles.holdPos, { flex: posWidth }]} />
+              </View>
+              <Text style={[styles.holdPct, { color: pct >= 0 ? '#3b7f4d' : '#a94444' }]}>
+                {Number.isFinite(pct) ? `${pct.toFixed(2)}%` : '—'}
+              </Text>
+            </View>
+          );
+        })}
+      </View>
+      {!!lastAt && (
+        <View style={styles.legendRow}>
+          <Text style={styles.subtle}>Scale: ±{maxAbs.toFixed(1)}%</Text>
+          <Text style={styles.subtle}>{new Date(lastAt).toLocaleTimeString()}</Text>
+        </View>
+      )}
+      <Text style={styles.smallNote}>
+        % change = (mark ÷ avg entry − 1). Uses Alpaca position snapshot (updates every few seconds).
+      </Text>
+    </View>
+  );
+};
+
 /* ─────────────────────────── 24) ENTRY / ORDERING / EXITS ─────────────────────────── */
 async function fetchAssetMeta(symbol) {
   try {
@@ -3172,6 +3259,7 @@ export default function App() {
 
         <PortfolioChangeChart acctSummary={acctSummary} />
         <DailyPortfolioValueChart acctSummary={acctSummary} />
+        <HoldingsChangeBarChart />
         <TxnHistoryCSVViewer />
 
         <LiveLogsCopyViewer logs={logHistory} />
@@ -3321,6 +3409,24 @@ const styles = StyleSheet.create({
   riskHealthRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginTop: 6, marginBottom: 6 },
   riskIconGroup: { flexDirection: 'row', alignItems: 'center', marginRight: 16 },
   healthIconGroup: { flexDirection: 'row', alignItems: 'center' },
+
+  holdRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  holdLabel: { width: 72, color: '#355070', fontWeight: '800', fontSize: 11, textAlign: 'right' },
+  holdBarWrap: {
+    flex: 1,
+    height: 12,
+    backgroundColor: '#eef7ff',
+    borderRadius: 6,
+    overflow: 'hidden',
+    flexDirection: 'row',
+    alignItems: 'center',
+    position: 'relative',
+  },
+  holdZero: { position: 'absolute', left: '50%', width: 1, top: 0, bottom: 0, backgroundColor: '#cde6f3' },
+  holdSide: { height: '100%' },
+  holdNeg: { backgroundColor: '#f37b7b', transform: [{ scaleX: -1 }] },
+  holdPos: { backgroundColor: '#7fd180' },
+  holdPct: { width: 70, textAlign: 'right', fontSize: 11, fontWeight: '800' },
 
   legendRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 6 },
   coachCard: {
