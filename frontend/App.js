@@ -1562,9 +1562,8 @@ const PortfolioChangeChart = ({ acctSummary }) => {
   if (!pts.length) {
     return (
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Portfolio % Change (Today)</Text>
+        <Text style={styles.cardTitle}>Portfolio Percentage</Text>
         <View style={{ height: 100, borderRadius: 8, backgroundColor: '#e0f8ff' }} />
-        <Text style={styles.smallNote}>Waiting for account data…</Text>
       </View>
     );
   }
@@ -1573,7 +1572,7 @@ const PortfolioChangeChart = ({ acctSummary }) => {
 
   return (
     <View style={styles.card}>
-      <Text style={styles.cardTitle}>Portfolio % Change (Today)</Text>
+      <Text style={styles.cardTitle}>Portfolio Percentage</Text>
       <MiniLineChart
         series={pts.map((p) => ({ val: p.pct }))}
         valueKey="val"
@@ -1587,9 +1586,6 @@ const PortfolioChangeChart = ({ acctSummary }) => {
         </Text>
         <Text style={styles.subtle}>{new Date(last.t).toLocaleTimeString()}</Text>
       </View>
-      <Text style={styles.smallNote}>
-        Intraday % vs previous close. Seeded from <Text style={{ fontWeight: '800' }}>/account/portfolio/history</Text> (5‑min). P/L is calculated as equity/base_value − 1.
-      </Text>
     </View>
   );
 };
@@ -1642,8 +1638,7 @@ const DailyPortfolioValueChart = ({ acctSummary }) => {
   if (!pts.length) {
     return (
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Portfolio Value (Daily)</Text>
-        <Text style={styles.smallNote}>No history yet from /account/portfolio/history (1‑D).</Text>
+        <Text style={styles.cardTitle}>Portfolio Value</Text>
       </View>
     );
   }
@@ -1652,7 +1647,7 @@ const DailyPortfolioValueChart = ({ acctSummary }) => {
 
   return (
     <View style={styles.card}>
-      <Text style={styles.cardTitle}>Portfolio Value (Daily)</Text>
+      <Text style={styles.cardTitle}>Portfolio Value</Text>
       <MiniLineChart
         series={pts}
         valueKey="val"
@@ -1666,24 +1661,30 @@ const DailyPortfolioValueChart = ({ acctSummary }) => {
         </Text>
         <Text style={styles.subtle}>{new Date(last.t).toLocaleDateString()}</Text>
       </View>
-      <Text style={styles.smallNote}>
-        Latest point = current equity; earlier points from <Text style={{ fontWeight: '800' }}>/account/portfolio/history</Text> (1‑D).
-      </Text>
     </View>
   );
 };
 
-/* ─────────────────────────── 23b) CHART: HOLDINGS % CHANGE (LIVE) ─────────────────────────── */
+/* ─────────────────────────── 23b) CHART: HOLDINGS PERCENTAGE (LOSS SHARE) ─────────────────────────── */
 const HoldingsChangeBarChart = () => {
   const [rows, setRows] = useState([]);
   const [lastAt, setLastAt] = useState(null);
+  const [totalLossUSD, setTotalLossUSD] = useState(0);
+
+  // Palette pulled from existing app colors to keep style cohesion.
+  const ACCENT_COLORS = ['#7fd180', '#f7b801', '#9f8ed7', '#b29cd4', '#355070', '#f37b7b', '#c5dbee', '#ead5ff', '#dcd3f7'];
+  const colorFor = (sym = '') => {
+    let h = 0;
+    for (let i = 0; i < sym.length; i++) h = (h * 31 + sym.charCodeAt(i)) >>> 0;
+    return ACCENT_COLORS[h % ACCENT_COLORS.length];
+  };
 
   useEffect(() => {
     let stopped = false;
     const poll = async () => {
       try {
         const positions = await getAllPositionsCached();
-        const items = (positions || [])
+        const base = (positions || [])
           .filter((p) => {
             const qty = +p.qty || 0;
             const mv  = +(p.market_value ?? p.marketValue ?? 0);
@@ -1696,14 +1697,20 @@ const HoldingsChangeBarChart = () => {
             const mv     = +(p.market_value ?? p.marketValue ?? NaN);
             const curRaw = +(p.current_price ?? p.asset_current_price ?? NaN);
             const mark   = Number.isFinite(curRaw) ? curRaw : (Number.isFinite(mv) && qty > 0 ? mv / qty : NaN);
-            const pct    = (Number.isFinite(basis) && basis > 0 && Number.isFinite(mark))
-              ? ((mark / basis) - 1) * 100
-              : NaN;
-            return { symbol, pct, basis, mark };
-          })
-          .sort((a, b) => Math.abs(b.pct || 0) - Math.abs(a.pct || 0));
+            const cost   = (Number.isFinite(basis) && qty > 0) ? basis * qty : NaN;
+            const mval   = (Number.isFinite(mark)  && qty > 0) ? mark  * qty : NaN;
+            const lossUSD = (Number.isFinite(cost) && Number.isFinite(mval) && cost > mval) ? (cost - mval) : 0;
+            return { symbol, lossUSD, basis, mark };
+          });
 
-        setRows(items);
+        const totLoss = base.reduce((s, r) => s + (r.lossUSD > 0 ? r.lossUSD : 0), 0);
+        const rowsOut = base
+          .filter((r) => r.lossUSD > 0)
+          .map((r) => ({ ...r, pct: totLoss > 0 ? (r.lossUSD / totLoss) * 100 : 0, color: colorFor(r.symbol) }))
+          .sort((a, b) => (b.pct - a.pct));
+
+        setTotalLossUSD(totLoss);
+        setRows(rowsOut);
         setLastAt(new Date().toISOString());
       } catch {}
       if (!stopped) setTimeout(poll, 4000);
@@ -1715,47 +1722,40 @@ const HoldingsChangeBarChart = () => {
   if (!rows.length) {
     return (
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Holdings % Change (Live)</Text>
-        <Text style={styles.smallNote}>No active positions detected (or only dust/stables).</Text>
+        <Text style={styles.cardTitle}>Holdings Percentage</Text>
+        <Text style={styles.subtle}>No current unrealized losses detected.</Text>
       </View>
     );
   }
 
-  const maxAbs = Math.max(0.5, ...rows.map((r) => Math.abs(Number(r.pct) || 0)));
+  // Display as left→right bars scaled to 100% of total current loss
+  const maxPct = Math.max(100, ...rows.map((r) => Number(r.pct) || 0));
 
   return (
     <View style={styles.card}>
-      <Text style={styles.cardTitle}>Holdings % Change (Live)</Text>
+      <Text style={styles.cardTitle}>Holdings Percentage</Text>
       <View style={{ gap: 8 }}>
         {rows.map((r) => {
-          const pct = Number(r.pct);
-          const posWidth = pct > 0 ? Math.min(1, pct / maxAbs) : 0;
-          const negWidth = pct < 0 ? Math.min(1, Math.abs(pct) / maxAbs) : 0;
+          const pct = Math.max(0, Number(r.pct) || 0);
+          const widthFrac = Math.min(1, pct / maxPct);
           return (
             <View key={r.symbol} style={styles.holdRow}>
+              <View style={[styles.legendSwatch, { backgroundColor: r.color }]} />
               <Text style={styles.holdLabel}>{r.symbol}</Text>
               <View style={styles.holdBarWrap}>
-                <View style={styles.holdZero} />
-                <View style={[styles.holdSide, styles.holdNeg, { flex: negWidth }]} />
-                <View style={{ width: 1 }} />
-                <View style={[styles.holdSide, styles.holdPos, { flex: posWidth }]} />
+                <View style={[styles.holdFill, { flex: widthFrac, backgroundColor: r.color }]} />
               </View>
-              <Text style={[styles.holdPct, { color: pct >= 0 ? '#3b7f4d' : '#a94444' }]}>
-                {Number.isFinite(pct) ? `${pct.toFixed(2)}%` : '—'}
-              </Text>
+              <Text style={styles.holdPct}>{Number.isFinite(pct) ? `${pct.toFixed(1)}%` : '—'}</Text>
             </View>
           );
         })}
       </View>
       {!!lastAt && (
         <View style={styles.legendRow}>
-          <Text style={styles.subtle}>Scale: ±{maxAbs.toFixed(1)}%</Text>
+          <Text style={styles.subtle}>Total loss: {fmtUSD(totalLossUSD)}</Text>
           <Text style={styles.subtle}>{new Date(lastAt).toLocaleTimeString()}</Text>
         </View>
       )}
-      <Text style={styles.smallNote}>
-        % change = (mark ÷ avg entry − 1). Uses Alpaca position snapshot (updates every few seconds).
-      </Text>
     </View>
   );
 };
@@ -3257,9 +3257,10 @@ export default function App() {
           </View>
         </View>
 
+        {/* Chart order per request: 1) Portfolio Percentage, 2) Holdings Percentage, 3) Portfolio Value */}
         <PortfolioChangeChart acctSummary={acctSummary} />
-        <DailyPortfolioValueChart acctSummary={acctSummary} />
         <HoldingsChangeBarChart />
+        <DailyPortfolioValueChart acctSummary={acctSummary} />
         <TxnHistoryCSVViewer />
 
         <LiveLogsCopyViewer logs={logHistory} />
@@ -3412,20 +3413,18 @@ const styles = StyleSheet.create({
 
   holdRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   holdLabel: { width: 72, color: '#355070', fontWeight: '800', fontSize: 11, textAlign: 'right' },
+  legendSwatch: { width: 10, height: 10, borderRadius: 2, },
   holdBarWrap: {
     flex: 1,
     height: 12,
-    backgroundColor: '#eef7ff',
+    backgroundColor: '#121212', /* mimic chart #1 dark track */
     borderRadius: 6,
     overflow: 'hidden',
     flexDirection: 'row',
     alignItems: 'center',
     position: 'relative',
   },
-  holdZero: { position: 'absolute', left: '50%', width: 1, top: 0, bottom: 0, backgroundColor: '#cde6f3' },
-  holdSide: { height: '100%' },
-  holdNeg: { backgroundColor: '#f37b7b', transform: [{ scaleX: -1 }] },
-  holdPos: { backgroundColor: '#7fd180' },
+  holdFill: { height: '100%' },
   holdPct: { width: 70, textAlign: 'right', fontSize: 11, fontWeight: '800' },
 
   legendRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 6 },
