@@ -12,7 +12,7 @@ import {
   TextInput,
   Platform,
 } from 'react-native';
-import Svg, { Path, Circle } from 'react-native-svg';
+import Svg, { Circle } from 'react-native-svg';
 import Constants from 'expo-constants';
 
 /* ──────────────────────────────── 1) VERSION / CONFIG ──────────────────────────────── */
