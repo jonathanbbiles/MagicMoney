@@ -12,7 +12,7 @@ import {
   TextInput,
   Platform,
 } from 'react-native';
-import { Svg, Path, Circle } from 'react-native-svg';
+import Svg, { Path, Circle } from 'react-native-svg';
 import Constants from 'expo-constants';
 
 /* ──────────────────────────────── 1) VERSION / CONFIG ──────────────────────────────── */
@@ -1666,20 +1666,12 @@ const DailyPortfolioValueChart = ({ acctSummary }) => {
   );
 };
 
-/* ─────────────────────────── 23b) CHART: HOLDINGS PERCENTAGE (PIE + SELECTED P&L) ─────────────────────────── */
-/**
- * Replaces the bar chart with a donut (pie) showing each holding's share of *unrealized loss*,
- * using the exact same logic/filters as before. In the same row, a second donut shows the
- * % gain/loss for the *selected* symbol while it’s being held. Tap a slice or legend to select.
- */
-const HoldingsLossPieRow = () => {
+/* ─────────────────────────── 23b) CHART: HOLDINGS PERCENTAGE (LOSS SHARE) ─────────────────────────── */
+const HoldingsChangeBarChart = () => {
   const [rows, setRows] = useState([]);
-  const [allHoldings, setAllHoldings] = useState([]);
-  const [totalLossUSD, setTotalLossUSD] = useState(0);
   const [lastAt, setLastAt] = useState(null);
-  const [selectedSym, setSelectedSym] = useState(null);
+  const [totalLossUSD, setTotalLossUSD] = useState(0);
 
-  // Same palette + hashing strategy as before for consistent colors
   const ACCENT_COLORS = ['#7fd180', '#f7b801', '#9f8ed7', '#b29cd4', '#355070', '#f37b7b', '#c5dbee', '#ead5ff', '#dcd3f7'];
   const colorFor = (sym = '') => {
     let h = 0;
@@ -1687,7 +1679,6 @@ const HoldingsLossPieRow = () => {
     return ACCENT_COLORS[h % ACCENT_COLORS.length];
   };
 
-  // Poll positions every ~4s (same cadence/logic as the previous bar chart)
   useEffect(() => {
     let stopped = false;
     const poll = async () => {
@@ -1709,178 +1700,121 @@ const HoldingsLossPieRow = () => {
             const cost   = (Number.isFinite(basis) && qty > 0) ? basis * qty : NaN;
             const mval   = (Number.isFinite(mark)  && qty > 0) ? mark  * qty : NaN;
             const lossUSD = (Number.isFinite(cost) && Number.isFinite(mval) && cost > mval) ? (cost - mval) : 0;
-            const plPct = (Number.isFinite(basis) && basis > 0 && Number.isFinite(mark))
-              ? ((mark - basis) / basis) * 100
-              : 0;
-            return { symbol, lossUSD, basis, mark, plPct, color: colorFor(symbol) };
+            return { symbol, lossUSD, basis, mark };
           });
 
         const totLoss = base.reduce((s, r) => s + (r.lossUSD > 0 ? r.lossUSD : 0), 0);
         const rowsOut = base
           .filter((r) => r.lossUSD > 0)
-          .map((r) => ({ ...r, pct: totLoss > 0 ? (r.lossUSD / totLoss) * 100 : 0 }))
+          .map((r) => ({ ...r, pct: totLoss > 0 ? (r.lossUSD / totLoss) * 100 : 0, color: colorFor(r.symbol) }))
           .sort((a, b) => (b.pct - a.pct));
 
         setTotalLossUSD(totLoss);
         setRows(rowsOut);
-        setAllHoldings(base);
         setLastAt(new Date().toISOString());
-
-        // Keep a reasonable default selection
-        if (!selectedSym) {
-          if (rowsOut.length) setSelectedSym(rowsOut[0].symbol);
-          else if (base.length) setSelectedSym(base[0].symbol);
-        }
       } catch {}
       if (!stopped) setTimeout(poll, 4000);
     };
     poll();
     return () => { stopped = true; };
-  }, [selectedSym]);
+  }, []);
 
-  // --- Donut math helpers (react-native-svg) ---
-  const size = 170, cx = size / 2, cy = size / 2, radius = 60, thickness = 18;
-  const full = Math.PI * 2;
-  const GAP_RAD = 0.012; // small visual gap between slices
+  if (!rows.length) {
+    return (
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Holdings Percentage</Text>
+        <Text style={styles.subtle}>No current unrealized losses detected.</Text>
+      </View>
+    );
+  }
 
-  const arcPath = (r, start, end) => {
-    const large = end - start > Math.PI ? 1 : 0;
-    const x0 = cx + r * Math.cos(start);
-    const y0 = cy + r * Math.sin(start);
-    const x1 = cx + r * Math.cos(end);
-    const y1 = cy + r * Math.sin(end);
-    return `M ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1}`;
-  };
+  const size = 180;
+  const stroke = 22;
+  const cx = size / 2;
+  const cy = size / 2;
+  const radius = cx - stroke / 2;
+  const C = 2 * Math.PI * radius;
 
-  // Build slices from rows (loss shares)
-  const slices = (() => {
-    if (!rows.length || totalLossUSD <= 0) return [];
-    let acc = -Math.PI / 2; // start at 12 o'clock
-    return rows.map((r) => {
-      const span = (r.pct / 100) * full;
-      const s = acc + GAP_RAD / 2;
-      const e = acc + Math.max(0, span - GAP_RAD / 2);
-      acc += span;
-      return { ...r, start: s, end: e };
-    });
-  })();
-
-  // Selected symbol’s P&L % (while held)
-  const sel = (() => {
-    if (!selectedSym) return null;
-    const inRows = rows.find((r) => r.symbol === selectedSym);
-    if (inRows) return inRows;
-    const inAll = allHoldings.find((r) => r.symbol === selectedSym);
-    if (inAll) return inAll;
-    return null;
-  })();
-
-  const selPct = Number.isFinite(sel?.plPct) ? sel.plPct : null;
-  const selColor = (selPct ?? 0) >= 0 ? '#7fd180' : '#f37b7b';
-
-  // Ring gauge scaling (visual only): ±50% -> full ring
-  const maxAbs = 50;
-  const fillFrac = Number.isFinite(selPct) ? Math.max(0, Math.min(1, Math.abs(selPct) / maxAbs)) : 0;
-  const gaugeStart = -Math.PI / 2;
-  const gaugeEnd = gaugeStart + full * fillFrac;
-  const trackColor = '#e0d8f6';
+  let accFrac = 0;
+  const segs = rows.map((r, idx) => {
+    const pctVal = Number(r.pct);
+    const fracRaw = Math.max(0, Math.min(1, Number.isFinite(pctVal) ? pctVal / 100 : 0));
+    const startFrac = Math.min(Math.max(accFrac, 0), 1);
+    let frac = fracRaw;
+    if (idx === rows.length - 1) {
+      frac = Math.max(0, 1 - startFrac);
+    }
+    const len = frac * C;
+    const offset = ((startFrac % 1) + 1) % 1 * C;
+    accFrac = startFrac + frac;
+    return {
+      key: r.symbol,
+      color: r.color,
+      len,
+      offset,
+      pct: Number.isFinite(pctVal) ? pctVal : NaN,
+    };
+  });
 
   return (
-    <View style={styles.grid2}>
-      {/* Left: Loss-share pie */}
-      <View style={[styles.card, styles.cardHalf]}>
-        <Text style={styles.cardTitle}>Holdings Percentage</Text>
-        {!rows.length ? (
-          <>
-            <Text style={styles.subtle}>All good — no unrealized losses right now.</Text>
-            {!!lastAt && <Text style={styles.subtle}>{new Date(lastAt).toLocaleTimeString()}</Text>}
-          </>
-        ) : (
-          <View style={styles.pieBox}>
-            <Svg width={size} height={size}>
-              {/* Track (thin) */}
-              <Circle cx={cx} cy={cy} r={radius} stroke="#cde6f3" strokeWidth={thickness * 0.35} fill="none" />
-              {slices.map((sl) => (
-                <Path
-                  key={sl.symbol}
-                  d={arcPath(radius, sl.start, sl.end)}
-                  stroke={sl.color}
-                  strokeWidth={thickness}
-                  strokeLinecap="butt"
-                  fill="none"
-                  onPress={() => setSelectedSym(sl.symbol)}
-                />
-              ))}
-              {/* Inner cutout */}
-              <Circle cx={cx} cy={cy} r={radius - thickness * 0.72} fill="#ffffff" />
-            </Svg>
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>Holdings Percentage</Text>
 
-            <View style={styles.pieCenter}>
-              <Text style={styles.centerTextSmall}>Total Unrealized Loss</Text>
-              <Text style={styles.centerTextBig}>{fmtUSD(totalLossUSD)}</Text>
-            </View>
-
-            <Text style={styles.tapHint}>Tap a slice or legend to select →</Text>
-
-            {/* Legend */}
-            <View style={styles.pieLegendRow}>
-              {rows.slice(0, 6).map((r) => (
-                <TouchableOpacity key={r.symbol} style={styles.pieLegendItem} onPress={() => setSelectedSym(r.symbol)}>
-                  <View style={[styles.legendSwatch, { backgroundColor: r.color }]} />
-                  <Text style={styles.holdLabel}>{r.symbol}</Text>
-                  <Text style={styles.holdPct}>{r.pct.toFixed(1)}%</Text>
-                </TouchableOpacity>
-              ))}
-              {rows.length > 6 && (
-                <Text style={[styles.subtle, { marginTop: 4 }]}>+ {rows.length - 6} more…</Text>
-              )}
-            </View>
-
-            {!!lastAt && (
-              <View style={styles.legendRow}>
-                <Text style={styles.subtle}>Updated {new Date(lastAt).toLocaleTimeString()}</Text>
-                <View />
-              </View>
-            )}
-          </View>
-        )}
-      </View>
-
-      {/* Right: Selected symbol’s P&L% donut */}
-      <View style={[styles.card, styles.cardHalf]}>
-        <Text style={styles.cardTitle}>Selected Holding — % Gain/Loss</Text>
-        {!selectedSym ? (
-          <Text style={styles.subtle}>Select a slice on the left.</Text>
-        ) : (
-          <View style={styles.donutBox}>
-            <Svg width={size} height={size}>
-              {/* Background track */}
-              <Circle cx={cx} cy={cy} r={radius} stroke={trackColor} strokeWidth={thickness} fill="none" />
-              {/* Progress (± scaled ring) */}
-              <Path
-                d={arcPath(radius, gaugeStart, gaugeEnd)}
-                stroke={selColor}
-                strokeWidth={thickness}
-                strokeLinecap="round"
+      <View style={{ alignItems: 'center', justifyContent: 'center', paddingVertical: 6 }}>
+        <Svg width={size} height={size}>
+          <Circle
+            cx={cx}
+            cy={cy}
+            r={radius}
+            stroke="#121212"
+            strokeWidth={stroke}
+            fill="none"
+          />
+          {segs.map((s) => {
+            if (!(s.len > 0)) return null;
+            const dashArray = `${s.len} ${Math.max(C - s.len, 0)}`;
+            const dashOffset = s.offset === 0 ? 0 : -s.offset;
+            return (
+              <Circle
+                key={s.key}
+                cx={cx}
+                cy={cy}
+                r={radius}
+                stroke={s.color}
+                strokeWidth={stroke}
                 fill="none"
+                strokeDasharray={dashArray}
+                strokeDashoffset={dashOffset}
+                strokeLinecap="butt"
+                transform={`rotate(-90 ${cx} ${cy})`}
               />
-              {/* Inner cutout */}
-              <Circle cx={cx} cy={cy} r={radius - thickness * 0.72} fill="#ffffff" />
-            </Svg>
-
-            <View style={styles.pieCenter}>
-              <Text style={styles.centerTextSmall}>{selectedSym}</Text>
-              <Text style={[styles.centerTextBig, { color: selColor }]}>{
-                Number.isFinite(selPct) ? fmtPct(selPct) : '—'
-              }</Text>
-              <Text style={styles.gaugeNote}>scaled to ±50%</Text>
-            </View>
-          </View>
-        )}
+            );
+          })}
+        </Svg>
       </View>
+
+      <View style={{ gap: 8, marginTop: 8 }}>
+        {rows.map((r) => (
+          <View key={r.symbol} style={styles.holdRow}>
+            <View style={[styles.legendSwatch, { backgroundColor: r.color }]} />
+            <Text style={styles.holdLabel}>{r.symbol}</Text>
+            <View style={{ flex: 1 }} />
+            <Text style={styles.holdPct}>{Number.isFinite(r.pct) ? `${Number(r.pct).toFixed(1)}%` : '—'}</Text>
+          </View>
+        ))}
+      </View>
+
+      {!!lastAt && (
+        <View style={styles.legendRow}>
+          <Text style={styles.subtle}>Total loss: {fmtUSD(totalLossUSD)}</Text>
+          <Text style={styles.subtle}>{new Date(lastAt).toLocaleTimeString()}</Text>
+        </View>
+      )}
     </View>
   );
 };
+
+const HoldingsLossPieRow = HoldingsChangeBarChart;
 /* ─────────────────────────── 24) ENTRY / ORDERING / EXITS ─────────────────────────── */
 async function fetchAssetMeta(symbol) {
   try {
