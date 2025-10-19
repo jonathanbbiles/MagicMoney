@@ -320,11 +320,24 @@ function synthQuoteFromTrade(price, bps = SETTINGS.syntheticTradeSpreadBps) {
 }
 
 /* ───────────────────────── 7) ACCOUNT / HISTORY / ACTIVITIES ───────────────────────── */
-async function getPortfolioHistory({ period = '1M', timeframe = '1D' } = {}) {
-  const url = `${ALPACA_BASE_URL}/account/portfolio/history?period=${encodeURIComponent(period)}&timeframe=${encodeURIComponent(timeframe)}&extended_hours=true`;
+async function getPortfolioHistory({
+  period = '1D',
+  timeframe = '5Min',
+  intraday_reporting = 'continuous', // crypto-friendly
+  pnl_reset = 'no_reset',            // continuous P&L
+  extended_hours = true,             // harmless toggle for equities; ignored for crypto
+} = {}) {
+  const sp = new URLSearchParams({
+    period: String(period),
+    timeframe: String(timeframe),
+    intraday_reporting: String(intraday_reporting),
+    pnl_reset: String(pnl_reset),
+    extended_hours: String(!!extended_hours),
+  });
+  const url = `${ALPACA_BASE_URL}/account/portfolio/history?${sp.toString()}`;
   const res = await f(url, { headers: HEADERS });
   if (!res.ok) return null;
-  return res.json().catch(() => null);
+  try { return await res.json(); } catch { return null; }
 }
 
 async function getActivities({ afterISO, untilISO, pageToken, types } = {}) {
@@ -1623,47 +1636,71 @@ const MiniLineChart = ({ series, valueKey = 'val', height = 100, colorMode = 'by
 /* ─────────────────────────── 22) CHARTS: PORTFOLIO CHANGE ─────────────────────────── */
 const PortfolioChangeChart = ({ acctSummary }) => {
   const [pts, setPts] = useState([]);
+  const baseRef = useRef(null);   // history base_value
   const seededRef = useRef(false);
 
+  // Seed from intraday, continuous history (single baseline)
   useEffect(() => {
     (async () => {
       if (seededRef.current) return;
       seededRef.current = true;
-      try {
-        const hist = await getPortfolioHistory({ period: '1D', timeframe: '5Min' });
-        if (!hist) return;
 
-        const ts = (hist.timestamp || hist.timestamps || []).map((t) => parseTsMs(t)).filter(Number.isFinite);
-        const rawPct = (hist.profit_loss_pct || hist.pnl_pct || []).map((x) => +x);
-        let seeded = [];
-        if (rawPct.length && ts.length) {
-          // Alpaca returns decimals (e.g., 0.0048 for 0.48%). Convert to percent.
-          seeded = rawPct.map((v, i) => ({
-            t: ts[i] || (Date.now() - (rawPct.length - i) * 300000),
-            pct: v * 100,
-          }));
-        } else if (Array.isArray(hist.equity)) {
-          const eq = hist.equity.map((x) => +x).filter(Number.isFinite);
-          const base = Number.isFinite(+hist.base_value) ? +hist.base_value : (eq[0] || 1);
-          seeded = eq.map((e, i) => ({
-            t: ts[i] || (Date.now() - (eq.length - i) * 300000),
-            pct: ((e / base) - 1) * 100,
-          }));
-        }
-        if (seeded.length) setPts(seeded.slice(-200));
-      } catch {}
+      const hist = await getPortfolioHistory({
+        period: '1D',
+        timeframe: '5Min',
+        intraday_reporting: 'continuous',
+        pnl_reset: 'no_reset',
+        extended_hours: true,
+      });
+      if (!hist) return;
+
+      // Prefer equity + base_value to avoid rounding artifacts
+      const ts = (hist.timestamp || hist.timestamps || []).map((t) => parseTsMs(t)).filter(Number.isFinite);
+      const eq = Array.isArray(hist.equity) ? hist.equity.map((x) => +x).filter(Number.isFinite) : [];
+      let base = Number.isFinite(+hist.base_value) ? +hist.base_value : (eq.length ? eq[0] : NaN);
+      if (!Number.isFinite(base) || base <= 0) {
+        base = (eq.length ? eq[0] : 1);
+      }
+      baseRef.current = base;
+
+      let seeded = [];
+      if (eq.length && ts.length) {
+        seeded = eq.map((e, i) => ({
+          t: ts[i] || (Date.now() - (eq.length - i) * 300000),
+          pct: ((e / base) - 1) * 100, // percent vs same base
+        }));
+      } else if (Array.isArray(hist.profit_loss_pct)) {
+        // Fallback if equity missing: hist.profit_loss_pct is a fraction
+        const plp = hist.profit_loss_pct.map((v) => (+v) * 100);
+        seeded = plp.map((p, i) => ({
+          t: ts[i] || (Date.now() - (plp.length - i) * 300000),
+          pct: p,
+        }));
+      }
+
+      if (seeded.length) setPts(seeded.slice(-200));
     })();
   }, []);
 
+  // Live update: recompute last point from SAME base (no dailyChangePct mixing)
   useEffect(() => {
-    const v = Number(acctSummary?.dailyChangePct);
-    if (Number.isFinite(v)) {
-      setPts((prev) => {
-        const next = [...prev, { t: Date.now(), pct: v }];
-        return next.length > 200 ? next.slice(next.length - 200) : next;
-      });
-    }
-  }, [acctSummary?.dailyChangePct]);
+    const base = baseRef.current;
+    const curEq = Number(acctSummary?.portfolioValue);
+    if (!Number.isFinite(base) || !Number.isFinite(curEq) || base <= 0) return;
+
+    const pctNow = ((curEq / base) - 1) * 100;
+    setPts((prev) => {
+      const next = prev && prev.length ? prev.slice() : [];
+      const now = Date.now();
+      if (!next.length) return [{ t: now, pct: pctNow }];
+      // Replace last if same 5-min bucket, else append
+      const last = next[next.length - 1];
+      const sameBucket = Math.floor((last.t || 0) / 300000) === Math.floor(now / 300000);
+      if (sameBucket) next[next.length - 1] = { t: now, pct: pctNow };
+      else next.push({ t: now, pct: pctNow });
+      return next.slice(-200);
+    });
+  }, [acctSummary?.portfolioValue]);
 
   if (!pts.length) {
     return (
