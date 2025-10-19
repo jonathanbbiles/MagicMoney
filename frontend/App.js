@@ -12,78 +12,563 @@ import {
   TextInput,
   Platform,
 } from 'react-native';
-import Svg, { Circle } from 'react-native-svg';
+import Constants from 'expo-constants';
 
-import {
-  ALPACA_BASE_URL,
-  BLACKLIST,
-  DUST_FLATTEN_MAX_USD,
-  DUST_SWEEP_MINUTES,
-  EQUITY_COMMISSION_PER_TRADE_USD,
-  EQUITY_SEC_FEE_BPS,
-  EQUITY_TAF_CAP,
-  EQUITY_TAF_PER_SHARE,
-  EXTRA_OVER_FEES_BPS,
-  FEE_BPS_MAKER,
-  FEE_BPS_TAKER,
-  HEADERS,
-  MAX_CRYPTOS,
-  MAX_EQUITIES,
-  MIN_BID_NOTIONAL_LOOSE_USD,
-  MIN_BID_SIZE_LOOSE,
-  MIN_PRICE_FOR_TICK_SANE_USD,
-  QUOTE_TTL_MS,
-  SIMPLE_SETTINGS_ONLY,
-  SPREAD_OVER_FEES_MIN_BPS,
-  STABLES,
-  VERSION,
-} from './src/config/alpaca';
-import {
-  effectiveSetting,
-  getOverrides,
-  getSettings,
-  setOverridesSnapshot,
-  setSettingsSnapshot,
-  subscribeOverrides,
-  subscribeSettings,
-} from './src/state/settingsStore';
-import {
-  cancelAllOrders,
-  cancelOpenOrdersForSymbol,
-  getAccountSummaryRaw,
-  getAllPositionsCached,
-  getOpenOrdersCached,
-  getUsableBuyingPower,
-  invalidateOpenOrdersCache,
-  invalidatePositionsCache,
-  getCryptoBars1m,
-  getCryptoBars1mBatch,
-  getCryptoQuotesBatch,
-  getCryptoTradesBatch,
-  getPnLAndFeesSnapshot,
-  getPortfolioHistory,
-  getQuoteSmart,
-  getStockClockCached,
-  markUnsupported,
-  registerAlpacaLogger,
-} from './src/services/alpacaClient';
-import { clamp, emaArr, fmtPct, fmtUSD, isFractionalQty, isFresh, parseTsMs, roundToTick } from './src/utils/format';
-import { rateLimitedFetch, sleep } from './src/utils/network';
-import { toDataSymbol, isCrypto, isStock } from './src/utils/symbols';
-import { LiveLogsCopyViewer, TxnHistoryCSVViewer } from './src/components/HistoryViewers';
+/* ──────────────────────────────── 1) VERSION / CONFIG ──────────────────────────────── */
+const VERSION = 'v1';
+const EX = Constants?.expoConfig?.extra || Constants?.manifest?.extra || {};
 
+// (per user request: do not change keys)
+const ALPACA_KEY = 'AKANN0IP04IH45Z6FG3L';
+const ALPACA_SECRET = 'qvaKRqP9Q3XMVMEYqVnq2BEgPGhQQQfWg1JT7bWV';
+// Force LIVE trading endpoint, ignoring EX/APCA overrides
+const ALPACA_BASE_URL = EX.APCA_API_BASE || 'https://api.alpaca.markets/v2';
+
+const DATA_ROOT_CRYPTO = 'https://data.alpaca.markets/v1beta3/crypto';
+// IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
+const DATA_LOCATIONS = ['us'];
+const DATA_ROOT_STOCKS_V2 = 'https://data.alpaca.markets/v2/stocks';
+
+const HEADERS = {
+  'APCA-API-KEY-ID': ALPACA_KEY,
+  'APCA-API-SECRET-KEY': ALPACA_SECRET,
+  Accept: 'application/json',
+  'Content-Type': 'application/json',
+};
+// Safety guard: crash loudly if a paper endpoint is ever used
+if (typeof ALPACA_BASE_URL === 'string' && /paper-api\.alpaca\.markets/i.test(ALPACA_BASE_URL)) {
+  throw new Error('Paper trading endpoint detected. LIVE ONLY is enforced. Fix ALPACA_BASE_URL.');
+}
 console.log('[Alpaca ENV]', { base: ALPACA_BASE_URL, mode: 'LIVE' });
 
+getAccountSummaryRaw().then(() => {
+  console.log('✅ Connected to Alpaca LIVE endpoint:', ALPACA_BASE_URL);
+}).catch((e) => {
+  console.log('❌ Alpaca connection error:', e?.message || e);
+});
+
+/* ───────────────────────────── 2) CORE CONSTANTS / STRATEGY ───────────────────────────── */
+// Fee constants retained for compatibility but no longer used for gating logic.
+const FEE_BPS_MAKER = 15;
+const FEE_BPS_TAKER = 25;
+const EQUITY_SEC_FEE_BPS = 0.35;
+const EQUITY_TAF_PER_SHARE = 0.000145;
+const EQUITY_TAF_CAP = 7.27;
+const EQUITY_COMMISSION_PER_TRADE_USD = 0.0;
+
+// Legacy guard constants retained but superseded by settings (see DEFAULT_SETTINGS).
+const SLIP_BUFFER_BPS_BY_RISK = [1, 2, 3, 4, 5];
+const STABLES = new Set(['USDTUSD', 'USDCUSD']);
+// You can remove SHIBUSD from blacklist if you want to include it despite tiny tick size.
+const BLACKLIST = new Set(['SHIBUSD']);
+const MIN_PRICE_FOR_TICK_SANE_USD = 0.001; // keep low, but still skip micro-price assets
+const DUST_FLATTEN_MAX_USD = 0.75;
+const DUST_SWEEP_MINUTES = 12;
+const MIN_BID_SIZE_LOOSE = 1;
+const MIN_BID_NOTIONAL_LOOSE_USD = 5; // gate by ~$ value, not raw size
+
+const MAX_EQUITIES = 400;
+const MAX_CRYPTOS = 400;
+
+const QUOTE_TTL_MS = 4000;
+
+/* Fee-aware gates */
+const DYNAMIC_MIN_PROFIT_BPS = 60; // ~0.60% target floor to cover fees + edge
+const EXTRA_OVER_FEES_BPS = 10;
+const SPREAD_OVER_FEES_MIN_BPS = 5;
 
 /* ────────────────────────────── 3) LIVE SETTINGS (UI-MUTABLE) ────────────────────────────── */
-let SETTINGS = { ...getSettings() };
-let SETTINGS_OVERRIDES = { ...getOverrides() };
+/**
+ * Safer defaults: enforce momentum & spread-over-fees; maker-first; dynamic stops with grace.
+ */
+const DEFAULT_SETTINGS = {
+  // Risk / scan pacing
+  riskLevel: 1,
+  scanMs: 5000,
+  stockPageSize: 12,
 
-subscribeSettings((next) => { SETTINGS = { ...next }; });
-subscribeOverrides((next) => { SETTINGS_OVERRIDES = { ...(next || {}) }; });
+  // Position sizing
+  maxPosPctEquity: 10,
+  absMaxNotionalUSD: 2000000,
+  maxConcurrentPositions: 8,
 
-const eff = (symbol, key) => effectiveSetting(symbol, key);
-const f = rateLimitedFetch;
+  // Entry gates
+  spreadMaxBps: 120,
+  spreadOverFeesMinBps: 0,
+  dynamicMinProfitBps: 60,
+  extraOverFeesBps: 10,
+  netMinProfitBps: 2.0,
+  minPriceUsd: 0.001,
+  slipBpsByRisk: [1, 2, 3, 4, 5],
+
+  // Quote handling
+  liveRequireQuote: true, // live quotes only; no synthetic fallback unless user disables this
+  quoteTtlMs: 15000,
+  liveFreshMsCrypto: 15000,
+  liveFreshMsStock: 15000,
+  liveFreshTradeMsCrypto: 180000,
+  syntheticTradeSpreadBps: 12,
+
+  // Momentum filter
+  enforceMomentum: true,
+
+  // Entry / exit behavior
+  enableTakerFlip: false,
+  takerExitOnTouch: true,
+  takerExitGuard: 'min',
+  makerCampSec: 18,
+  touchTicksRequired: 2,
+  touchFlipTimeoutSec: 8,
+  maxHoldMin: 20,
+  maxTimeLossUSD: -5.0,
+
+  // Stops / trailing
+  enableStops: true,
+  stopLossBps: 80,
+  hardStopLossPct: 1.8,
+  stopGraceSec: 10, // NEW
+  enableTrailing: true,
+  trailStartBps: 20,
+  trailingStopBps: 10,
+
+  // Daily halts
+  haltOnDailyLoss: true,
+  dailyMaxLossPct: 5.0,
+  haltOnDailyProfit: false,
+  dailyProfitTargetPct: 8.0,
+
+  // Fees (crypto)
+  feeBpsMaker: 15,
+  feeBpsTaker: 25,
+
+  // Housekeeping / dust handling
+  dustFlattenMaxUsd: 0.75,
+  dustSweepMinutes: 12,
+
+  // Misc / compatibility
+  netMinProfitUSD: 0.01,
+  netMinProfitUSDBase: 0.0,
+  netMinProfitPct: 0.02,
+  avoidPDT: false,
+  pdtEquityThresholdUSD: 10000,
+
+  // Gates
+  requireSpreadOverFees: false,
+
+  // Auto‑tune settings
+  autoTuneEnabled: false,
+  autoTuneWindowMin: 2,
+  autoTuneThreshold: 2,
+  autoTuneCooldownSec: 45,
+  autoTunePerSweepMaxSymbols: 5,
+  autoTuneSpreadStepBps: 10,
+  autoTuneFeesGuardStepBps: 5,
+  autoTuneNetMinStepBps: 0.5,
+  autoTuneMaxSpreadBps: 180,
+  autoTuneMinSpreadOverFeesBps: 0,
+  autoTuneMinNetMinBps: 1.0,
+};
+let SETTINGS = { ...DEFAULT_SETTINGS };
+
+// Minimal UI switch: show only Gate settings inside Settings panel.
+const SIMPLE_SETTINGS_ONLY = true;
+
+// Per-symbol overrides live here. Example: { SOLUSD: { spreadMaxBps: 130 } }
+let SETTINGS_OVERRIDES = {};
+
+// Effective setting helper: tries per-symbol override, falls back to global setting
+function eff(symbol, key) {
+  const o = SETTINGS_OVERRIDES?.[symbol];
+  const v = o && Object.prototype.hasOwnProperty.call(o, key) ? o[key] : undefined;
+  return v != null ? v : SETTINGS[key];
+}
+
+/* ─────────────────────────────── 4) UTILITIES / HTTP ─────────────────────────────── */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// --- Global request rate limiter (simple token bucket) ---
+let __TOKENS = 180; // ~180 req/min default budget
+let __LAST_REFILL = Date.now();
+const __REFILL_RATE = 180 / 60000; // tokens/ms
+const __MAX_TOKENS = 180;
+async function __takeToken() {
+  const now = Date.now();
+  const elapsed = now - __LAST_REFILL;
+  if (elapsed > 0) {
+    __TOKENS = Math.min(__MAX_TOKENS, __TOKENS + elapsed * __REFILL_RATE);
+    __LAST_REFILL = now;
+  }
+  if (__TOKENS >= 1) {
+    __TOKENS -= 1;
+    return;
+  }
+  const waitMs = Math.ceil((1 - __TOKENS) / __REFILL_RATE);
+  await sleep(Math.min(1500, Math.max(50, waitMs)));
+  return __takeToken();
+}
+
+async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
+  let lastErr = null;
+  for (let i = 0; i <= retries; i++) {
+    await __takeToken();
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...opts, signal: ac.signal });
+      clearTimeout(t);
+      if (res.status === 429 || res.status >= 500) {
+        if (i === retries) return res;
+        await sleep(400 * Math.pow(2, i) + Math.floor(Math.random() * 300));
+        continue;
+      }
+      return res;
+    } catch (e) {
+      clearTimeout(t);
+      lastErr = e;
+      if (i === retries) throw e;
+      await sleep(300 * Math.pow(2, i) + Math.floor(Math.random() * 250));
+    }
+  }
+  throw lastErr || new Error('fetch failed');
+}
+
+/* ─────────────────────────── 5) TIME / PARSE / FORMATTING ─────────────────────────── */
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+const fmtUSD = (n) =>
+  Number.isFinite(n)
+    ? `$ ${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : '—';
+const fmtPct = (n) => (Number.isFinite(n) ? `${n.toFixed(2)}%` : '—');
+
+const parseTsMs = (t) => {
+  if (t == null) return NaN;
+  if (typeof t === 'string') {
+    const ms = Date.parse(t);
+    if (Number.isFinite(ms)) return ms;
+    const n = +t;
+    if (Number.isFinite(n)) {
+      if (n > 1e15) return Math.floor(n / 1e6);
+      if (n > 1e12) return Math.floor(n / 1e3);
+      if (n > 1e10) return n;
+      if (n > 1e9) return n * 1000;
+    }
+    return NaN;
+  }
+  if (typeof t === 'number') {
+    if (t > 1e15) return Math.floor(t / 1e6);
+    if (t > 1e12) return Math.floor(t / 1e3);
+    if (t > 1e10) return t;
+    if (t > 1e9) return t * 1000;
+    return t;
+  }
+  return NaN;
+};
+const isFresh = (tsMs, ttlMs) => Number.isFinite(tsMs) && (Date.now() - tsMs <= ttlMs);
+
+const emaArr = (arr, span) => {
+  if (!arr?.length) return [];
+  const k = 2 / (span + 1);
+  let prev = arr[0];
+  const out = [prev];
+  for (let i = 1; i < arr.length; i++) {
+    prev = arr[i] * k + prev * (1 - k);
+    out.push(prev);
+  }
+  return out;
+};
+const roundToTick = (px, tick) => Math.ceil(px / tick) * tick;
+const isFractionalQty = (q) => Math.abs(q - Math.round(q)) > 1e-6;
+const isoDaysAgo = (n) => new Date(Date.now() - n * 864e5).toISOString();
+
+/* ──────────────────────────── 6) SYMBOL HELPERS ──────────────────────────── */
+function toDataSymbol(sym) {
+  if (!sym) return sym;
+  if (sym.includes('/')) return sym;
+  if (sym.endsWith('USD')) {
+    const base = sym.slice(0, -3);
+    if (!base || base.toUpperCase().endsWith('USD')) return `${sym}/USD`;
+    return `${base}/USD`;
+  }
+  return sym;
+}
+function isCrypto(sym) { return /USD$/.test(sym); }
+function isStock(sym) { return !isCrypto(sym); }
+
+function synthQuoteFromTrade(price, bps = SETTINGS.syntheticTradeSpreadBps) {
+  if (!(price > 0)) return null;
+  const half = price * (bps / 20000);
+  return { bid: price - half, ask: price + half, bs: null, as: null, tms: Date.now() };
+}
+
+/* ───────────────────────── 7) ACCOUNT / HISTORY / ACTIVITIES ───────────────────────── */
+async function getPortfolioHistory({ period = '1M', timeframe = '1D' } = {}) {
+  const url = `${ALPACA_BASE_URL}/account/portfolio/history?period=${encodeURIComponent(period)}&timeframe=${encodeURIComponent(timeframe)}&extended_hours=true`;
+  const res = await f(url, { headers: HEADERS });
+  if (!res.ok) return null;
+  return res.json().catch(() => null);
+}
+
+async function getActivities({ afterISO, untilISO, pageToken, types } = {}) {
+  const params = new URLSearchParams({
+    activity_types: types || 'FILL,CFEE,FEE,PTC',
+    direction: 'desc',
+    page_size: '100',
+  });
+  if (afterISO) params.set('after', afterISO);
+  if (untilISO) params.set('until', untilISO);
+  if (pageToken) params.set('page_token', pageToken);
+
+  const url = `${ALPACA_BASE_URL}/account/activities?${params.toString()}`;
+  const res = await f(url, { headers: HEADERS });
+  let items = [];
+  try { items = await res.json(); } catch {}
+  const next = res.headers?.get?.('x-next-page-token') || null;
+  return { items: Array.isArray(items) ? items : [], next };
+}
+
+async function getPnLAndFeesSnapshot() {
+  const hist1M = await getPortfolioHistory({ period: '1M', timeframe: '1D' });
+  let last7Sum = null, last7DownDays = null, last7UpDays = null, last30Sum = null;
+  if (hist1M?.profit_loss) {
+    const pl = hist1M.profit_loss.map(Number). filter(Number.isFinite);
+    const last7 = pl.slice(-7), last30 = pl.slice(-30);
+    last7Sum = last7.reduce((a,b)=>a+b,0);
+    last30Sum = last30.reduce((a,b)=>a+b,0);
+    last7UpDays = last7.filter((x)=>x>0).length;
+    last7DownDays = last7.filter((x)=>x<0).length;
+  }
+
+  let fees30 = 0, fillsCount30 = 0;
+  const afterISO = isoDaysAgo(30), untilISO = new Date().toISOString();
+  let token = null;
+  for (let i = 0; i < 10; i++) {
+    const { items, next } = await getActivities({ afterISO, untilISO, pageToken: token });
+    for (const it of items) {
+      const t = (it?.activity_type || it?.activityType || '').toUpperCase();
+      if (t === 'CFEE' || t === 'FEE' || t === 'PTC') {
+        const raw = it.net_amount ?? it.amount ?? it.price ?? (Number(it.per_share_amount) * Number(it.qty) || NaN);
+        const amt = Number(raw);
+        if (Number.isFinite(amt)) fees30 += amt;
+      } else if (t === 'FILL') fillsCount30 += 1;
+    }
+    if (!next) break;
+    token = next;
+  }
+  return { last7Sum, last7UpDays, last7DownDays, last30Sum, fees30, fillsCount30 };
+}
+
+/* ───────────────────────────── 8) MARKET CLOCK (STOCKS) ───────────────────────────── */
+async function getStockClock() {
+  try {
+    const r = await f(`${ALPACA_BASE_URL}/clock`, { headers: HEADERS });
+    if (!r.ok) return { is_open: false };
+    const j = await r.json();
+    return { is_open: !!j.is_open, next_open: j.next_open, next_close: j.next_close };
+  } catch {
+    return { is_open: false };
+  }
+}
+let STOCK_CLOCK_CACHE = { value: { is_open: false }, ts: 0 };
+async function getStockClockCached(ttlMs = 30000) {
+  const now = Date.now();
+  if (now - STOCK_CLOCK_CACHE.ts < ttlMs) return STOCK_CLOCK_CACHE.value;
+  const v = await getStockClock();
+  STOCK_CLOCK_CACHE = { value: v, ts: now };
+  return v;
+}
+
+/* ──────────────────────── 9) TRANSACTION HISTORY → CSV VIEWER ──────────────────────── */
+const TxnHistoryCSVViewer = () => {
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+  const [csv, setCsv] = useState('');
+  const csvRef = useRef(null);
+  const [collapsed, setCollapsed] = useState(false);
+
+  async function fetchActivities({ days = 7, types = 'FILL,CFEE,FEE,TRANS,PTC', max = 1000 } = {}) {
+    const untilISO = new Date().toISOString();
+    const afterISO = new Date(Date.now() - days * 864e5).toISOString();
+    let token = null;
+    let all = [];
+    for (let i = 0; i < 20; i++) {
+      const { items, next } = await getActivities({ afterISO, untilISO, pageToken: token, types });
+      all = all.concat(items);
+      if (!next || all.length >= max) break;
+      token = next;
+    }
+    return all.slice(0, max);
+  }
+
+  function toCsv(rows) {
+    const header = ['DateTime', 'Type', 'Side', 'Symbol', 'Qty', 'Price', 'CashFlowUSD', 'OrderID', 'ActivityID'];
+    const escape = (v) => {
+      if (v == null) return '';
+      const s = String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const lines = [header.join(',')];
+    for (const r of rows) {
+      const dtISO = r.transaction_time || r.date || '';
+      const local = dtISO ? new Date(dtISO).toLocaleString() : '';
+      const side = r.side || '';
+      const symbol = r.symbol || '';
+      const qty = r.qty || r.cum_qty || '';
+      const price = r.price || '';
+      let cash = '';
+      if ((r.activity_type || '').toUpperCase() === 'FILL') {
+        const q = parseFloat(qty ?? '0');
+        const p = parseFloat(price ?? '0');
+        if (Number.isFinite(q) && Number.isFinite(p)) {
+          const signed = q * p * (side === 'buy' ? -1 : 1);
+          cash = signed.toFixed(2);
+        }
+      } else {
+        const net = parseFloat(r.net_amount ?? r.amount ?? '');
+        cash = Number.isFinite(net) ? net.toFixed(2) : '';
+      }
+      const row = [local, r.activity_type, side, symbol, qty, price, cash, r.order_id || '', r.id || ''];
+      lines.push(row.map(escape).join(','));
+    }
+    return lines.join('\n');
+  }
+
+  const buildRange = async (days) => {
+    try {
+      setBusy(true);
+      setStatus('Fetching…');
+      setCsv('');
+      setCollapsed(false);
+      const acts = await fetchActivities({ days });
+      if (!acts.length) {
+        setStatus('No activities found in range.');
+        return;
+      }
+      const out = toCsv(acts);
+      setCsv(out);
+      setStatus(`Built ${acts.length} activities (${days}d). Tap the box → Select All → Copy.`);
+      setTimeout(() => {
+        try {
+          csvRef.current?.focus?.();
+          csvRef.current?.setNativeProps?.({ selection: { start: 0, end: out.length } });
+        } catch {}
+      }, 150);
+    } catch (err) {
+      setStatus(`Error: ${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <View style={styles.txnBox}>
+      <Text style={styles.txnTitle}>Transaction History → CSV</Text>
+      <View style={styles.txnBtnRow}>
+        <TouchableOpacity style={styles.txnBtn} onPress={() => buildRange(1)} disabled={busy}>
+          <Text style={styles.txnBtnText}>Build 24h CSV</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.txnBtn} onPress={() => buildRange(7)} disabled={busy}>
+          <Text style={styles.txnBtnText}>Build 7d CSV</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.txnBtn} onPress={() => buildRange(30)} disabled={busy}>
+          <Text style={styles.txnBtnText}>Build 30d CSV</Text>
+        </TouchableOpacity>
+      </View>
+      {busy ? <ActivityIndicator /> : null}
+      <Text style={styles.txnStatus}>{status}</Text>
+      {csv ? (
+        <>
+          {!collapsed ? (
+            <View style={{ marginTop: 8 }}>
+              <Text style={styles.csvHelp}>Tap the box → Select All → Copy</Text>
+              <TouchableOpacity onPress={() => setCollapsed(true)} style={styles.chip}>
+                <Text style={styles.chipText}>Minimize</Text>
+              </TouchableOpacity>
+              <TextInput
+                ref={csvRef}
+                style={styles.csvBox}
+                value={csv}
+                editable={false}
+                multiline
+                selectTextOnFocus
+                scrollEnabled
+                textBreakStrategy="highQuality"
+              />
+            </View>
+          ) : (
+            <View style={{ marginTop: 8 }}>
+              <TouchableOpacity onPress={() => setCollapsed(false)} style={styles.chip}>
+                <Text style={styles.chipText}>Show CSV</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+        </>
+      ) : null}
+    </View>
+  );
+};
+
+/* ─────────────────────────── 9b) LIVE LOGS → COPY VIEWER ─────────────────────────── */
+const LiveLogsCopyViewer = ({ logs = [] }) => {
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState('');
+  const [txt, setTxt] = useState('');
+  const txtRef = useRef(null);
+  const [collapsed, setCollapsed] = useState(false);
+
+  const build = async () => {
+    try {
+      setBusy(true);
+      setStatus('Building snapshot…');
+      setTxt('');
+      setCollapsed(false);
+      const lines = (logs || []).map((l) => {
+        const ts = new Date(l.ts).toLocaleString();
+        return `${ts} • ${l.text}`;
+      });
+      const out = lines.join('\n');
+      setTxt(out);
+      setStatus(`Built ${lines.length} lines. Tap the box → Select All → Copy.`);
+      setTimeout(() => {
+        try {
+          txtRef.current?.focus?.();
+          txtRef.current?.setNativeProps?.({ selection: { start: 0, end: out.length } });
+        } catch {}
+      }, 150);
+    } catch (e) {
+      setStatus(`Error: ${e?.message || e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <View style={styles.txnBox}>
+      <Text style={styles.txnTitle}>Live Logs → Copy</Text>
+      <View style={styles.txnBtnRow}>
+        <TouchableOpacity style={styles.txnBtn} onPress={build} disabled={busy}>
+          <Text style={styles.txnBtnText}>Build Snapshot</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.txnBtn} onPress={() => setCollapsed((v) => !v)} disabled={busy}>
+          <Text style={styles.txnBtnText}>{collapsed ? 'Show' : 'Minimize'}</Text>
+        </TouchableOpacity>
+      </View>
+      {busy ? <ActivityIndicator /> : null}
+      <Text style={styles.txnStatus}>{status}</Text>
+      {txt && !collapsed ? (
+        <TextInput
+          ref={txtRef}
+          style={styles.csvBox}
+          value={txt}
+          editable={false}
+          multiline
+          selectTextOnFocus
+          scrollEnabled
+          textBreakStrategy="highQuality"
+        />
+      ) : null}
+    </View>
+  );
+};
 
 /* ───────────────────────────── 10) STATIC UNIVERSES ───────────────────────────── */
 const ORIGINAL_TOKENS = [
@@ -113,6 +598,7 @@ const STATIC_UNIVERSE = Array.from(
   new Map([...TRAD_100, ...CRYPTO_STOCKS_100].map((s) => [s, { name: s, symbol: s, cc: null }])).values()
 );
 
+/* ───────────────────────── 11) QUOTE CACHE / SUPPORT FLAGS ───────────────────────── */
 const quoteCache = new Map();
 const unsupportedSymbols = new Map();
 const isUnsupported = (sym) => {
@@ -121,6 +607,198 @@ const isUnsupported = (sym) => {
   if (Date.now() > u) { unsupportedSymbols.delete(sym); return false; }
   return true;
 };
+function markUnsupported(sym, mins = 120) { unsupportedSymbols.set(sym, Date.now() + mins * 60000); }
+
+// -------------------------------------------------------------------------
+// BAR CACHE
+const barsCache = new Map();
+const barsCacheTTL = 30000; // 30 seconds
+
+/* ─────────────────────────────── 12) CRYPTO DATA API ─────────────────────────────── */
+const buildURLCrypto = (loc, what, symbolsCSV, params = {}) => {
+  const encoded = symbolsCSV.split(',').map((s) => encodeURIComponent(s)).join(',');
+  const sp = new URLSearchParams();
+  Object.entries(params || {}).forEach(([k, v]) => { if (v != null) sp.set(k, v); });
+  const qs = sp.toString();
+  return `${DATA_ROOT_CRYPTO}/${loc}/latest/${what}?symbols=${encoded}${qs ? '&' + qs : ''}`;
+};
+
+async function getCryptoQuotesBatch(dsyms = []) {
+  if (!dsyms.length) return new Map();
+  for (const loc of DATA_LOCATIONS) {
+    try {
+      const url = buildURLCrypto(loc, 'quotes', dsyms.join(','));
+      const r = await f(url, { headers: HEADERS });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        logTradeAction('quote_http_error', 'QUOTE', { status: r.status, loc, body: body?.slice?.(0, 120) });
+        continue;
+      }
+      const j = await r.json().catch(() => null);
+      const raw = j?.quotes || {};
+      const out = new Map();
+      for (const dsym of dsyms) {
+        const q = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
+        if (!q) continue;
+        const bid = Number(q.bp ?? q.bid_price);
+        const ask = Number(q.ap ?? q.ask_price);
+        const bs = Number(q.bs ?? q.bid_size);
+        const as = Number(q.as ?? q.ask_size);
+        const tms = parseTsMs(q.t);
+        if (bid > 0 && ask > 0) {
+          out.set(dsym, { bid, ask, bs: Number.isFinite(bs) ? bs : null, as: Number.isFinite(as) ? as : null, tms });
+        }
+      }
+      if (out.size) return out;
+    } catch (e) {
+      logTradeAction('quote_http_error', 'QUOTE', { status: 'exception', loc, body: e?.message || '' });
+    }
+  }
+  return new Map();
+}
+async function getCryptoTradesBatch(dsyms = []) {
+  if (!dsyms.length) return new Map();
+  for (const loc of DATA_LOCATIONS) {
+    try {
+      const url = buildURLCrypto(loc, 'trades', dsyms.join(','));
+      const r = await f(url, { headers: HEADERS });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        logTradeAction('trade_http_error', 'TRADE', { status: r.status, loc, body: body?.slice?.(0, 120) });
+        continue;
+      }
+      const j = await r.json().catch(() => null);
+      const raw = j?.trades || {};
+      const out = new Map();
+      for (const dsym of dsyms) {
+        const t = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
+        const p = Number(t?.p ?? t?.price);
+        const tms = parseTsMs(t?.t);
+        if (Number.isFinite(p) && p > 0) out.set(dsym, { price: p, tms });
+      }
+      if (out.size) return out;
+    } catch (e) {
+      logTradeAction('trade_http_error', 'TRADE', { status: 'exception', loc, body: e?.message || '' });
+    }
+  }
+  return new Map();
+}
+async function getCryptoBars1m(symbol, limit = 6) {
+  const dsym = toDataSymbol(symbol);
+  const cached = barsCache.get(dsym);
+  const now = Date.now();
+  if (cached && (now - cached.ts) < barsCacheTTL) {
+    return cached.bars.slice(0, limit);
+  }
+  for (const loc of DATA_LOCATIONS) {
+    try {
+      const sp = new URLSearchParams({ timeframe: '1Min', limit: String(limit), symbols: dsym });
+      const url = `${DATA_ROOT_CRYPTO}/${loc}/bars?${sp.toString()}`;
+      const r = await f(url, { headers: HEADERS });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        logTradeAction('quote_http_error', 'BARS', { status: r.status, loc, body: body?.slice?.(0, 120) });
+        continue;
+      }
+      const j = await r.json().catch(() => null);
+      const arr = j?.bars?.[dsym];
+      if (Array.isArray(arr) && arr.length) {
+        const bars = arr.map((b) => ({
+          open: Number(b.o ?? b.open),
+          high: Number(b.h ?? b.high),
+          low: Number(b.l ?? b.low),
+          close: Number(b.c ?? b.close),
+          vol: Number(b.v ?? b.volume ?? 0),
+          tms: parseTsMs(b.t),
+        })).filter((x) => Number.isFinite(x.close) && x.close > 0);
+        barsCache.set(dsym, { ts: now, bars: bars.slice() });
+        return bars;
+      }
+    } catch (e) {
+      logTradeAction('quote_http_error', 'BARS', { status: 'exception', loc, body: e?.message || '' });
+    }
+  }
+  return [];
+}
+
+async function getCryptoBars1mBatch(symbols = [], limit = 6) {
+  const uniqSyms = Array.from(new Set(symbols.filter(Boolean)));
+  if (!uniqSyms.length) return new Map();
+  const dsymList = uniqSyms.map((s) => toDataSymbol(s));
+  const out = new Map();
+  const now = Date.now();
+
+  const missing = [];
+  for (const dsym of dsymList) {
+    const cached = barsCache.get(dsym);
+    if (cached && (now - cached.ts) < barsCacheTTL) {
+      out.set(dsym.replace('/', ''), cached.bars.slice(0, limit));
+    } else {
+      missing.push(dsym);
+    }
+  }
+  if (!missing.length) return out;
+
+  for (const loc of DATA_LOCATIONS) {
+    try {
+      const sp = new URLSearchParams({ timeframe: '1Min', limit: String(limit), symbols: missing.join(',') });
+      const url = `${DATA_ROOT_CRYPTO}/${loc}/bars?${sp.toString()}`;
+      const r = await f(url, { headers: HEADERS });
+      if (!r.ok) {
+        const body = await r.text().catch(() => '');
+        logTradeAction('quote_http_error', 'BARS', { status: r.status, loc, body: body?.slice?.(0, 120) });
+        continue;
+      }
+      const j = await r.json().catch(() => null);
+      const raw = j?.bars || {};
+      for (const dsym of missing) {
+        const arr = raw[dsym];
+        if (Array.isArray(arr) && arr.length) {
+          const bars = arr.map((b) => ({
+            open: Number(b.o ?? b.open),
+            high: Number(b.h ?? b.high),
+            low: Number(b.l ?? b.low),
+            close: Number(b.c ?? b.close),
+            vol: Number(b.v ?? b.volume ?? 0),
+            tms: parseTsMs(b.t),
+          })).filter((x) => Number.isFinite(x.close) && x.close > 0);
+          barsCache.set(dsym, { ts: now, bars: bars.slice() });
+          out.set(dsym.replace('/', ''), bars.slice(0, limit));
+        }
+      }
+      break;
+    } catch (e) {
+      logTradeAction('quote_http_error', 'BARS', { status: 'exception', loc, body: e?.message || '' });
+    }
+  }
+  return out;
+}
+
+/* ──────────────────────────────── 13) STOCKS DATA API ─────────────────────────────── */
+async function stocksLatestQuotesBatch(symbols = []) {
+  if (!symbols.length) return new Map();
+  const csv = symbols.join(',');
+  try {
+    const r = await f(`${DATA_ROOT_STOCKS_V2}/quotes/latest?symbols=${encodeURIComponent(csv)}`, { headers: HEADERS });
+    if (!r.ok) return new Map();
+    const j = await r.json().catch(() => null);
+    const out = new Map();
+    for (const sym of symbols) {
+      const qraw = j?.quotes?.[sym];
+      const q = Array.isArray(qraw) ? qraw[0] : qraw;
+      if (!q) continue;
+      const bid = Number(q.bp ?? q.bid_price);
+      const ask = Number(q.ap ?? q.ask_price);
+      const bs = Number(q.bs ?? q.bid_size);
+      const as = Number(q.as ?? q.ask_size);
+      const tms = parseTsMs(q.t);
+      if (bid > 0 && ask > 0) out.set(sym, { bid, ask, bs: Number.isFinite(bs) ? bs : null, as: Number.isFinite(as) ? as : null, tms });
+    }
+    return out;
+  } catch { return new Map(); }
+}
+async function stocksLatestTrade(symbol) { return null; }
+async function stocksBars1m(symbols = [], limit = 6) { return new Map(); }
 
 /* ───────────────────────────── 14) FEE / PNL MODEL ───────────────────────────── */
 /**
@@ -556,6 +1234,147 @@ const getPositionInfo = async (symbol) => {
     };
   } catch { return null; }
 };
+const getAllPositions = async () => {
+  try {
+    const r = await f(`${ALPACA_BASE_URL}/positions`, { headers: HEADERS });
+    if (!r.ok) return [];
+    const arr = await r.json();
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+};
+const getOpenOrders = async () => {
+  try {
+    const r = await f(`${ALPACA_BASE_URL}/orders?status=open&nested=true&limit=100`, { headers: HEADERS });
+    if (!r.ok) return [];
+    const arr = await r.json();
+    return Array.isArray(arr) ? arr : [];
+  } catch { return []; }
+};
+let __openOrdersCache = { ts: 0, items: [] };
+async function getOpenOrdersCached(ttlMs = 2000) {
+  const now = Date.now();
+  if (now - __openOrdersCache.ts < ttlMs) return __openOrdersCache.items.slice();
+  const items = await getOpenOrders();
+  __openOrdersCache = { ts: now, items };
+  return items.slice();
+}
+
+let __positionsCache = { ts: 0, items: [] };
+async function getAllPositionsCached(ttlMs = 2000) {
+  const now = Date.now();
+  if (now - __positionsCache.ts < ttlMs) return __positionsCache.items.slice();
+  const items = await getAllPositions();
+  __positionsCache = { ts: now, items };
+  return items.slice();
+}
+
+// ---- Usable Buying Power (fresh snapshot minus pending BUY notional) ----
+async function getUsableBuyingPower({ forCrypto = true } = {}) {
+  // 1) fresh account
+  const a = await getAccountSummaryRaw();
+
+  // 2) start from the correct bucket
+  let base = forCrypto
+    ? (Number.isFinite(a.cryptoBuyingPower) ? a.cryptoBuyingPower : (Number.isFinite(a.cash) ? a.cash : a.buyingPower))
+    : (Number.isFinite(a.stockBuyingPower) ? a.stockBuyingPower : a.buyingPower);
+
+  base = Number.isFinite(base) ? base : 0;
+
+  // 3) subtract pending BUY notional (open orders) to avoid double-spending
+  let pending = 0;
+  try {
+    const open = await getOpenOrdersCached();
+    for (const o of open || []) {
+      const side = String(o.side || '').toLowerCase();
+      if (side !== 'buy') continue;
+
+      const sym = o.symbol || '';
+      const isCryptoSym = /USD$/.test(sym);
+      if (forCrypto !== isCryptoSym) continue;
+
+      const qty  = +o.qty || +o.quantity || NaN;
+      const lim  = +o.limit_price || +o.limitPrice || NaN;
+      const notl = +o.notional || NaN;
+
+      if (Number.isFinite(notl) && notl > 0) {
+        pending += notl;
+      } else if (Number.isFinite(qty) && qty > 0 && Number.isFinite(lim) && lim > 0) {
+        pending += qty * lim;
+      }
+      // market BUY with no notional: skip (cannot reserve safely)
+    }
+  } catch {}
+
+  const usable = Math.max(0, base - pending);
+  return { usable, base, pending, snapshot: a };
+}
+
+const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
+  try {
+    const open = await getOpenOrdersCached();
+    const targets = (open || []).filter(
+      (o) => o.symbol === symbol && (!side || (o.side || '').toLowerCase() === String(side).toLowerCase())
+    );
+    await Promise.all(
+      targets.map((o) =>
+        f(`${ALPACA_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null)
+      )
+    );
+    __openOrdersCache = { ts: 0, items: [] };
+  } catch {}
+};
+const cancelAllOrders = async () => {
+  try {
+    const orders = await getOpenOrdersCached();
+    await Promise.all((orders || []).map((o) => f(`${ALPACA_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null)));
+    __openOrdersCache = { ts: 0, items: [] };
+  } catch {}
+};
+
+async function getAccountSummaryRaw() {
+  const res = await f(`${ALPACA_BASE_URL}/account`, { headers: HEADERS });
+  if (!res.ok) throw new Error(`Account ${res.status}`);
+  const a = await res.json();
+  const num = (x) => { const n = parseFloat(x); return Number.isFinite(n) ? n : NaN; };
+
+  const equity = num(a.equity ?? a.portfolio_value);
+
+  // Buckets from Alpaca
+  const stockBP  = num(a.buying_power);
+  const cryptoBP = num(a.crypto_buying_power);
+  const nmbp     = num(a.non_marginable_buying_power);
+  const cash     = num(a.cash);
+  const dtbp     = num(a.daytrade_buying_power);
+
+  // Prefer NMBP, then cash, then cryptoBP
+  const cashish = Number.isFinite(nmbp) ? nmbp
+                : Number.isFinite(cash) ? cash
+                : Number.isFinite(cryptoBP) ? cryptoBP
+                : NaN;
+
+  // For display, show cash-like funds as buying power
+  const buyingPowerDisplay = Number.isFinite(cashish) ? cashish : stockBP;
+
+  const prevClose = num(a.equity_previous_close);
+  const lastEq = num(a.last_equity);
+  const ref = Number.isFinite(prevClose) ? prevClose : lastEq;
+  const changeUsd = Number.isFinite(equity) && Number.isFinite(ref) ? equity - ref : NaN;
+  const changePct = Number.isFinite(changeUsd) && ref > 0 ? (changeUsd / ref) * 100 : NaN;
+
+  const patternDayTrader = !!a.pattern_day_trader;
+  const daytradeCount = Number.isFinite(+a.daytrade_count) ? +a.daytrade_count : null;
+
+  return {
+    equity,
+    buyingPower: buyingPowerDisplay,
+    changeUsd, changePct,
+    patternDayTrader, daytradeCount,
+    cryptoBuyingPower: cashish,
+    stockBuyingPower: Number.isFinite(stockBP) ? stockBP : cashish,
+    daytradeBuyingPower: dtbp,
+    cash
+  };
+}
 function capNotional(symbol, proposed, equity) {
   const hardCap = SETTINGS.absMaxNotionalUSD;
   const perSymbolDynCap = (SETTINGS.maxPosPctEquity / 100) * equity;
@@ -580,7 +1399,7 @@ async function cleanupStaleBuyOrders(maxAgeSec = 30) {
       })
     );
     if (stale.length) {
-      invalidateOpenOrdersCache();
+      __openOrdersCache = { ts: 0, items: [] };
     }
   } catch {}
 }
@@ -852,6 +1671,7 @@ const HoldingsChangeBarChart = () => {
   const [lastAt, setLastAt] = useState(null);
   const [totalLossUSD, setTotalLossUSD] = useState(0);
 
+  // Palette pulled from existing app colors to keep style cohesion.
   const ACCENT_COLORS = ['#7fd180', '#f7b801', '#9f8ed7', '#b29cd4', '#355070', '#f37b7b', '#c5dbee', '#ead5ff', '#dcd3f7'];
   const colorFor = (sym = '') => {
     let h = 0;
@@ -908,82 +1728,28 @@ const HoldingsChangeBarChart = () => {
     );
   }
 
-  const size = 180;
-  const stroke = 22;
-  const cx = size / 2;
-  const cy = size / 2;
-  const radius = cx - stroke / 2;
-  const C = 2 * Math.PI * radius;
-
-  let accFrac = 0;
-  const segs = rows.map((r, idx) => {
-    const pctVal = Number(r.pct);
-    const fracRaw = Math.max(0, Math.min(1, Number.isFinite(pctVal) ? pctVal / 100 : 0));
-    const startFrac = Math.min(Math.max(accFrac, 0), 1);
-    let frac = fracRaw;
-    if (idx === rows.length - 1) {
-      frac = Math.max(0, 1 - startFrac);
-    }
-    const len = frac * C;
-    const offset = ((startFrac % 1) + 1) % 1 * C;
-    accFrac = startFrac + frac;
-    return {
-      key: r.symbol,
-      color: r.color,
-      len,
-      offset,
-      pct: Number.isFinite(pctVal) ? pctVal : NaN,
-    };
-  });
+  // Display as left→right bars scaled to 100% of total current loss
+  const maxPct = Math.max(100, ...rows.map((r) => Number(r.pct) || 0));
 
   return (
     <View style={styles.card}>
       <Text style={styles.cardTitle}>Holdings Percentage</Text>
-
-      <View style={{ alignItems: 'center', justifyContent: 'center', paddingVertical: 6 }}>
-        <Svg width={size} height={size}>
-          <Circle
-            cx={cx}
-            cy={cy}
-            r={radius}
-            stroke="#121212"
-            strokeWidth={stroke}
-            fill="none"
-          />
-          {segs.map((s) => {
-            if (!(s.len > 0)) return null;
-            const dashArray = `${s.len} ${Math.max(C - s.len, 0)}`;
-            const dashOffset = s.offset === 0 ? 0 : -s.offset;
-            return (
-              <Circle
-                key={s.key}
-                cx={cx}
-                cy={cy}
-                r={radius}
-                stroke={s.color}
-                strokeWidth={stroke}
-                fill="none"
-                strokeDasharray={dashArray}
-                strokeDashoffset={dashOffset}
-                strokeLinecap="butt"
-                transform={`rotate(-90 ${cx} ${cy})`}
-              />
-            );
-          })}
-        </Svg>
+      <View style={{ gap: 8 }}>
+        {rows.map((r) => {
+          const pct = Math.max(0, Number(r.pct) || 0);
+          const widthFrac = Math.min(1, pct / maxPct);
+          return (
+            <View key={r.symbol} style={styles.holdRow}>
+              <View style={[styles.legendSwatch, { backgroundColor: r.color }]} />
+              <Text style={styles.holdLabel}>{r.symbol}</Text>
+              <View style={styles.holdBarWrap}>
+                <View style={[styles.holdFill, { flex: widthFrac, backgroundColor: r.color }]} />
+              </View>
+              <Text style={styles.holdPct}>{Number.isFinite(pct) ? `${pct.toFixed(1)}%` : '—'}</Text>
+            </View>
+          );
+        })}
       </View>
-
-      <View style={{ gap: 8, marginTop: 8 }}>
-        {rows.map((r) => (
-          <View key={r.symbol} style={styles.holdRow}>
-            <View style={[styles.legendSwatch, { backgroundColor: r.color }]} />
-            <Text style={styles.holdLabel}>{r.symbol}</Text>
-            <View style={{ flex: 1 }} />
-            <Text style={styles.holdPct}>{Number.isFinite(r.pct) ? `${Number(r.pct).toFixed(1)}%` : '—'}</Text>
-          </View>
-        ))}
-      </View>
-
       {!!lastAt && (
         <View style={styles.legendRow}>
           <Text style={styles.subtle}>Total loss: {fmtUSD(totalLossUSD)}</Text>
@@ -994,7 +1760,6 @@ const HoldingsChangeBarChart = () => {
   );
 };
 
-const HoldingsLossPieRow = HoldingsChangeBarChart;
 /* ─────────────────────────── 24) ENTRY / ORDERING / EXITS ─────────────────────────── */
 async function fetchAssetMeta(symbol) {
   try {
@@ -1097,7 +1862,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     if (needReplace && (nowTs - lastReplaceAt) > 1800) {
       if (lastOrderId) {
         try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
-        invalidateOpenOrdersCache();
+        __openOrdersCache = { ts: 0, items: [] };
       }
       const order = {
         symbol, qty, side: 'buy', type: 'limit', time_in_force: 'gtc',
@@ -1109,7 +1874,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         if (res.ok && data.id) {
           lastOrderId = data.id; placedLimit = join; lastReplaceAt = nowTs;
           logTradeAction('buy_camped', symbol, { limit: order.limit_price });
-          invalidateOpenOrdersCache();
+          __openOrdersCache = { ts: 0, items: [] };
         }
       } catch (e) {
         logTradeAction('quote_exception', symbol, { error: e.message });
@@ -1120,13 +1885,13 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     if (pos && pos.qty > 0) {
       if (lastOrderId) {
         try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
-        invalidateOpenOrdersCache();
+        __openOrdersCache = { ts: 0, items: [] };
       }
       logTradeAction('buy_success', symbol, {
         qty: pos.qty, limit: placedLimit != null ? formatLimit(placedLimit) : placedLimit,
       });
-      invalidatePositionsCache();
-      invalidateOpenOrdersCache();
+      __positionsCache = { ts: 0, items: [] };
+      __openOrdersCache = { ts: 0, items: [] };
       return { filled: true, entry: pos.basis ?? placedLimit, qty: pos.qty, liquidity: 'maker' };
     }
     await sleep(1200);
@@ -1134,7 +1899,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
 
   if (lastOrderId) {
     try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
-    invalidateOpenOrdersCache();
+    __openOrdersCache = { ts: 0, items: [] };
     logTradeAction('buy_unfilled_canceled', symbol, {});
   }
 
@@ -1165,8 +1930,8 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         if (res.ok && data.id) {
           logTradeAction('buy_success', symbol, { qty: mQty, limit: 'mkt' });
-          invalidatePositionsCache();
-          invalidateOpenOrdersCache();
+          __positionsCache = { ts: 0, items: [] };
+          __openOrdersCache = { ts: 0, items: [] };
           return { filled: true, entry: q.ask, qty: mQty, liquidity: 'taker' };
         } else {
           logTradeAction('quote_exception', symbol, { error: `BUY mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 80) || ''}` });
@@ -1195,8 +1960,8 @@ async function marketSell(symbol, qty) {
     const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(mkt) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     if (res.ok && data.id) {
-      invalidatePositionsCache();
-      invalidateOpenOrdersCache();
+      __positionsCache = { ts: 0, items: [] };
+      __openOrdersCache = { ts: 0, items: [] };
       return data;
     }
     logTradeAction('tp_limit_error', symbol, { error: `SELL mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 120) || ''}` });
@@ -1324,7 +2089,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
             const ex = open.find((o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol);
             if (ex) {
               await f(`${ALPACA_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null);
-              invalidateOpenOrdersCache();
+              __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
           const mkt = await marketSell(symbol, qty);
@@ -1374,7 +2139,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
             const ex = open.find((o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol);
             if (ex) {
               await f(`${ALPACA_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null);
-              invalidateOpenOrdersCache();
+              __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
           const mkt = await marketSell(symbol, qty);
@@ -1464,7 +2229,7 @@ export default function App() {
   const [notification, setNotification] = useState(null);
   const [logHistory, setLogHistory] = useState([]);
 
-  const [overrides, setOverrides] = useState({ ...SETTINGS_OVERRIDES });
+  const [overrides, setOverrides] = useState({});
   const [lastSkips, setLastSkips] = useState({});
   const lastSkipsRef = useRef({});
   const [overrideSym, setOverrideSym] = useState(null);
@@ -1484,39 +2249,6 @@ export default function App() {
   });
   const [pnlSnap, setPnlSnap] = useState({ last7Sum: null, last7UpDays: null, last7DownDays: null, last30Sum: null, fees30: null, fillsCount30: null, updatedAt: null, error: null });
 
-
-  useEffect(() => {
-    registerAlpacaLogger(logTradeAction);
-    return () => registerAlpacaLogger(() => {});
-  }, []);
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const snapshot = await getPnLAndFeesSnapshot();
-        if (!cancelled) {
-          setPnlSnap((prev) => ({ ...prev, ...snapshot, updatedAt: new Date().toISOString(), error: null }));
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setPnlSnap((prev) => ({ ...prev, error: err?.message || String(err), updatedAt: new Date().toISOString() }));
-        }
-      }
-    };
-    load();
-    const id = setInterval(load, 15 * 60 * 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, []);
-
-  useEffect(() => {
-    getAccountSummaryRaw()
-      .then(() => console.log('✅ Connected to Alpaca LIVE endpoint:', ALPACA_BASE_URL))
-      .catch((e) => console.log('❌ Alpaca connection error:', e?.message || e));
-  }, []);
-
   const [lastScanAt, setLastScanAt] = useState(null);
   const [openMeta, setOpenMeta] = useState({ positions: 0, orders: 0, allowed: CRYPTO_CORE_TRACKED.length, universe: CRYPTO_CORE_TRACKED.length });
   const [scanStats, setScanStats] = useState({ ready: 0, attempted: 0, filled: 0, watch: 0, skipped: 0, reasons: {} });
@@ -1524,13 +2256,11 @@ export default function App() {
   const [settings, setSettings] = useState({ ...SETTINGS });
   useEffect(() => {
     SETTINGS = { ...settings };
-    setSettingsSnapshot(settings);
     logTradeAction('risk_changed', 'SETTINGS', { level: SETTINGS.riskLevel, spreadMax: SETTINGS.spreadMaxBps });
   }, [settings]);
 
   useEffect(() => {
     SETTINGS_OVERRIDES = { ...overrides };
-    setOverridesSnapshot(overrides);
   }, [overrides]);
   const [showSettings, setShowSettings] = useState(false);
 
@@ -1917,8 +2647,8 @@ export default function App() {
             try {
               const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(mkt) });
               if (res.ok) {
-                invalidatePositionsCache();
-                invalidateOpenOrdersCache();
+                __positionsCache = { ts: 0, items: [] };
+                __openOrdersCache = { ts: 0, items: [] };
                 logTradeAction('dust_flattened', sym, { usd: mv });
               }
             } catch {}
@@ -2529,11 +3259,11 @@ export default function App() {
 
         {/* Chart order per request: 1) Portfolio Percentage, 2) Holdings Percentage, 3) Portfolio Value */}
         <PortfolioChangeChart acctSummary={acctSummary} />
-        <HoldingsLossPieRow />
+        <HoldingsChangeBarChart />
         <DailyPortfolioValueChart acctSummary={acctSummary} />
-        <TxnHistoryCSVViewer styles={styles} />
+        <TxnHistoryCSVViewer />
 
-        <LiveLogsCopyViewer styles={styles} logs={logHistory} />
+        <LiveLogsCopyViewer logs={logHistory} />
 
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Scan summary</Text>
@@ -2710,14 +3440,4 @@ const styles = StyleSheet.create({
   coachText: { color: '#b7e1c8', fontSize: 11, marginTop: 2 },
   coachBtn: { backgroundColor: '#1d3a29', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 8 },
   coachBadge: { fontSize: 16 },
-  cardHalf: { flex: 1 },
-  pieBox: { alignItems: 'center', justifyContent: 'center' },
-  pieCenter: { position: 'absolute', alignItems: 'center', justifyContent: 'center' },
-  centerTextBig: { color: '#355070', fontWeight: '800', fontSize: 16, marginTop: 2 },
-  centerTextSmall: { color: '#657788', fontSize: 11 },
-  tapHint: { color: '#657788', fontSize: 10, marginTop: 6 },
-  pieLegendRow: { width: '100%', marginTop: 6 },
-  pieLegendItem: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
-  donutBox: { alignItems: 'center', justifyContent: 'center' },
-  gaugeNote: { color: '#657788', fontSize: 10, marginTop: 2 },
 });
