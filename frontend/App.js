@@ -93,11 +93,11 @@ const DEFAULT_SETTINGS = {
   maxConcurrentPositions: 8,
 
   // Entry gates
-  spreadMaxBps: 120,
-  spreadOverFeesMinBps: 0,
-  dynamicMinProfitBps: 60,
-  extraOverFeesBps: 10,
-  netMinProfitBps: 2.0,
+  spreadMaxBps: 160,        // allow wider spreads → more candidates
+  spreadOverFeesMinBps: 1,  // small guard if user enables the toggle later
+  dynamicMinProfitBps: 22,  // lower TP floor to make EV positive
+  extraOverFeesBps: 2,      // minimal cushion over fees
+  netMinProfitBps: 0.0,     // no extra absolute floor
   minPriceUsd: 0.001,
   slipBpsByRisk: [1, 2, 3, 4, 5],
 
@@ -110,11 +110,11 @@ const DEFAULT_SETTINGS = {
   syntheticTradeSpreadBps: 12,
 
   // Momentum filter
-  enforceMomentum: true,
+  enforceMomentum: false,   // start OFF for fills; you can re-enable later
 
   // Entry / exit behavior
   enableTakerFlip: false,
-  takerExitOnTouch: true,
+  takerExitOnTouch: false,  // sell as maker → lower exit fee
   takerExitGuard: 'min',
   makerCampSec: 18,
   touchTicksRequired: 2,
@@ -124,7 +124,7 @@ const DEFAULT_SETTINGS = {
 
   // Stops / trailing
   enableStops: true,
-  stopLossBps: 80,
+  stopLossBps: 50,          // tighter stop improves EV
   hardStopLossPct: 1.8,
   stopGraceSec: 10, // NEW
   enableTrailing: true,
@@ -153,7 +153,7 @@ const DEFAULT_SETTINGS = {
   pdtEquityThresholdUSD: 10000,
 
   // Gates
-  requireSpreadOverFees: false,
+  requireSpreadOverFees: false, // keep OFF; small guard value above only used if toggled ON
 
   // Auto‑tune settings
   autoTuneEnabled: false,
@@ -166,7 +166,7 @@ const DEFAULT_SETTINGS = {
   autoTuneNetMinStepBps: 0.5,
   autoTuneMaxSpreadBps: 180,
   autoTuneMinSpreadOverFeesBps: 0,
-  autoTuneMinNetMinBps: 1.0,
+  autoTuneMinNetMinBps: 0.0, // don’t force netMin back up if auto-tune is enabled
 
   // ==== New math knobs (volatility & EV) ====
   volHalfLifeMin: 10,          // EWMA half-life (minutes) for realized vol on 1m bars
