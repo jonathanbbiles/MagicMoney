@@ -183,6 +183,11 @@ const DEFAULT_SETTINGS = {
   kellyEnabled: true,          // enable Kelly-lite sizing
 };
 let SETTINGS = { ...DEFAULT_SETTINGS };
+try {
+  if ((SETTINGS.quoteTtlMs || 0) > (SETTINGS.liveFreshMsCrypto || 0)) {
+    console.warn('[Quotes] quoteTtlMs > liveFreshMsCrypto — cached quotes may fail freshness on read');
+  }
+} catch {}
 
 // Minimal UI switch: show only Gate settings inside Settings panel.
 const SIMPLE_SETTINGS_ONLY = true;
@@ -1160,16 +1165,35 @@ async function getQuotesBatch(symbols) {
       for (const dsym of slice) {
         const q = qmap.get(dsym);
         if (!q) continue;
+
+        // Freshness by exchange timestamp
+        const fresh = isFresh(q.tms, SETTINGS.liveFreshMsCrypto);
+
         // TEMP DEBUG (remove later)
         try {
           const ageMs = Date.now() - (q.tms || 0);
           if (Number.isFinite(ageMs)) {
-            console.log('QUOTE_TMS', dsym, q.t, q.tms, `${Math.round(ageMs)}ms_old`);
+            console.log('QUOTE_TMS', dsym, q.t, q.tms, `${Math.round(ageMs)}ms_old`, fresh ? 'FRESH' : 'STALE');
           }
         } catch {}
+
+        // If not fresh, do NOT include in batch output or cache
+        if (!fresh) continue;
+
         const sym = dsym.replace('/', '');
-        out.set(sym, { bid: q.bid, ask: q.ask, bs: q.bs, as: q.as, tms: q.tms });
-        quoteCache.set(sym, { ts: now, q: { bid: q.bid, ask: q.ask, bs: q.bs ?? null, as: q.as ?? null } });
+        out.set(sym, {
+          bid: q.bid,
+          ask: q.ask,
+          bs: q.bs ?? null,
+          as: q.as ?? null,
+          tms: q.tms
+        });
+
+        // Cache only fresh quotes and include tms in cached object
+        quoteCache.set(sym, {
+          ts: now,
+          q: { bid: q.bid, ask: q.ask, bs: q.bs ?? null, as: q.as ?? null, tms: q.tms }
+        });
       }
     }
   }
@@ -1190,7 +1214,9 @@ async function getQuoteSmart(symbol, preloadedMap = null) {
     // Always use cached real quotes if within TTL
     {
       const c = quoteCache.get(symbol);
-      if (c && Date.now() - c.ts < SETTINGS.quoteTtlMs) return c.q;
+      const withinTtl = c && (Date.now() - c.ts < SETTINGS.quoteTtlMs);
+      const freshExch = c && isFresh(c.q?.tms, SETTINGS.liveFreshMsCrypto);
+      if (withinTtl && freshExch) return c.q;
     }
 
     // Use preloaded map if available and fresh
