@@ -103,8 +103,8 @@ const DEFAULT_SETTINGS = {
 
   // Quote handling
   liveRequireQuote: true, // live quotes only; no synthetic fallback unless user disables this
-  quoteTtlMs: 15000,
-  liveFreshMsCrypto: 15000,
+  quoteTtlMs: 30000,
+  liveFreshMsCrypto: 60000,
   liveFreshMsStock: 15000,
   liveFreshTradeMsCrypto: 180000,
   syntheticTradeSpreadBps: 12,
@@ -254,29 +254,34 @@ const fmtUSD = (n) =>
     : '—';
 const fmtPct = (n) => (Number.isFinite(n) ? `${n.toFixed(2)}%` : '—');
 
+// Robust parser for RFC3339 strings and epoch-like numbers (ns/µs/ms/s)
 const parseTsMs = (t) => {
   if (t == null) return NaN;
+
+  // Strings: try Date.parse first, else numeric fallback
   if (typeof t === 'string') {
     const ms = Date.parse(t);
     if (Number.isFinite(ms)) return ms;
     const n = +t;
-    if (Number.isFinite(n)) {
-      if (n > 1e15) return Math.floor(n / 1e6);
-      if (n > 1e12) return Math.floor(n / 1e3);
-      if (n > 1e10) return n;
-      if (n > 1e9) return n * 1000;
-    }
-    return NaN;
+    if (!Number.isFinite(n)) return NaN;
+    return parseEpochLike(n);
   }
+
   if (typeof t === 'number') {
-    if (t > 1e15) return Math.floor(t / 1e6);
-    if (t > 1e12) return Math.floor(t / 1e3);
-    if (t > 1e10) return t;
-    if (t > 1e9) return t * 1000;
-    return t;
+    return parseEpochLike(t);
   }
   return NaN;
 };
+
+function parseEpochLike(n) {
+  const abs = Math.abs(n);
+  // ns (~1e18), µs (~1e15), ms (~1e12), s (~1e9)
+  if (abs >= 1e18) return Math.floor(abs / 1e6);  // ns → ms
+  if (abs >= 1e15) return Math.floor(abs / 1e3);  // µs → ms
+  if (abs >= 1e12) return abs;                    // ms
+  if (abs >= 1e9)  return abs * 1000;             // s → ms
+  return abs;                                     // assume ms
+}
 const isFresh = (tsMs, ttlMs) => Number.isFinite(tsMs) && (Date.now() - tsMs <= ttlMs);
 
 const emaArr = (arr, span) => {
@@ -660,7 +665,7 @@ async function getCryptoQuotesBatch(dsyms = []) {
         const as = Number(q.as ?? q.ask_size);
         const tms = parseTsMs(q.t);
         if (bid > 0 && ask > 0) {
-          out.set(dsym, { bid, ask, bs: Number.isFinite(bs) ? bs : null, as: Number.isFinite(as) ? as : null, tms });
+          out.set(dsym, { bid, ask, bs: Number.isFinite(bs) ? bs : null, as: Number.isFinite(as) ? as : null, tms, t: q.t ?? null });
         }
       }
       if (out.size) return out;
@@ -1142,11 +1147,16 @@ async function getQuotesBatch(symbols) {
       for (const dsym of slice) {
         const q = qmap.get(dsym);
         if (!q) continue;
-        const fresh = isFresh(q.tms, SETTINGS.liveFreshMsCrypto);
-        if (!fresh) continue;
+        // TEMP DEBUG (remove later)
+        try {
+          const ageMs = Date.now() - (q.tms || 0);
+          if (Number.isFinite(ageMs)) {
+            console.log('QUOTE_TMS', dsym, q.t, q.tms, `${Math.round(ageMs)}ms_old`);
+          }
+        } catch {}
         const sym = dsym.replace('/', '');
         out.set(sym, { bid: q.bid, ask: q.ask, bs: q.bs, as: q.as, tms: q.tms });
-        quoteCache.set(sym, { ts: now, q: { bid: q.bid, ask: q.ask, bs: q.bs, as: q.as } });
+        quoteCache.set(sym, { ts: now, q: { bid: q.bid, ask: q.ask, bs: q.bs ?? null, as: q.as ?? null } });
       }
     }
   }
@@ -2549,7 +2559,14 @@ export default function App() {
     const mm = microMetrics(q);
 
     if (q.bs != null && Number.isFinite(q.bs) && (q.bs * q.bid) < MIN_BID_NOTIONAL_LOOSE_USD) {
-      return { entryReady: false, why: 'illiquid', meta: { bsUSD: q.bs * q.bid, minUSD: MIN_BID_NOTIONAL_LOOSE_USD } };
+      return {
+        entryReady: false,
+        why: 'illiquid',
+        meta: {
+          bs: Number.isFinite(q.bs) && Number.isFinite(q.bid) ? q.bs * q.bid : 0,
+          min: MIN_BID_NOTIONAL_LOOSE_USD
+        }
+      };
     }
 
     const mid = 0.5 * (q.bid + q.ask);
@@ -2573,8 +2590,10 @@ export default function App() {
     const slopeUp = ema5.length >= 2 ? ema5.at(-1) > ema5.at(-2) : true;
     const v0 = closes.length >= 2 ? closes.at(-1) - closes.at(-2) : 0;
     const breakout = closes.length >= 6 ? closes.at(-1) >= Math.max(...closes.slice(-6, -1)) * 1.001 : true;
+    let _momentumPenalty = false;
     if (SETTINGS.enforceMomentum && !(v0 >= 0 || slopeUp || breakout)) {
-      return { entryReady: false, why: 'nomomo', meta: { v0, emaLast: ema5.at(-1), emaPrev: ema5.at(-2) } };
+      // Momentum penalty: reduce pUp later instead of hard veto
+      _momentumPenalty = true;
     }
 
     symEntry.spreadEwmaBps = ewma(symEntry.spreadEwmaBps, spreadBps, 0.2);
@@ -2600,6 +2619,10 @@ export default function App() {
     if (Number.isFinite(mm.microDrift) && q.bid > 0) {
       const driftBps = (mm.microDrift / q.bid) * 10000;
       pUp = clamp(pUp + 0.02 * Math.tanh(driftBps / Math.max(1, sigmaBpsEff)), 0.05, 0.95);
+    }
+
+    if (_momentumPenalty) {
+      pUp = clamp(0.5 + 0.5 * (pUp - 0.5) * 0.6, 0.05, 0.95); // shrink toward 0.5
     }
 
     const sellBps = SETTINGS.takerExitOnTouch ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker;
