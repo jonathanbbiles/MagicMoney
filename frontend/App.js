@@ -167,6 +167,20 @@ const DEFAULT_SETTINGS = {
   autoTuneMaxSpreadBps: 180,
   autoTuneMinSpreadOverFeesBps: 0,
   autoTuneMinNetMinBps: 1.0,
+
+  // ==== New math knobs (volatility & EV) ====
+  volHalfLifeMin: 10,          // EWMA half-life (minutes) for realized vol on 1m bars
+  evMinUSD: 0.20,              // minimum expected value per trade (USD per position) to gate entries
+  evMinBps: 0.8,               // fallback floor if size is tiny (bps per share)
+  tpVolScale: 1.0,             // kTP: target scales with σ (in bps)
+  stopVolMult: 2.5,            // soft stop = max(user stop, stopVolMult * σ_bps)
+  trailArmVolMult: 0.8,        // trail arms at max(user bps, trailArmVolMult * σ_bps)
+  sellEpsMinTicks: 2,          // taker touch epsilon at least N ticks
+  sellEpsVolFrac: 0.15,        // also ≥ 15% of σ_bps
+  makerMinFillProb: 0.15,      // skip maker if fill probability below this
+  pTouchHorizonMin: 8,         // minutes for barrier touch horizon
+  kellyFraction: 0.5,          // half-Kelly sizing factor [0..1]
+  kellyEnabled: true,          // enable Kelly-lite sizing
 };
 let SETTINGS = { ...DEFAULT_SETTINGS };
 
@@ -1193,6 +1207,88 @@ async function getQuoteSmart(symbol, preloadedMap = null) {
 
 /* ─────────────────────────────── 18) SIGNAL / ENTRY MATH ─────────────────────────────── */
 const SPREAD_EPS_BPS = 0.3;
+/* ───────── 18a) VOL/EV HELPERS (no deps) ───────── */
+
+// EWMA realized volatility of 1-minute log returns; returns {sigma, sigmaBps}
+function ewmaSigmaFromCloses(closes = [], halfLifeMin = 10) {
+  const n = closes.length;
+  if (n < 3) return { sigma: 0, sigmaBps: 0 };
+  const rets = [];
+  for (let i = 1; i < n; i++) {
+    const c0 = closes[i - 1], c1 = closes[i];
+    if (!(c0 > 0 && c1 > 0)) continue;
+    rets.push(Math.log(c1 / c0));
+  }
+  if (!rets.length) return { sigma: 0, sigmaBps: 0 };
+  const alpha = 1 - Math.pow(2, -1 / Math.max(1, halfLifeMin));
+  let v = 0;
+  for (const r of rets) v = (1 - alpha) * v + alpha * r * r;
+  const sigma = Math.sqrt(v);                // per minute
+  const sigmaBps = 10000 * sigma;            // bps per minute
+  return { sigma, sigmaBps };
+}
+
+// Microprice + imbalance from a quote with sizes; returns {micro, imbalance, microDrift}
+function microMetrics(q) {
+  const bid = +q?.bid, ask = +q?.ask, bs = +q?.bs || 0, as = +q?.as || 0;
+  if (!(bid > 0 && ask > 0) || !(bs > 0 && as > 0)) {
+    const mid = (bid > 0 && ask > 0) ? 0.5 * (bid + ask) : NaN;
+    return { micro: mid, imbalance: 0, microDrift: 0 };
+  }
+  const micro = (ask * bs + bid * as) / (bs + as);
+  const mid = 0.5 * (bid + ask);
+  const imbalance = (bs - as) / (bs + as);
+  const microDrift = micro - mid; // >0 → pressure up
+  return { micro, imbalance, microDrift };
+}
+
+// Driftless Brownian barrier touch probability: P(hit +b before -a) = a/(a+b)
+function barrierPTouchUpDriftless(aPrice, bPrice) {
+  if (!(aPrice > 0 && bPrice > 0)) return 0.5;
+  return aPrice / (aPrice + bPrice);
+}
+
+// Expected value per share using pUp, distances (price), fees/slippage; returns EV per share (USD)
+function expectedValuePerShare({ pUp, aPrice, bPrice, entryPx, sellFeeBps, buyFeeBps, slippageBps }) {
+  const buyFeePS  = entryPx * (Math.max(0, buyFeeBps)  / 10000);
+  const sellFeePS = (entryPx + bPrice) * (Math.max(0, sellFeeBps) / 10000);
+  const slipPS    = entryPx * (Math.max(0, slippageBps) / 10000);
+  return pUp * (bPrice - sellFeePS) - (1 - pUp) * (aPrice + buyFeePS) - slipPS;
+}
+
+// Dynamic SELL epsilon (bps) ≥ max( sellEpsVolFrac*σ_bps, sellEpsMinTicks*tick_bps, 0.2 )
+function dynamicSellEpsBps({ symbol, price, tick, sigmaBps, settings }) {
+  const tickBps = (tick > 0 && price > 0) ? (tick / price) * 10000 : 0.02;
+  const vPart = (settings.sellEpsVolFrac || 0.15) * (sigmaBps || 0);
+  const tPart = (settings.sellEpsMinTicks || 2) * tickBps;
+  return Math.max(0.2, vPart, tPart);
+}
+
+// Crude maker fill probability estimate using last bar volume as intensity proxy
+// Qahead (units) ~ q.bs, lambdaSell ≈ 0.5 * volPerSec (half of trades hit bid)
+function makerFillProb({ bsUnits, lastBarVolUnits, campSec }) {
+  const Qahead = Math.max(1e-9, bsUnits || 0);
+  const volPerSec = Math.max(0, (lastBarVolUnits || 0) / 60);
+  const lambdaHit = 0.5 * volPerSec; // assume ~half of prints are sell-initiated
+  const q = 1 - Math.exp(- (lambdaHit * Math.max(0, campSec || 0)) / Qahead);
+  return clamp(q, 0, 1);
+}
+
+// Robust runway using median MFE observed in symStats (fallback to Brownian expectation)
+function robustRunwayUSD(sym, entryPx, sigma, horizonMin, stats) {
+  const s = stats[sym] || {};
+  const hist = Array.isArray(s.mfeHist) ? s.mfeHist.slice(-60) : [];
+  if (hist.length >= 6) {
+    const sorted = hist.slice().sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)];
+    return Math.max(0, med);
+  }
+  // Brownian expected max excursion: E[max X_t] ≈ σ * sqrt(2H/π)
+  const H = Math.max(1, horizonMin);
+  const emx = sigma * Math.sqrt((2 * H) / Math.PI);
+  return Math.max(0, emx * entryPx); // σ is in log space per-minute; scale by price
+}
+
 // Exit floor uses the intended exit liquidity:
 // - If we plan to flip to taker on touch, assume taker fees on sell.
 // - Otherwise assume maker fees on sell (resting limit TP).
@@ -1816,6 +1912,18 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   while ((Date.now() - t0) / 1000 < CAMP_SEC) {
     const q = await getQuoteSmart(symbol, preQuoteMap);
     if (!q) { await sleep(500); continue; }
+
+    const barsFill = await getCryptoBars1m(symbol, 2);
+    const lastVol = Array.isArray(barsFill) && barsFill.length ? (barsFill[barsFill.length - 1].vol || 0) : 0;
+    const qFillEst = makerFillProb({ bsUnits: q.bs || 0, lastBarVolUnits: lastVol, campSec: SETTINGS.makerCampSec });
+    const symSlot = (symStats[symbol] ||= {});
+    symSlot.qMakerFillEwma = ewma(symSlot.qMakerFillEwma, qFillEst, 0.2);
+    const qFillEff = symSlot.qMakerFillEwma;
+
+    if (qFillEff < (SETTINGS.makerMinFillProb || 0.15) && SETTINGS.enableTakerFlip) {
+      logTradeAction('taker_force_flip', symbol, { reason: 'low_q_fill', q: Number(qFillEff ?? 0).toFixed(2) });
+      break;
+    }
     const bidNow = q.bid, askNow = q.ask;
     if (!Number.isFinite(bidNow) || bidNow <= 0) { await sleep(250); continue; }
 
@@ -1998,9 +2106,13 @@ const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
     ? ((q.ask - q.bid) / mid) * 10000
     : 0;
 
-  const slipEw = (symStats[symbol]?.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[SETTINGS.riskLevel] ?? 1));
+  const bars = await getCryptoBars1m(symbol, 8);
+  const closesStop = Array.isArray(bars) ? bars.map((b) => b.close) : [];
+  const { sigmaBps: sigmaBpsStop } = ewmaSigmaFromCloses(closesStop.slice(-8), SETTINGS.volHalfLifeMin);
+
   const effStopBps = Math.max(
-    SETTINGS.stopLossBps,
+    eff(symbol, 'stopLossBps'),
+    Math.floor((sigmaBpsStop || 0) * (SETTINGS.stopVolMult || 2.5)),
     Math.floor((spreadBpsNow * 0.5) + SETTINGS.feeBpsMaker + SETTINGS.feeBpsTaker + 6)
   );
 
@@ -2026,8 +2138,13 @@ const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
     if (res) return true;
   }
 
+  const trailStartEff = Math.max(
+    SETTINGS.trailStartBps,
+    Math.round((SETTINGS.trailArmVolMult || 0.8) * (sigmaBpsStop || 0))
+  );
+
   if (SETTINGS.enableTrailing) {
-    const armPx = entryPx * (1 + SETTINGS.trailStartBps / 10000);
+    const armPx = entryPx * (1 + trailStartEff / 10000);
     if (!state.trailArmed && bid >= armPx) {
       state.trailArmed = true;
       state.trailPeak = bid;
@@ -2114,7 +2231,12 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     const q = await getQuoteSmart(symbol);
     const memo = (touchMemoRef.current[symbol]) || (touchMemoRef.current[symbol] = { count: 0, lastTs: 0, firstTouchTs: 0 });
     if (q && q.bid > 0) {
-      const touchPx = finalLimit * (1 - SELL_EPS_BPS / 10000);
+      const tick = isStock(symbol) ? 0.01 : 1e-5;
+      const barsE = await getCryptoBars1m(symbol, 8);
+      const closesE = Array.isArray(barsE) ? barsE.map((b) => b.close) : [];
+      const { sigmaBps: sigmaBpsE } = ewmaSigmaFromCloses(closesE.slice(-8), SETTINGS.volHalfLifeMin);
+      const epsBps = dynamicSellEpsBps({ symbol, price: entryPx, tick, sigmaBps: sigmaBpsE, settings: SETTINGS });
+      const touchPx = finalLimit * (1 - epsBps / 10000);
       const touching = q.bid >= touchPx;
 
       if (touching) {
@@ -2406,6 +2528,12 @@ export default function App() {
       }
     }
     const closes = Array.isArray(bars1) ? bars1.map((b) => b.close) : [];
+    const { sigma, sigmaBps } = ewmaSigmaFromCloses(closes.slice(-16), SETTINGS.volHalfLifeMin);
+    const symEntry = (symStats[asset.symbol] ||= {});
+    if (!Array.isArray(symEntry.mfeHist)) symEntry.mfeHist = [];
+    if (!Array.isArray(symEntry.hitByHour)) symEntry.hitByHour = Array.from({ length: 24 }, () => ({ h: 0, t: 0 }));
+    symEntry.sigmaEwmaBps = ewma(symEntry.sigmaEwmaBps, sigmaBps, 0.2);
+    const sigmaBpsEff = symEntry.sigmaEwmaBps ?? sigmaBps;
 
     const q = await getQuoteSmart(asset.symbol, preQuoteMap);
     if (!q || !(q.bid > 0 && q.ask > 0)) {
@@ -2417,6 +2545,8 @@ export default function App() {
       } catch {}
       return { entryReady: false, why: 'no_quote', meta: { freshSec } };
     }
+
+    const mm = microMetrics(q);
 
     if (q.bs != null && Number.isFinite(q.bs) && (q.bs * q.bid) < MIN_BID_NOTIONAL_LOOSE_USD) {
       return { entryReady: false, why: 'illiquid', meta: { bsUSD: q.bs * q.bid, minUSD: MIN_BID_NOTIONAL_LOOSE_USD } };
@@ -2447,26 +2577,80 @@ export default function App() {
       return { entryReady: false, why: 'nomomo', meta: { v0, emaLast: ema5.at(-1), emaPrev: ema5.at(-2) } };
     }
 
-    (symStats[asset.symbol] ||= {}).spreadEwmaBps = ewma(symStats[asset.symbol].spreadEwmaBps, spreadBps, 0.2);
-    const slipEw = symStats[asset.symbol]?.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[riskLvl] ?? 1);
+    symEntry.spreadEwmaBps = ewma(symEntry.spreadEwmaBps, spreadBps, 0.2);
+    const slipEw = symEntry.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[riskLvl] ?? 1);
 
-    const needBps = Math.max(
+    const stopBaseBps = eff(asset.symbol, 'stopLossBps');
+    const effStopBps = Math.max(
+      stopBaseBps,
+      Math.round((SETTINGS.stopVolMult || 2.5) * (sigmaBpsEff || 0))
+    );
+
+    const needDyn = Math.max(
       requiredProfitBpsForSymbol(asset.symbol, riskLvl),
       exitFloorBps(asset.symbol) + 0.5 + slipEw,
       eff(asset.symbol, 'netMinProfitBps')
     );
-    const spreadEw = symStats[asset.symbol]?.spreadEwmaBps ?? spreadBps;
-    const needBpsCapped = Math.min(needBps, Math.max(exitFloorBps(asset.symbol) + 1, Math.round((spreadEw || 0) * 1.6)));
+    const needBpsVol = Math.max(needDyn, Math.round((SETTINGS.tpVolScale || 1.0) * (sigmaBpsEff || 0)));
+
+    const aPrice = q.bid * (effStopBps / 10000);
+    const bPrice = q.bid * (needBpsVol / 10000);
+    let pUp = barrierPTouchUpDriftless(aPrice, bPrice);
+
+    if (Number.isFinite(mm.microDrift) && q.bid > 0) {
+      const driftBps = (mm.microDrift / q.bid) * 10000;
+      pUp = clamp(pUp + 0.02 * Math.tanh(driftBps / Math.max(1, sigmaBpsEff)), 0.05, 0.95);
+    }
+
+    const sellBps = SETTINGS.takerExitOnTouch ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker;
+    const EVps = expectedValuePerShare({
+      pUp,
+      aPrice,
+      bPrice,
+      entryPx: q.bid,
+      sellFeeBps: sellBps,
+      buyFeeBps: SETTINGS.feeBpsMaker,
+      slippageBps: slipEw,
+    });
+
+    const evUsdFloor = SETTINGS.evMinUSD || 0.2;
+    const evBpsFloor = SETTINGS.evMinBps || 0.8;
+    const evBps = (EVps / Math.max(1e-9, q.bid)) * 10000;
+    const approxQty = Math.max(
+      MIN_BID_SIZE_LOOSE,
+      (q.bs || 0),
+      MIN_BID_NOTIONAL_LOOSE_USD / Math.max(q.bid, 1e-9)
+    );
+    const EVusd = EVps * approxQty;
+    if ((EVps < 0 && evBps < evBpsFloor) || (EVusd < evUsdFloor && evBps < evBpsFloor)) {
+      logTradeAction('entry_skipped', asset.symbol, { reason: 'edge_negative_ev', EVps, evBps, EVusd });
+      return { entryReady: false, why: 'edge_negative_ev', meta: { EVps, evBps, EVusd } };
+    }
+
+    const spreadEw = symEntry.spreadEwmaBps ?? spreadBps;
+    const needBpsCapped = Math.min(
+      Math.max(needBpsVol, exitFloorBps(asset.symbol) + 1),
+      Math.max(exitFloorBps(asset.symbol) + 1, Math.round((spreadEw || 0) * 1.6))
+    );
     const tpBase = q.bid * (1 + needBpsCapped / 10000);
     if (!(tpBase > q.bid * 1.00005)) {
       return { entryReady: false, why: 'edge_negative', meta: { tpBps: needBpsCapped, bid: q.bid, tp: tpBase } };
     }
 
-    const sst = symStats[asset.symbol] || {};
-    const drag_g = Math.max(1e-6, sst.drag_g ?? 8);
-    const runway = v0 > 0 ? (v0 * v0) / (2 * drag_g) : 0;
-
-    return { entryReady: true, spreadBps, quote: q, tpBps: needBpsCapped, tp: tpBase, v0, runway, meta: {} };
+    return {
+      entryReady: true,
+      spreadBps,
+      quote: q,
+      tpBps: needBpsCapped,
+      tp: tpBase,
+      v0,
+      runway: 0,
+      pUp,
+      EVps,
+      sigmaBps: sigmaBpsEff,
+      microImb: mm.imbalance,
+      meta: {},
+    };
   }
 
   const placeOrder = async (symbol, ccSymbol = symbol, d, sigPre = null, preQuoteMap = null, refs) => {
@@ -2519,14 +2703,32 @@ export default function App() {
       return false;
     }
 
+    let entryPx = Number.isFinite(sig?.quote?.bid) && sig.quote.bid > 0 ? sig.quote.bid : sig?.quote?.ask;
+    if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig?.quote?.bid;
+
+    let kellyNotional = null;
+    if (SETTINGS.kellyEnabled && sig && Number.isFinite(sig.pUp) && Number.isFinite(sig.EVps)) {
+      const entryForKelly = Number.isFinite(entryPx) && entryPx > 0 ? entryPx : sig?.quote?.ask;
+      const stopBps = eff(symbol, 'stopLossBps');
+      const aPrice = Math.max(0, (entryForKelly || 0) * (stopBps / 10000));
+      const bPrice = Math.max(0, (sig.tp ?? 0) - (entryForKelly || 0));
+      const sellFee = (SETTINGS.takerExitOnTouch ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker);
+      const U = Math.max(1e-9, bPrice - ((sellFee * (entryForKelly || 0)) / 10000));
+      const D = Math.max(1e-9, aPrice + ((SETTINGS.feeBpsMaker * (entryForKelly || 0)) / 10000));
+      const fKelly = ((sig.pUp * U) - ((1 - sig.pUp) * D)) / Math.max(1e-9, U * D);
+      const f = clamp((SETTINGS.kellyFraction || 0.5) * Math.max(0, fKelly), 0, SETTINGS.maxPosPctEquity / 100);
+      kellyNotional = f * equity;
+    }
+
     // Cap per position
     const desired  = Math.min(buyingPower, (SETTINGS.maxPosPctEquity / 100) * equity);
-    const notional = capNotional(symbol, desired, equity);
+    const notionalBase = capNotional(symbol, desired, equity);
+    const notional = Number.isFinite(kellyNotional) && kellyNotional > 0
+      ? Math.min(notionalBase, kellyNotional)
+      : notionalBase;
 
     logTradeAction('quote_ok', symbol, { spreadBps: (sig?.spreadBps ?? 0), bp_base: bpInfo.base, bp_pending: bpInfo.pending, bp_usable: buyingPower });
 
-    let entryPx = sig?.quote?.bid;
-    if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig?.quote?.ask;
     if (!Number.isFinite(notional) || notional < 5) {
       logTradeAction('skip_small_order', symbol);
       return false;
@@ -2554,6 +2756,11 @@ export default function App() {
 
     const buyBpsApplied = result.liquidity === 'taker' ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker;
 
+    const barsR = await getCryptoBars1m(symbol, 12);
+    const closesR = Array.isArray(barsR) ? barsR.map((b) => b.close) : [];
+    const { sigma: sigmaRun } = ewmaSigmaFromCloses(closesR.slice(-12), SETTINGS.volHalfLifeMin);
+    const runwayUSD = robustRunwayUSD(symbol, actualEntry, sigmaRun, SETTINGS.pTouchHorizonMin, symStats);
+
     const approxMid = sig && sig.quote ? 0.5 * (sig.quote.bid + sig.quote.ask) : actualEntry;
     const slipBpsVal = Number.isFinite(approxMid) && approxMid > 0 ? ((actualEntry - (sig?.quote?.bid ?? entryPx)) / approxMid) * 10000 : 0;
     const s = (refs.tradeStateRef.current[symbol] ||= { hitByHour: Array.from({ length: 24 }, () => ({ h: 0, t: 0 })), mfeHist: [] });
@@ -2562,13 +2769,13 @@ export default function App() {
     const slipEw = s.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[SETTINGS.riskLevel] ?? 1);
     const needBps0 = requiredProfitBpsForSymbol(symbol, SETTINGS.riskLevel);
     const needBpsAdj = Math.max(needBps0, exitFloorBps(symbol) + 0.5 + slipEw, eff(symbol, 'netMinProfitBps'));
-    const tpBase = actualEntry * (1 + needBpsAdj / 10000);
+    const tpBase = Math.max(sig?.tp ?? 0, actualEntry * (1 + needBpsAdj / 10000));
     const feeFloor = minExitPriceFeeAwareDynamic({ symbol, entryPx: actualEntry, qty: actualQty, buyBpsOverride: buyBpsApplied });
-    const tpCapped = Math.max(Math.min(tpBase, actualEntry + (sig?.runway ?? 0)), feeFloor);
+    const tpCapped = Math.max(Math.min(tpBase, actualEntry + (runwayUSD || 0)), feeFloor);
 
     refs.tradeStateRef.current[symbol] = {
       entry: actualEntry, qty: actualQty, tp: tpCapped, feeFloor,
-      runway: sig?.runway ?? 0, entryTs: Date.now(), lastLimitPostTs: 0,
+      runway: runwayUSD ?? sig?.runway ?? 0, entryTs: Date.now(), lastLimitPostTs: 0,
       wasHolding: true, stopPx: null, hardStopPx: null, trailArmed: false, trailPeak: null,
       buyBpsApplied, // track actual buy fee (maker/taker)
     };
@@ -2612,10 +2819,14 @@ export default function App() {
           const slipEw = symStats[symbol]?.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[SETTINGS.riskLevel] ?? 1);
           const needAdj = Math.max(requiredProfitBpsForSymbol(symbol, SETTINGS.riskLevel), exitFloorBps(symbol) + 0.5 + slipEw, eff(symbol, 'netMinProfitBps'));
           const entryBase = Number(s.entry || basePos.avg_entry_price || basePos.mark || 0);
+          const barsMaint = await getCryptoBars1m(symbol, 12);
+          const closesMaint = Array.isArray(barsMaint) ? barsMaint.map((b) => b.close) : [];
+          const { sigma: sigmaMaint } = ewmaSigmaFromCloses(closesMaint.slice(-12), SETTINGS.volHalfLifeMin);
           const tpBase = entryBase * (1 + needAdj / 10000);
           const feeFloor = minExitPriceFeeAwareDynamic({ symbol, entryPx: entryBase, qty: avail, buyBpsOverride: s.buyBpsApplied });
-          const tp = Math.max(Math.min(tpBase, entryBase + (s.runway ?? 0)), feeFloor);
-          s.tp = tp; s.feeFloor = feeFloor;
+          const runwayUSD = robustRunwayUSD(symbol, entryBase, sigmaMaint, SETTINGS.pTouchHorizonMin, symStats);
+          const tp = Math.max(Math.min(tpBase, entryBase + (runwayUSD || 0)), feeFloor);
+          s.tp = tp; s.feeFloor = feeFloor; s.runway = runwayUSD;
 
           await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos: basePos });
         }
