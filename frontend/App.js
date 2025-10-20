@@ -114,7 +114,8 @@ const DEFAULT_SETTINGS = {
 
   // Entry / exit behavior
   enableTakerFlip: false,
-  takerExitOnTouch: false,  // sell as maker → lower exit fee
+  // Exit behavior: prefer maker exits by default (lower fees → lower floor)
+  takerExitOnTouch: false,  // was true; set false by default
   takerExitGuard: 'min',
   makerCampSec: 18,
   touchTicksRequired: 2,
@@ -169,9 +170,13 @@ const DEFAULT_SETTINGS = {
   autoTuneMinNetMinBps: 0.0, // don’t force netMin back up if auto-tune is enabled
 
   // ==== New math knobs (volatility & EV) ====
+  // EV guard (new)
+  evGuardEnabled: false,       // OFF = fail-open (no EV veto)
+  evMinBps: -1.0,              // allow slightly negative EV in bps
+  evMinUSD: -0.02,             // allow tiny negative EV per trade in USD
+  evShowDebug: true,           // log EV math to Live logs
+
   volHalfLifeMin: 10,          // EWMA half-life (minutes) for realized vol on 1m bars
-  evMinUSD: 0.20,              // minimum expected value per trade (USD per position) to gate entries
-  evMinBps: 0.8,               // fallback floor if size is tiny (bps per share)
   tpVolScale: 1.0,             // kTP: target scales with σ (in bps)
   stopVolMult: 2.5,            // soft stop = max(user stop, stopVolMult * σ_bps)
   trailArmVolMult: 0.8,        // trail arms at max(user bps, trailArmVolMult * σ_bps)
@@ -867,6 +872,47 @@ function perShareFixedOnSell(qty, model) {
   if (model.cls !== 'equity') return 0;
   const fixed = Math.min(model.tafPerShare * qty, model.tafCap) + model.commissionUSD;
   return fixed / Math.max(1, qty);
+}
+
+function midFromQuote(q) {
+  return (q && Number.isFinite(q.bid) && Number.isFinite(q.ask)) ? 0.5 * (q.bid + q.ask) : null;
+}
+
+function stopBpsForSymbol(symbol) {
+  // Use configured stopLossBps as the loss distance "a"
+  return Math.max(1, SETTINGS.stopLossBps || 80);
+}
+
+/**
+ * Very lightweight EV model (units = bps of entry).
+ * p_up is nudged by short-term slope; if momentum filter is OFF, use mild tilt only.
+ */
+function expectedValueBps({ symbol, q, tpBps, buyBpsOverride }) {
+  const m = midFromQuote(q) || q?.bid || 0;
+  if (!(m > 0) || !(tpBps > 0)) return -1e9;
+
+  const a = stopBpsForSymbol(symbol);           // loss distance in bps
+  const b = tpBps;                               // gain distance in bps
+  const slip = symStats[symbol]?.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[SETTINGS.riskLevel] ?? 1);
+
+  // Fees: use dynamic round-trip with actual planned sell side
+  const fees = roundTripFeeBpsEstimateWithBuy(symbol, buyBpsOverride) + slip;
+
+  // Tiny momentum tilt: use last two closes if available
+  const closes = PRICE_HIST.get(symbol) || [];
+  let tilt = 0;
+  if (closes.length >= 2) {
+    const v0 = closes[closes.length - 1] - closes[closes.length - 2];
+    tilt = Number.isFinite(v0) ? Math.sign(v0) * 0.02 : 0; // ±2% tilt to p_up (very mild)
+  }
+  // Base gambler's-ruin p_up = a/(a+b) when drift=0; tilt around 0.5
+  let p_up = 0.5 + tilt;
+  p_up = Math.max(0.05, Math.min(0.95, p_up));
+
+  // EV in bps (gross minus fees)
+  const evGross = p_up * b - (1 - p_up) * a;
+  const evNet = evGross - fees;
+  return evNet;
 }
 
 // ---- dynamic-fee variants
@@ -2699,20 +2745,6 @@ export default function App() {
       slippageBps: slipEw,
     });
 
-    const evUsdFloor = SETTINGS.evMinUSD || 0.2;
-    const evBpsFloor = SETTINGS.evMinBps || 0.8;
-    const evBps = (EVps / Math.max(1e-9, q.bid)) * 10000;
-    const approxQty = Math.max(
-      MIN_BID_SIZE_LOOSE,
-      (q.bs || 0),
-      MIN_BID_NOTIONAL_LOOSE_USD / Math.max(q.bid, 1e-9)
-    );
-    const EVusd = EVps * approxQty;
-    if ((EVps < 0 && evBps < evBpsFloor) || (EVusd < evUsdFloor && evBps < evBpsFloor)) {
-      logTradeAction('entry_skipped', asset.symbol, { reason: 'edge_negative_ev', EVps, evBps, EVusd });
-      return { entryReady: false, why: 'edge_negative_ev', meta: { EVps, evBps, EVusd } };
-    }
-
     const spreadEw = symEntry.spreadEwmaBps ?? spreadBps;
     const needBpsCapped = Math.min(
       Math.max(needBpsVol, exitFloorBps(asset.symbol) + 1),
@@ -2722,6 +2754,22 @@ export default function App() {
     if (!(tpBase > q.bid * 1.00005)) {
       return { entryReady: false, why: 'edge_negative', meta: { tpBps: needBpsCapped, bid: q.bid, tp: tpBase } };
     }
+
+    // ── EV guard (fail-open if disabled) ─────────────────────────────────────────
+    if (SETTINGS.evGuardEnabled) {
+      // Compute EV in bps relative to entry
+      const evBps = expectedValueBps({ symbol: asset.symbol, q, tpBps: needBpsCapped, buyBpsOverride: SETTINGS.feeBpsMaker });
+      const evUsd = (evBps / 10000) * q.bid; // per 1 unit; order sizing handled later
+
+      if (SETTINGS.evShowDebug) {
+        logTradeAction('quote_ok', asset.symbol, { evBps: Number(evBps?.toFixed?.(2)), tpBps: Number(needBpsCapped?.toFixed?.(1)) });
+      }
+
+      if (!(evBps >= (SETTINGS.evMinBps ?? -1) || evUsd >= (SETTINGS.evMinUSD ?? -0.02))) {
+        return { entryReady: false, why: 'edge_negative_ev', meta: { evBps, evUsd, tpBps: needBpsCapped } };
+      }
+    }
+    // If EV guard is disabled → proceed (classic gates already passed)
 
     return {
       entryReady: true,
