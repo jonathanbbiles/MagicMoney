@@ -310,6 +310,28 @@ const isFractionalQty = (q) => Math.abs(q - Math.round(q)) > 1e-6;
 const isoDaysAgo = (n) => new Date(Date.now() - n * 864e5).toISOString();
 
 /* ──────────────────────────── 6) SYMBOL HELPERS ──────────────────────────── */
+// Canonicalize symbols to the app's internal form (e.g., "BCHUSD").
+// Accepts formats like "BCH/USD", "BCH-USD", and already-canonical "BCHUSD".
+const SYM_MAP = {
+  'BCH/USD':'BCHUSD','BCH-USD':'BCHUSD','BCHUSD':'BCHUSD',
+  'UNI/USD':'UNIUSD','UNI-USD':'UNIUSD','UNIUSD':'UNIUSD',
+  'LTC/USD':'LTCUSD','LTC-USD':'LTCUSD','LTCUSD':'LTCUSD',
+  'XRP/USD':'XRPUSD','XRP-USD':'XRPUSD','XRPUSD':'XRPUSD',
+  'BTC/USD':'BTCUSD','BTC-USD':'BTCUSD','BTCUSD':'BTCUSD',
+  'ETH/USD':'ETHUSD','ETH-USD':'ETHUSD','ETHUSD':'ETHUSD',
+  'SOL/USD':'SOLUSD','SOL-USD':'SOLUSD','SOLUSD':'SOLUSD',
+  'AAVE/USD':'AAVEUSD','AAVE-USD':'AAVEUSD','AAVEUSD':'AAVEUSD',
+};
+function normSymbol(s) {
+  if (!s) return null;
+  const t = String(s).trim().toUpperCase();
+  if (SYM_MAP[t]) return SYM_MAP[t];
+  if (t.endsWith('/USD')) return t.replace('/USD', 'USD');
+  if (t.endsWith('-USD')) return t.replace('-USD', 'USD');
+  if (/^[A-Z]{2,10}USD$/.test(t)) return t;
+  return t;
+}
+
 function toDataSymbol(sym) {
   if (!sym) return sym;
   if (sym.includes('/')) return sym;
@@ -612,6 +634,232 @@ const LiveLogsCopyViewer = ({ logs = [] }) => {
   );
 };
 
+/* ─────────────────────────── 9c) PnL & Benchmark Scoreboard ─────────────────────────── */
+// Build minimal events from Alpaca activities, then compute FIFO realized P&L and fees.
+function buildEventsFromActivities(acts = []) {
+  const evs = [];
+  for (const a of acts) {
+    const t = String(a.activity_type || a.activityType || '').toUpperCase();
+    const sym = normSymbol(a.symbol || a.symbol_id || null);
+    const side = String(a.side || '').toLowerCase();
+    const qty = Number(a.qty ?? a.cum_qty ?? a.quantity ?? 0);
+    const price = Number(a.price ?? a.fill_price ?? a.avg_price ?? 0);
+    const tsRaw = a.transaction_time || a.date || a.timestamp || a.processed_at || a.created_at || a.time || '';
+    const tsMs = parseTsMs(tsRaw);
+
+    if (t === 'FILL') {
+      const q = Math.abs(Number(qty) || 0);
+      if (!(q > 0) || !(price > 0) || !sym) continue;
+      const cashUsd = q * price * (side === 'buy' ? -1 : 1);
+      evs.push({ tsMs, type: 'FILL', side, symbol: sym, qty: q, price, cashUsd });
+    } else if (t === 'CFEE' || t === 'FEE' || t === 'PTC') {
+      const net = Number(a.net_amount ?? a.amount ?? a.price ?? 0);
+      if (sym && Number(qty) < 0 && price > 0) {
+        // Asset-denominated fee: negative qty at a price → remove from lots & treat as USD fee at that valuation
+        evs.push({ tsMs, type: 'CFEE_ASSET', symbol: sym, qty: Math.abs(Number(qty) || 0), price, cashUsd: 0 });
+      } else {
+        // Pure USD fee
+        const usd = Math.abs(Number(net) || 0);
+        if (usd > 0) evs.push({ tsMs, type: 'CFEE_USD', symbol: null, qty: 0, price: 0, cashUsd: -usd });
+      }
+    }
+  }
+  return evs.sort((a, b) => (a.tsMs || 0) - (b.tsMs || 0));
+}
+
+function fifoPnlFromEvents(events = []) {
+  const book = new Map(); // sym -> [{qty, cost}]
+  let realized = 0;
+  let feesUsd = 0;
+  const cashFlows = []; // [{ts, cash}]
+
+  const lotsOf = (sym) => {
+    if (!book.has(sym)) book.set(sym, []);
+    return book.get(sym);
+  };
+  const removeQtyFIFO = (sym, qToRemove, pxForPnl = null, isSell = false) => {
+    const lots = lotsOf(sym);
+    let remain = qToRemove;
+    while (remain > 1e-12 && lots.length) {
+      const lot = lots[0];
+      const take = Math.min(lot.qty, remain);
+      if (isSell && pxForPnl != null) {
+        realized += (pxForPnl - lot.cost) * take;
+      }
+      lot.qty -= take;
+      remain -= take;
+      if (lot.qty <= 1e-12) lots.shift();
+    }
+    return qToRemove - remain; // matched amount
+  };
+
+  for (const e of events) {
+    if (e.type === 'FILL') {
+      cashFlows.push({ ts: e.tsMs, cash: e.cashUsd });
+      if (e.side === 'buy') {
+        const lots = book.get(e.symbol) || [];
+        lots.push({ qty: e.qty, cost: e.price });
+        book.set(e.symbol, lots);
+      } else if (e.side === 'sell') {
+        const matched = removeQtyFIFO(e.symbol, e.qty, e.price, true);
+        // If a sell exceeds in-window lots, we ignore the unmatched portion (came from pre-window inventory).
+        if (matched < e.qty) {
+          // Partial info only — safe fallback (do nothing for the remainder).
+        }
+      }
+    } else if (e.type === 'CFEE_USD') {
+      feesUsd += Math.abs(e.cashUsd || 0);
+    } else if (e.type === 'CFEE_ASSET') {
+      // Remove the asset qty from FIFO and count USD value of the removed qty as a fee
+      const matched = removeQtyFIFO(e.symbol, e.qty, null, false);
+      feesUsd += matched * (e.price || 0);
+    }
+  }
+  return { book, realizedUsd: realized, feesUsd, cashFlows };
+}
+
+async function markToMarketBookPrices(book) {
+  const syms = Array.from(book.keys());
+  if (!syms.length) return { unrealizedUsd: 0, pricesAt: {} };
+  const ds = syms.map((s) => toDataSymbol(s));
+  const qmap = await getCryptoQuotesBatch(ds);
+  let unreal = 0;
+  const pricesAt = {};
+  for (const s of syms) {
+    const q = qmap.get(toDataSymbol(s));
+    const mid = q && Number.isFinite(q.bid) && Number.isFinite(q.ask) ? 0.5 * (q.bid + q.ask) : (q?.bid || q?.ask || 0);
+    if (mid > 0) pricesAt[s] = mid;
+    const lots = book.get(s) || [];
+    for (const lot of lots) {
+      if (mid > 0) unreal += (mid - lot.cost) * lot.qty;
+    }
+  }
+  return { unrealizedUsd: unreal, pricesAt };
+}
+
+function computePeakOutflow(cashFlows = []) {
+  // Track cumulative cash (negative = invested). Peak outflow = min cumulative (absolute).
+  let cum = 0, minCum = 0;
+  for (const cf of cashFlows.sort((a, b) => (a.ts || 0) - (b.ts || 0))) {
+    cum += Number(cf.cash || 0);
+    if (cum < minCum) minCum = cum;
+  }
+  return Math.abs(minCum);
+}
+
+// Lightweight activities fetch (mirrors TxnHistoryCSVViewer internal)
+async function fetchActivitiesRange({ days = 7, types = 'FILL,CFEE,FEE,TRANS,PTC', max = 1000 } = {}) {
+  const untilISO = new Date().toISOString();
+  const afterISO = new Date(Date.now() - days * 864e5).toISOString();
+  let token = null;
+  let all = [];
+  for (let i = 0; i < 20; i++) {
+    const { items, next } = await getActivities({ afterISO, untilISO, pageToken: token, types });
+    all = all.concat(items);
+    if (!next || all.length >= max) break;
+    token = next;
+  }
+  return all.slice(0, max);
+}
+
+const PnlScoreboard = ({ days = 7 }) => {
+  const [busy, setBusy] = useState(false);
+  const [score, setScore] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      setBusy(true);
+      setError(null);
+      try {
+        const acts = await fetchActivitiesRange({ days });
+        const events = buildEventsFromActivities(acts);
+        const { book, realizedUsd, feesUsd, cashFlows } = fifoPnlFromEvents(events);
+        const { unrealizedUsd } = await markToMarketBookPrices(book);
+        const realizedNet = realizedUsd - feesUsd;
+        const totalNet = realizedNet + unrealizedUsd;
+        const peakOut = computePeakOutflow(cashFlows);
+        const { spyRet, btcRet } = await computeBenchReturns(days);
+        const spyHypo = peakOut * spyRet;
+        const btcHypo = peakOut * btcRet;
+        setScore({
+          realizedUsd, feesUsd, realizedNet,
+          unrealizedUsd, totalNet, peakOut,
+          spyRet, btcRet, spyHypo, btcHypo,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (e) {
+        setError(e?.message || String(e));
+      } finally {
+        setBusy(false);
+      }
+    })();
+  }, [days]);
+
+  return (
+    <View style={styles.card}>
+      <Text style={styles.cardTitle}>P&L (last {days}d) — Realized vs Unrealized + Benchmarks</Text>
+      {busy && <ActivityIndicator />}
+      {error && <Text style={styles.sevError}>Error: {error}</Text>}
+      {score && (
+        <View style={{ gap: 6 }}>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Realized (gross)</Text>
+            <Text style={styles.value}>{fmtUSD(score.realizedUsd)}</Text>
+          </View>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Fees</Text>
+            <Text style={styles.value}>{fmtUSD(-Math.abs(score.feesUsd))}</Text>
+          </View>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Realized (net)</Text>
+            <Text style={styles.value}>{fmtUSD(score.realizedNet)}</Text>
+          </View>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Unrealized (open lots)</Text>
+            <Text style={[styles.value, { color: '#355070' }]}>{fmtUSD(score.unrealizedUsd)}</Text>
+          </View>
+          <View style={styles.line} />
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Total (net + unrealized)</Text>
+            <Text style={styles.value}>{fmtUSD(score.totalNet)}</Text>
+          </View>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Peak net cash deployed</Text>
+            <Text style={styles.value}>{fmtUSD(score.peakOut)}</Text>
+          </View>
+          <View style={styles.line} />
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>SPY return over window</Text>
+            <Text style={styles.value}>{fmtPct(score.spyRet * 100)}</Text>
+          </View>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>BTC return over window</Text>
+            <Text style={styles.value}>{fmtPct(score.btcRet * 100)}</Text>
+          </View>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Hypothetical $ on SPY (peakOut × ret)</Text>
+            <Text style={styles.value}>{fmtUSD(score.spyHypo)}</Text>
+          </View>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Hypothetical $ on BTC (peakOut × ret)</Text>
+            <Text style={styles.value}>{fmtUSD(score.btcHypo)}</Text>
+          </View>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Alpha vs SPY (realized net − SPY $)</Text>
+            <Text style={styles.value}>{fmtUSD(score.realizedNet - score.spyHypo)}</Text>
+          </View>
+          <View style={styles.legendRow}>
+            <Text style={styles.subtle}>Alpha vs BTC (realized net − BTC $)</Text>
+            <Text style={styles.value}>{fmtUSD(score.realizedNet - score.btcHypo)}</Text>
+          </View>
+          <Text style={styles.smallNote}>Updated {new Date(score.updatedAt).toLocaleTimeString()}</Text>
+        </View>
+      )}
+    </View>
+  );
+};
+
 /* ───────────────────────────── 10) STATIC UNIVERSES ───────────────────────────── */
 const ORIGINAL_TOKENS = [
   { name: 'ETH/USD',  symbol: 'ETHUSD',  cc: 'ETH'  },
@@ -839,6 +1087,90 @@ async function stocksLatestQuotesBatch(symbols = []) {
     return out;
   } catch { return new Map(); }
 }
+
+// --- Daily bars helpers (stocks & crypto) for simple benchmark returns ---
+async function stocksDailyBars(symbols = [], limit = 10) {
+  if (!symbols.length) return new Map();
+  const csv = symbols.join(',');
+  const sp = new URLSearchParams({
+    timeframe: '1Day',
+    symbols: csv,
+    limit: String(limit),
+    adjustment: 'raw',
+  });
+  try {
+    const r = await f(`${DATA_ROOT_STOCKS_V2}/bars?${sp.toString()}`, { headers: HEADERS });
+    if (!r.ok) return new Map();
+    const j = await r.json().catch(() => null);
+    const raw = j?.bars || {};
+    const out = new Map();
+    for (const sym of symbols) {
+      const arr = raw[sym];
+      if (Array.isArray(arr) && arr.length) {
+        out.set(sym, arr.map(b => ({
+          tms: parseTsMs(b.t),
+          open: Number(b.o ?? b.open),
+          high: Number(b.h ?? b.high),
+          low:  Number(b.l ?? b.low),
+          close:Number(b.c ?? b.close),
+          vol:  Number(b.v ?? b.volume ?? 0),
+        })).filter(x => Number.isFinite(x.close) && x.close > 0));
+      }
+    }
+    return out;
+  } catch { return new Map(); }
+}
+
+async function cryptoDailyBars(symbols = [], limit = 10) {
+  const uniq = Array.from(new Set(symbols.filter(Boolean)));
+  if (!uniq.length) return new Map();
+  const out = new Map();
+  for (const loc of DATA_LOCATIONS) {
+    try {
+      const ds = uniq.map(s => toDataSymbol(s)).join(',');
+      const sp = new URLSearchParams({ timeframe: '1Day', limit: String(limit), symbols: ds });
+      const url = `${DATA_ROOT_CRYPTO}/${loc}/bars?${sp.toString()}`;
+      const r = await f(url, { headers: HEADERS });
+      if (!r.ok) continue;
+      const j = await r.json().catch(() => null);
+      const raw = j?.bars || {};
+      for (const sym of uniq) {
+        const dsym = toDataSymbol(sym);
+        const arr = raw[dsym];
+        if (Array.isArray(arr) && arr.length) {
+          out.set(sym, arr.map(b => ({
+            tms: parseTsMs(b.t),
+            open: Number(b.o ?? b.open),
+            high: Number(b.h ?? b.high),
+            low:  Number(b.l ?? b.low),
+            close:Number(b.c ?? b.close),
+            vol:  Number(b.v ?? b.volume ?? 0),
+          })).filter(x => Number.isFinite(x.close) && x.close > 0));
+        }
+      }
+      break; // success from this location
+    } catch {}
+  }
+  return out;
+}
+
+async function computeBenchReturns(days = 7) {
+  // Use SPY for stocks proxy; BTCUSD for crypto proxy.
+  const spyBarsMap = await stocksDailyBars(['SPY'], days + 2);
+  const btcBarsMap = await cryptoDailyBars(['BTCUSD'], days + 2);
+  const spy = (spyBarsMap.get('SPY') || []).slice(-(days + 1));
+  const btc = (btcBarsMap.get('BTCUSD') || []).slice(-(days + 1));
+  const pct = (arr) => (arr.length >= 2 && arr[0].close > 0)
+    ? (arr[arr.length - 1].close / arr[0].close) - 1
+    : 0;
+  return {
+    spyRet: pct(spy),
+    btcRet: pct(btc),
+    spySeries: spy,
+    btcSeries: btc,
+  };
+}
+
 async function stocksLatestTrade(symbol) { return null; }
 async function stocksBars1m(symbols = [], limit = 6) { return new Map(); }
 
@@ -3603,6 +3935,8 @@ export default function App() {
         </View>
 
         {/* Chart order per request: 1) Portfolio Percentage, 2) Holdings Percentage, 3) Portfolio Value */}
+        {/* NEW: P&L + Benchmarks scoreboard */}
+        <PnlScoreboard days={7} />
         <PortfolioChangeChart acctSummary={acctSummary} />
         <HoldingsChangeBarChart />
         <DailyPortfolioValueChart acctSummary={acctSummary} />
