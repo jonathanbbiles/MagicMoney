@@ -93,10 +93,13 @@ export const DEFAULT_SETTINGS = {
 
   // Stops / trailing
   enableStops: true,
+  stopLossPct: 2.0,
   stopLossBps: 80,
   hardStopLossPct: 1.8,
   stopGraceSec: 10,
   enableTrailing: true,
+  trailStartPct: 1.0,
+  trailDropPct: 1.0,
   trailStartBps: 20,
   trailingStopBps: 10,
 
