@@ -1890,33 +1890,6 @@ async function cancelOrder(orderId) {
   }
 }
 
-async function marketSell(symbol, qty) {
-  if (!(qty > 0)) return null;
-  const order = {
-    symbol,
-    qty,
-    side: 'sell',
-    type: 'market',
-    time_in_force: isStock(symbol) ? 'day' : 'gtc',
-  };
-  if (DRY_RUN_STOPS) {
-    logTradeAction('risk_stop', symbol, { dryRun: true, qty, order });
-    return { dryRun: true, order };
-  }
-  const res = await f(`${ALPACA_BASE_URL}/orders`, {
-    method: 'POST',
-    headers: HEADERS,
-    body: JSON.stringify(order),
-  });
-  const raw = await res.text();
-  let data;
-  try { data = JSON.parse(raw); } catch { data = { raw }; }
-  if (!res.ok) throw new Error(data?.message || data?.raw || `Sell ${res.status}`);
-  __openOrdersCache = { ts: 0, items: [] };
-  __positionsCache = { ts: 0, items: [] };
-  return data;
-}
-
 const RISK_EXIT_COOLDOWN_MS = 60000;
 function computeRiskDecision({ entryPrice, currentPrice, peakPrice, trailingActive, settings }) {
   if (!(entryPrice > 0) || !(currentPrice > 0)) return { trigger: false };
@@ -2697,6 +2670,10 @@ async function marketSell(symbol, qty) {
   }
   const tif = isStock(symbol) ? 'day' : 'gtc';
   const mkt = { symbol, qty: usableQty, side: 'sell', type: 'market', time_in_force: tif };
+  if (DRY_RUN_STOPS) {
+    logTradeAction('risk_stop', symbol, { dryRun: true, qty: usableQty, order: mkt });
+    return { dryRun: true, order: mkt };
+  }
   try {
     const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(mkt) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
