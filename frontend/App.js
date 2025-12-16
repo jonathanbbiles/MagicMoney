@@ -12,6 +12,7 @@ import {
   TextInput,
   Platform,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 
 /* ──────────────────────────────── 1) VERSION / CONFIG ──────────────────────────────── */
@@ -35,6 +36,7 @@ const HEADERS = {
   Accept: 'application/json',
   'Content-Type': 'application/json',
 };
+const DRY_RUN_STOPS = false; // Set true to log stop actions without sending orders
 // Safety guard: crash loudly if a paper endpoint is ever used
 if (typeof ALPACA_BASE_URL === 'string' && /paper-api\.alpaca\.markets/i.test(ALPACA_BASE_URL)) {
   throw new Error('Paper trading endpoint detected. LIVE ONLY is enforced. Fix ALPACA_BASE_URL.');
@@ -125,10 +127,13 @@ const DEFAULT_SETTINGS = {
 
   // Stops / trailing
   enableStops: true,
+  stopLossPct: 2.0,
   stopLossBps: 50,          // tighter stop improves EV
   hardStopLossPct: 1.8,
   stopGraceSec: 10, // NEW
   enableTrailing: true,
+  trailStartPct: 1.0,
+  trailDropPct: 1.0,
   trailStartBps: 20,
   trailingStopBps: 10,
 
@@ -193,6 +198,20 @@ try {
     console.warn('[Quotes] quoteTtlMs > liveFreshMsCrypto — cached quotes may fail freshness on read');
   }
 } catch {}
+
+const SETTINGS_STORAGE_KEY = `${VERSION}:settings:v2`;
+function migrateSettings(raw) {
+  const base = { ...(raw || {}) };
+  return {
+    ...DEFAULT_SETTINGS,
+    ...base,
+    enableStops: base.enableStops ?? DEFAULT_SETTINGS.enableStops,
+    stopLossPct: Number.isFinite(+base.stopLossPct) ? +base.stopLossPct : DEFAULT_SETTINGS.stopLossPct,
+    enableTrailing: base.enableTrailing ?? DEFAULT_SETTINGS.enableTrailing,
+    trailStartPct: Number.isFinite(+base.trailStartPct) ? +base.trailStartPct : DEFAULT_SETTINGS.trailStartPct,
+    trailDropPct: Number.isFinite(+base.trailDropPct) ? +base.trailDropPct : DEFAULT_SETTINGS.trailDropPct,
+  };
+}
 
 // Minimal UI switch: show only Gate settings inside Settings panel.
 const SIMPLE_SETTINGS_ONLY = true;
@@ -1854,6 +1873,169 @@ const cancelAllOrders = async () => {
   } catch {}
 };
 
+async function getOpenSellOrderBySymbol(symbol, cached = null) {
+  const open = cached || (await getOpenOrdersCached());
+  return (open || []).find((o) => (o.side || '').toLowerCase() === 'sell' && o.symbol === symbol) || null;
+}
+
+async function cancelOrder(orderId) {
+  if (!orderId) return false;
+  try {
+    await f(`${ALPACA_BASE_URL}/orders/${orderId}`, { method: 'DELETE', headers: HEADERS });
+    __openOrdersCache = { ts: 0, items: [] };
+    return true;
+  } catch (err) {
+    console.warn('Cancel error', err?.message || err);
+    return false;
+  }
+}
+
+async function marketSell(symbol, qty) {
+  if (!(qty > 0)) return null;
+  const order = {
+    symbol,
+    qty,
+    side: 'sell',
+    type: 'market',
+    time_in_force: isStock(symbol) ? 'day' : 'gtc',
+  };
+  if (DRY_RUN_STOPS) {
+    logTradeAction('risk_stop', symbol, { dryRun: true, qty, order });
+    return { dryRun: true, order };
+  }
+  const res = await f(`${ALPACA_BASE_URL}/orders`, {
+    method: 'POST',
+    headers: HEADERS,
+    body: JSON.stringify(order),
+  });
+  const raw = await res.text();
+  let data;
+  try { data = JSON.parse(raw); } catch { data = { raw }; }
+  if (!res.ok) throw new Error(data?.message || data?.raw || `Sell ${res.status}`);
+  __openOrdersCache = { ts: 0, items: [] };
+  __positionsCache = { ts: 0, items: [] };
+  return data;
+}
+
+const RISK_EXIT_COOLDOWN_MS = 60000;
+function computeRiskDecision({ entryPrice, currentPrice, peakPrice, trailingActive, settings }) {
+  if (!(entryPrice > 0) || !(currentPrice > 0)) return { trigger: false };
+  const s = settings || SETTINGS;
+  const profitPct = ((currentPrice - entryPrice) / entryPrice) * 100;
+  const dropFromEntryPct = ((entryPrice - currentPrice) / entryPrice) * 100;
+  const peakEff = trailingActive ? Math.max(peakPrice || 0, currentPrice) : peakPrice;
+  const dropFromPeakPct = trailingActive && peakEff > 0 ? ((peakEff - currentPrice) / peakEff) * 100 : 0;
+  let trigger = false;
+  let reason = null;
+  if (s.enableStops && dropFromEntryPct >= (s.stopLossPct || 0)) {
+    trigger = true;
+    reason = 'fixed_stop';
+  }
+  if (!trigger && s.enableTrailing && trailingActive && dropFromPeakPct >= (s.trailDropPct || 0)) {
+    trigger = true;
+    reason = 'trailing_stop';
+  }
+  return { trigger, reason, profitPct, dropFromEntryPct, dropFromPeakPct, peakEff };
+}
+
+async function ensureRiskExitsForPosition(pos, ctx = {}) {
+  if (!SETTINGS.enableStops) return false;
+  const symbol = pos.symbol;
+  const qtyAvailable = Number(pos.qty_available ?? pos.available ?? pos.qty ?? 0);
+  const entryPrice = Number(pos.avg_entry_price ?? pos.basis ?? 0);
+  if (!(qtyAvailable > 0) || !(entryPrice > 0)) return false;
+
+  const now = Date.now();
+  const last = recentRiskExitRef.current.get(symbol);
+  if (last && now - last < RISK_EXIT_COOLDOWN_MS) return false;
+
+  let currentPrice = NaN;
+  try {
+    const q = await getQuoteSmart(symbol, ctx.preQuoteMap);
+    if (q && Number.isFinite(q.bid) && Number.isFinite(q.ask) && q.bid > 0 && q.ask > 0) {
+      currentPrice = 0.5 * (q.bid + q.ask);
+    }
+  } catch {}
+  if (!(currentPrice > 0)) {
+    const mv = Number(pos.market_value ?? pos.marketValue ?? 0);
+    if (mv > 0 && qtyAvailable > 0) currentPrice = mv / qtyAvailable;
+    if (!(currentPrice > 0)) {
+      const px = Number(pos.current_price ?? pos.asset_current_price ?? 0);
+      if (px > 0) currentPrice = px;
+    }
+  }
+  if (!(currentPrice > 0)) return false;
+
+  const riskState = riskTrailStateRef.current;
+  const state = riskState.get(symbol) || { peakPrice: entryPrice, trailingActive: false };
+  const settings = SETTINGS;
+  const profitPct = ((currentPrice - entryPrice) / entryPrice) * 100;
+  const shouldArmTrail = settings.enableTrailing && profitPct >= (settings.trailStartPct || 0);
+  const trailingActive = state.trailingActive || shouldArmTrail;
+  const peakPrice = trailingActive ? Math.max(state.peakPrice || entryPrice, currentPrice) : state.peakPrice || entryPrice;
+
+  const decision = computeRiskDecision({ entryPrice, currentPrice, peakPrice, trailingActive, settings });
+  riskState.set(symbol, { peakPrice, trailingActive });
+
+  if (!decision.trigger) return false;
+
+  const openSell = await getOpenSellOrderBySymbol(symbol, ctx.openOrders);
+  if (openSell) await cancelOrder(openSell.id);
+
+  const payload = {
+    qty: qtyAvailable,
+    entryPrice,
+    currentPrice,
+    peakPrice,
+    profitPct,
+    dropEntry: decision.dropFromEntryPct,
+    dropPeak: decision.dropFromPeakPct,
+    reason: decision.reason,
+  };
+  logTradeAction('risk_stop', symbol, payload);
+  console.log(
+    `STOP SELL ${symbol} qty=${qtyAvailable} entry=${entryPrice} current=${currentPrice} peak=${peakPrice} ` +
+      `profitPct=${profitPct.toFixed?.(2)} dropEntry=${decision.dropFromEntryPct?.toFixed?.(2)} dropPeak=${decision.dropFromPeakPct?.toFixed?.(2)} reason=${decision.reason}${DRY_RUN_STOPS ? ' DRY-RUN' : ''}`
+  );
+
+  try {
+    if (!DRY_RUN_STOPS) await marketSell(symbol, qtyAvailable);
+    recentRiskExitRef.current.set(symbol, Date.now());
+    riskState.delete(symbol);
+    return true;
+  } catch (err) {
+    console.error('Stop sell error', err?.message || err);
+    return false;
+  }
+}
+
+function simulateRiskPath({ entryPrice, prices = [], settings }) {
+  const s = settings || SETTINGS;
+  let state = { peakPrice: entryPrice, trailingActive: false };
+  let last = null;
+  for (const p of prices) {
+    const profitPct = ((p - entryPrice) / entryPrice) * 100;
+    const shouldArmTrail = s.enableTrailing && profitPct >= (s.trailStartPct || 0);
+    const trailingActive = state.trailingActive || shouldArmTrail;
+    const peakPrice = trailingActive ? Math.max(state.peakPrice || entryPrice, p) : state.peakPrice || entryPrice;
+    last = computeRiskDecision({ entryPrice, currentPrice: p, peakPrice, trailingActive, settings: s });
+    state = { peakPrice, trailingActive };
+  }
+  return last;
+}
+
+function runRiskHarness() {
+  const base = migrateSettings(SETTINGS);
+  const fixed = simulateRiskPath({ entryPrice: 100, prices: [98], settings: base });
+  const trailing = simulateRiskPath({ entryPrice: 100, prices: [103, 101.97], settings: base });
+  console.log('Risk Harness — fixed stop', fixed);
+  console.log('Risk Harness — trailing stop', trailing);
+}
+
+if (typeof globalThis !== 'undefined') {
+  globalThis.runRiskHarness = runRiskHarness;
+}
+
 async function getAccountSummaryRaw() {
   const res = await f(`${ALPACA_BASE_URL}/account`, { headers: HEADERS });
   if (!res.ok) throw new Error(`Account ${res.status}`);
@@ -2828,6 +3010,24 @@ export default function App() {
 
   const [settings, setSettings] = useState({ ...SETTINGS });
   useEffect(() => {
+    (async () => {
+      try {
+        const raw = await AsyncStorage.getItem(SETTINGS_STORAGE_KEY);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          const migrated = migrateSettings(parsed);
+          setSettings(migrated);
+          SETTINGS = { ...migrated };
+        }
+      } catch (err) {
+        console.warn('Settings load failed', err?.message || err);
+      }
+    })();
+  }, []);
+  useEffect(() => {
+    AsyncStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings)).catch(() => {});
+  }, [settings]);
+  useEffect(() => {
     SETTINGS = { ...settings };
     logTradeAction('risk_changed', 'SETTINGS', { level: SETTINGS.riskLevel, spreadMax: SETTINGS.spreadMaxBps });
   }, [settings]);
@@ -2845,6 +3045,8 @@ export default function App() {
   const touchMemoRef = useRef({});
   const stockPageRef = useRef(0);
   const cryptoPageRef = useRef(0);
+  const riskTrailStateRef = useRef(new Map());
+  const recentRiskExitRef = useRef(new Map());
 
   const lastAcctFetchRef = useRef(0);
   const getAccountSummaryThrottled = async (minMs = 30000) => {
@@ -3264,14 +3466,13 @@ export default function App() {
         );
         for (const p of positions || []) {
           const symbol = p.symbol;
-          if (isStock(symbol)) { continue; } // crypto-only build: skip equities like RKLB
-
           const basePos = posBySym.get(symbol) || p;
           const avail = Number(basePos.qty_available ?? basePos.available ?? basePos.qty ?? 0);
           const mv    = Number(basePos.market_value ?? basePos.marketValue ?? 0);
           if (!(avail > 0 || mv >= SETTINGS.dustFlattenMaxUsd)) {
             // Not truly held → don’t maintain TP/stop; also clear stale trade state
             delete tradeStateRef.current[symbol];
+            riskTrailStateRef.current.delete(symbol);
             continue;
           }
 
@@ -3295,6 +3496,7 @@ export default function App() {
           s.tp = tp; s.feeFloor = feeFloor; s.runway = runwayUSD;
 
           await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos: basePos });
+          await ensureRiskExitsForPosition(basePos, { openOrders, preQuoteMap: null });
         }
       } finally {
         timer = setTimeout(run, 1000 * 5);
@@ -3620,11 +3822,11 @@ export default function App() {
 
   const applyPreset = (name) => {
     const presets = {
-      Safer:  { riskLevel: 3, spreadMaxBps: 50,  maxPosPctEquity: 10, absMaxNotionalUSD: 100, makerCampSec: 30, enableTakerFlip: false, takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 10, liveRequireQuote: true, liveFreshMsCrypto: 10000, liveFreshMsStock: 10000, enforceMomentum: true,  enableStops: true, stopLossBps: 80, hardStopLossPct: 1.8, stopGraceSec: 10, enableTrailing: true, trailStartBps: 20, trailingStopBps: 10, maxConcurrentPositions: 6, haltOnDailyLoss: true,  dailyMaxLossPct: 3.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
-      Neutral:{ riskLevel: 2, spreadMaxBps: 70,  maxPosPctEquity: 15, absMaxNotionalUSD: 150, makerCampSec: 25, enableTakerFlip: false, takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 9,  liveRequireQuote: true, liveFreshMsCrypto: 15000, liveFreshMsStock: 15000, enforceMomentum: true,  enableStops: true, stopLossBps: 80, hardStopLossPct: 1.8, stopGraceSec: 10, enableTrailing: true, trailStartBps: 20, trailingStopBps: 10,  maxConcurrentPositions: 8, haltOnDailyLoss: true,  dailyMaxLossPct: 4.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
-      Faster: { riskLevel: 1, spreadMaxBps: 100, maxPosPctEquity: 20, absMaxNotionalUSD: 200, makerCampSec: 20, enableTakerFlip: false, takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 8,  liveRequireQuote: true, liveFreshMsCrypto: 15000, liveFreshMsStock: 15000, enforceMomentum: true,  enableStops: true, stopLossBps: 80, hardStopLossPct: 1.8, stopGraceSec: 10, enableTrailing: true, trailStartBps: 20, trailingStopBps: 10,  maxConcurrentPositions: 8, haltOnDailyLoss: true,  dailyMaxLossPct: 5.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
-      Aggro:  { riskLevel: 0, spreadMaxBps: 120, maxPosPctEquity: 25, absMaxNotionalUSD: 300, makerCampSec: 15, enableTakerFlip: true,  takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 7,  liveRequireQuote: true, liveFreshMsCrypto: 15000, liveFreshMsStock: 15000, enforceMomentum: false, enableStops: true, stopLossBps: 80, hardStopLossPct: 1.8, stopGraceSec: 10, enableTrailing: true, trailStartBps: 12, trailingStopBps: 6,  maxConcurrentPositions: 10,haltOnDailyLoss: true,  dailyMaxLossPct: 6.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
-      Max:    { riskLevel: 0, spreadMaxBps: 150, maxPosPctEquity: 30, absMaxNotionalUSD: 500, makerCampSec: 10, enableTakerFlip: true,  takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 6,  liveRequireQuote: true, liveFreshMsCrypto: 15000, liveFreshMsStock: 15000, enforceMomentum: false, enableStops: true, stopLossBps: 80, hardStopLossPct: 2.0, stopGraceSec: 10, enableTrailing: true, trailStartBps: 10, trailingStopBps: 5,  maxConcurrentPositions: 12,haltOnDailyLoss: false, dailyMaxLossPct: 8.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
+      Safer:  { riskLevel: 3, spreadMaxBps: 50,  maxPosPctEquity: 10, absMaxNotionalUSD: 100, makerCampSec: 30, enableTakerFlip: false, takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 10, liveRequireQuote: true, liveFreshMsCrypto: 10000, liveFreshMsStock: 10000, enforceMomentum: true,  enableStops: true, stopLossPct: 2.0, stopLossBps: 80, hardStopLossPct: 1.8, stopGraceSec: 10, enableTrailing: true, trailStartPct: 1.0, trailDropPct: 1.0, trailStartBps: 20, trailingStopBps: 10, maxConcurrentPositions: 6, haltOnDailyLoss: true,  dailyMaxLossPct: 3.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
+      Neutral:{ riskLevel: 2, spreadMaxBps: 70,  maxPosPctEquity: 15, absMaxNotionalUSD: 150, makerCampSec: 25, enableTakerFlip: false, takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 9,  liveRequireQuote: true, liveFreshMsCrypto: 15000, liveFreshMsStock: 15000, enforceMomentum: true,  enableStops: true, stopLossPct: 2.0, stopLossBps: 80, hardStopLossPct: 1.8, stopGraceSec: 10, enableTrailing: true, trailStartPct: 1.0, trailDropPct: 1.0, trailStartBps: 20, trailingStopBps: 10,  maxConcurrentPositions: 8, haltOnDailyLoss: true,  dailyMaxLossPct: 4.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
+      Faster: { riskLevel: 1, spreadMaxBps: 100, maxPosPctEquity: 20, absMaxNotionalUSD: 200, makerCampSec: 20, enableTakerFlip: false, takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 8,  liveRequireQuote: true, liveFreshMsCrypto: 15000, liveFreshMsStock: 15000, enforceMomentum: true,  enableStops: true, stopLossPct: 2.0, stopLossBps: 80, hardStopLossPct: 1.8, stopGraceSec: 10, enableTrailing: true, trailStartPct: 1.0, trailDropPct: 1.0, trailStartBps: 20, trailingStopBps: 10,  maxConcurrentPositions: 8, haltOnDailyLoss: true,  dailyMaxLossPct: 5.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
+      Aggro:  { riskLevel: 0, spreadMaxBps: 120, maxPosPctEquity: 25, absMaxNotionalUSD: 300, makerCampSec: 15, enableTakerFlip: true,  takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 7,  liveRequireQuote: true, liveFreshMsCrypto: 15000, liveFreshMsStock: 15000, enforceMomentum: false, enableStops: true, stopLossPct: 2.0, stopLossBps: 80, hardStopLossPct: 1.8, stopGraceSec: 10, enableTrailing: true, trailStartPct: 1.0, trailDropPct: 1.0, trailStartBps: 12, trailingStopBps: 6,  maxConcurrentPositions: 10,haltOnDailyLoss: true,  dailyMaxLossPct: 6.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
+      Max:    { riskLevel: 0, spreadMaxBps: 150, maxPosPctEquity: 30, absMaxNotionalUSD: 500, makerCampSec: 10, enableTakerFlip: true,  takerExitOnTouch: true, takerExitGuard: 'min', touchFlipTimeoutSec: 6,  liveRequireQuote: true, liveFreshMsCrypto: 15000, liveFreshMsStock: 15000, enforceMomentum: false, enableStops: true, stopLossPct: 2.0, stopLossBps: 80, hardStopLossPct: 2.0, stopGraceSec: 10, enableTrailing: true, trailStartPct: 1.0, trailDropPct: 1.0, trailStartBps: 10, trailingStopBps: 5,  maxConcurrentPositions: 12,haltOnDailyLoss: false, dailyMaxLossPct: 8.0, spreadOverFeesMinBps: 5, dynamicMinProfitBps: 60, extraOverFeesBps: 10, minPriceUsd: 0.001, feeBpsMaker: 15, feeBpsTaker: 25, slipBpsByRisk: [1,2,3,4,5] },
     };
     const p = presets[name];
     if (!p) return;
@@ -3817,6 +4019,66 @@ export default function App() {
               >
                 <Text style={styles.chipText}>{settings.requireSpreadOverFees ? 'ON' : 'OFF'}</Text>
               </TouchableOpacity>
+            </View>
+
+            <View style={styles.line} />
+
+            {/* Stops */}
+            <View style={styles.rowSpace}>
+              <Text style={styles.label}>🛑 Stops enabled</Text>
+              <TouchableOpacity
+                style={[styles.chip, { backgroundColor: settings.enableStops ? '#4caf50' : '#2b2b2b' }]}
+                onPress={() => setSettings((s) => ({ ...s, enableStops: !s.enableStops }))}
+              >
+                <Text style={styles.chipText}>{settings.enableStops ? 'ON' : 'OFF'}</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={styles.rowSpace}>
+              <Text style={styles.label}>Stop loss (%) below entry</Text>
+              <View style={styles.bumpGroup}>
+                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('stopLossPct', -0.25, { min: 0.2 })}>
+                  <Text style={styles.bumpBtnText}>-</Text>
+                </TouchableOpacity>
+                <Text style={styles.value}>{Number(settings.stopLossPct ?? 0).toFixed(2)}</Text>
+                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('stopLossPct', +0.25, { max: 10 })}>
+                  <Text style={styles.bumpBtnText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Trailing */}
+            <View style={styles.rowSpace}>
+              <Text style={styles.label}>📈 Trailing stop enabled</Text>
+              <TouchableOpacity
+                style={[styles.chip, { backgroundColor: settings.enableTrailing ? '#4caf50' : '#2b2b2b' }]}
+                onPress={() => setSettings((s) => ({ ...s, enableTrailing: !s.enableTrailing }))}
+              >
+                <Text style={styles.chipText}>{settings.enableTrailing ? 'ON' : 'OFF'}</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={styles.rowSpace}>
+              <Text style={styles.label}>Trail starts at profit (%)</Text>
+              <View style={styles.bumpGroup}>
+                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('trailStartPct', -0.25, { min: 0.1 })}>
+                  <Text style={styles.bumpBtnText}>-</Text>
+                </TouchableOpacity>
+                <Text style={styles.value}>{Number(settings.trailStartPct ?? 0).toFixed(2)}</Text>
+                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('trailStartPct', +0.25, { max: 20 })}>
+                  <Text style={styles.bumpBtnText}>+</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+            <View style={styles.rowSpace}>
+              <Text style={styles.label}>Sell if drop from peak (%)</Text>
+              <View style={styles.bumpGroup}>
+                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('trailDropPct', -0.25, { min: 0.1 })}>
+                  <Text style={styles.bumpBtnText}>-</Text>
+                </TouchableOpacity>
+                <Text style={styles.value}>{Number(settings.trailDropPct ?? 0).toFixed(2)}</Text>
+                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('trailDropPct', +0.25, { max: 20 })}>
+                  <Text style={styles.bumpBtnText}>+</Text>
+                </TouchableOpacity>
+              </View>
             </View>
 
             {/* Fees (bps): Maker/Taker */}
