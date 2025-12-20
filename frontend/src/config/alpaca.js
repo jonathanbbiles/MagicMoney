@@ -8,6 +8,7 @@ export const ALPACA_KEY = 'AKANN0IP04IH45Z6FG3L';
 export const ALPACA_SECRET = 'qvaKRqP9Q3XMVMEYqVnq2BEgPGhQQQfWg1JT7bWV';
 // Force LIVE trading endpoint, ignoring EX/APCA overrides
 export const ALPACA_BASE_URL = EX.APCA_API_BASE || 'https://api.alpaca.markets/v2';
+export const BACKEND_BASE_URL = EX.BACKEND_BASE_URL || 'http://localhost:3000';
 
 export const DATA_ROOT_CRYPTO = 'https://data.alpaca.markets/v1beta3/crypto';
 // IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
@@ -17,6 +18,11 @@ export const DATA_ROOT_STOCKS_V2 = 'https://data.alpaca.markets/v2/stocks';
 export const HEADERS = {
   'APCA-API-KEY-ID': ALPACA_KEY,
   'APCA-API-SECRET-KEY': ALPACA_SECRET,
+  Accept: 'application/json',
+  'Content-Type': 'application/json',
+};
+
+export const BACKEND_HEADERS = {
   Accept: 'application/json',
   'Content-Type': 'application/json',
 };

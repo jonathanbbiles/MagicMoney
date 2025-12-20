@@ -2,21 +2,17 @@ require('dotenv').config();
 
 const express = require('express');
 
-const axios = require('axios');
-
-const { placeMarketBuyThenSell, initializeInventoryFromPositions } = require('./trade');
+const {
+  placeMarketBuyThenSell,
+  initializeInventoryFromPositions,
+  submitOrder,
+  fetchOrders,
+  cancelOrder,
+} = require('./trade');
 
 const app = express();
 
 app.use(express.json());
-
- 
-
-const ALPACA_BASE_URL = process.env.ALPACA_API_BASE || 'https://api.alpaca.markets/v2';
-
-const API_KEY = process.env.ALPACA_API_KEY;
-
-const SECRET_KEY = process.env.ALPACA_SECRET_KEY;
 
  
 
@@ -52,41 +48,16 @@ app.post('/buy', async (req, res) => {
 
   try {
 
-    const response = await axios.post(
+    const result = await submitOrder({
+      symbol,
+      qty,
+      side,
+      type,
+      time_in_force,
+      limit_price,
+    });
 
-      `${ALPACA_BASE_URL}/orders`,
-
-      {
-
-        symbol,
-
-        qty,
-
-        side,
-
-        type,
-
-        time_in_force,
-
-        limit_price,
-
-      },
-
-      {
-
-        headers: {
-
-          'APCA-API-KEY-ID': API_KEY,
-
-          'APCA-API-SECRET-KEY': SECRET_KEY,
-
-        },
-
-      }
-
-    );
-
-    res.json(response.data);
+    res.json(result);
 
   } catch (error) {
 
@@ -96,6 +67,36 @@ app.post('/buy', async (req, res) => {
 
   }
 
+});
+
+app.get('/orders', async (req, res) => {
+  try {
+    const orders = await fetchOrders(req.query || {});
+    res.json(orders);
+  } catch (error) {
+    console.error('Orders fetch error:', error?.response?.data || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/orders', async (req, res) => {
+  try {
+    const result = await submitOrder(req.body || {});
+    res.json(result);
+  } catch (error) {
+    console.error('Order submit error:', error?.response?.data || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/orders/:id', async (req, res) => {
+  try {
+    const result = await cancelOrder(req.params.id);
+    res.json(result || { canceled: true, id: req.params.id });
+  } catch (error) {
+    console.error('Order cancel error:', error?.response?.data || error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
  
