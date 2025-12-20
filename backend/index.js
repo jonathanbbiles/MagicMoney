@@ -8,6 +8,7 @@ const {
   submitOrder,
   fetchOrders,
   cancelOrder,
+  startExitManager,
 } = require('./trade');
 
 const app = express();
@@ -124,5 +125,7 @@ initializeInventoryFromPositions()
       console.log(`Backend server running on port ${PORT}`);
 
     });
+
+    startExitManager();
 
   });

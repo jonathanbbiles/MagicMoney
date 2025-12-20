@@ -31,7 +31,17 @@ const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 10);
 
 const BUFFER_BPS = Number(process.env.BUFFER_BPS || 15);
 
+const MAX_HOLD_SECONDS = Number(process.env.MAX_HOLD_SECONDS || 300);
+
+const REPRICE_EVERY_SECONDS = Number(process.env.REPRICE_EVERY_SECONDS || 20);
+
+const FORCE_EXIT_SECONDS = Number(process.env.FORCE_EXIT_SECONDS || 600);
+
+const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
+
 const inventoryState = new Map();
+
+const exitState = new Map();
 
 const cfeeCache = { ts: 0, items: [] };
 
@@ -75,7 +85,31 @@ function logBuyDecision(symbol, computedNotionalUsd, decision) {
 
 }
 
+function logExitDecision({
+  symbol,
+  heldSeconds,
+  entryPrice,
+  targetPrice,
+  bid,
+  ask,
+  minNetProfitBps,
+  actionTaken,
+}) {
+  console.log('exit_state', {
+    symbol,
+    heldSeconds,
+    entryPrice,
+    targetPrice,
+    bid,
+    ask,
+    minNetProfitBps,
+    actionTaken,
+  });
+}
+
 function updateInventoryFromBuy(symbol, qty, price) {
+
+  const normalizedSymbol = normalizeSymbol(symbol);
 
   const qtyNum = Number(qty);
 
@@ -87,7 +121,7 @@ function updateInventoryFromBuy(symbol, qty, price) {
 
   }
 
-  const current = inventoryState.get(symbol) || { qty: 0, costBasis: 0, avgPrice: 0 };
+  const current = inventoryState.get(normalizedSymbol) || { qty: 0, costBasis: 0, avgPrice: 0 };
 
   const newQty = current.qty + qtyNum;
 
@@ -95,7 +129,7 @@ function updateInventoryFromBuy(symbol, qty, price) {
 
   const avgPrice = newQty > 0 ? newCost / newQty : 0;
 
-  inventoryState.set(symbol, { qty: newQty, costBasis: newCost, avgPrice });
+  inventoryState.set(normalizedSymbol, { qty: newQty, costBasis: newCost, avgPrice });
 
 }
 
@@ -109,6 +143,8 @@ async function initializeInventoryFromPositions() {
 
   for (const pos of positions) {
 
+    const symbol = normalizeSymbol(pos.symbol);
+
     const qty = Number(pos.qty ?? pos.quantity ?? 0);
 
     const avgPrice = Number(pos.avg_entry_price ?? pos.avgEntryPrice ?? 0);
@@ -119,7 +155,7 @@ async function initializeInventoryFromPositions() {
 
     }
 
-    inventoryState.set(pos.symbol, { qty, costBasis: qty * avgPrice, avgPrice });
+    inventoryState.set(symbol, { qty, costBasis: qty * avgPrice, avgPrice });
 
   }
 
@@ -153,7 +189,12 @@ async function fetchRecentCfeeEntries(limit = 25) {
 
   });
 
-  const items = Array.isArray(res.data) ? res.data : [];
+  const items = Array.isArray(res.data)
+    ? res.data.map((entry) => ({
+      ...entry,
+      symbol: normalizeSymbol(entry.symbol),
+    }))
+    : [];
 
   cfeeCache.ts = now;
 
@@ -186,6 +227,8 @@ function parseCashFlowUsd(entry) {
 }
 
 async function feeAwareMinProfitBps(symbol, notionalUsd) {
+
+  const normalizedSymbol = normalizeSymbol(symbol);
 
   if (!Number.isFinite(notionalUsd) || notionalUsd <= 0) {
 
@@ -235,7 +278,13 @@ async function feeAwareMinProfitBps(symbol, notionalUsd) {
 
   const minBps = Math.max(USER_MIN_PROFIT_BPS, feeFloor);
 
-  console.log('feeAwareMinProfitBps', { symbol, notionalUsd, feeUsd, feeBps, minBps });
+  console.log('feeAwareMinProfitBps', {
+    symbol: normalizedSymbol,
+    notionalUsd,
+    feeUsd,
+    feeBps,
+    minBps,
+  });
 
   return minBps;
 
@@ -349,45 +398,17 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   }
 
-  const notionalUsd = Number(filledOrder.filled_qty) * avgPrice;
+  const sellOrder = await handleBuyFill({
 
-  const minProfitBps = await feeAwareMinProfitBps(normalizedSymbol, notionalUsd);
+    symbol: normalizedSymbol,
 
-  // Mark up sell price to cover fees, slippage, and desired profit
+    qty: filledOrder.filled_qty,
 
-  const sellPrice = roundPrice(avgPrice * (1 + minProfitBps / 10000));
+    entryPrice: avgPrice,
 
- 
+  });
 
-  const sellRes = await axios.post(
-
-    `${ALPACA_BASE_URL}/orders`,
-
-    {
-
-      symbol: normalizedSymbol,
-
-      qty: filledOrder.filled_qty,
-
-      side: 'sell',
-
-      type: 'limit',
-
-      // match the buy order's time in force
-
-      time_in_force: 'gtc',
-
-      limit_price: sellPrice,
-
-    },
-
-    { headers: HEADERS }
-
-  );
-
- 
-
-  return { buy: filledOrder, sell: sellRes.data };
+  return { buy: filledOrder, sell: sellOrder };
 
 }
 
@@ -476,6 +497,541 @@ function roundQty(qty) {
 function roundPrice(price) {
 
   return parseFloat(Number(price).toFixed(2));
+
+}
+
+async function getLatestQuote(rawSymbol) {
+
+  const symbol = normalizeSymbol(rawSymbol);
+
+  if (isCryptoSymbol(symbol)) {
+
+    const res = await axios.get(
+
+      `${DATA_URL}/crypto/latest/quotes?symbols=${symbol}`,
+
+      { headers: HEADERS }
+
+    );
+
+    const quote = res.data.quotes && res.data.quotes[symbol];
+
+    if (!quote) throw new Error(`Quote not available for ${symbol}`);
+
+    const bid = Number(quote.bp ?? quote.bid_price ?? quote.bid);
+
+    const ask = Number(quote.ap ?? quote.ask_price ?? quote.ask);
+
+    return {
+
+      bid: Number.isFinite(bid) ? bid : null,
+
+      ask: Number.isFinite(ask) ? ask : null,
+
+    };
+
+  }
+
+  const res = await axios.get(
+
+    `${STOCKS_DATA_URL}/quotes/latest?symbols=${encodeURIComponent(symbol)}`,
+
+    { headers: HEADERS }
+
+  );
+
+  const quote = res.data.quotes && res.data.quotes[symbol];
+
+  if (!quote) throw new Error(`Quote not available for ${symbol}`);
+
+  const bid = Number(quote.bp ?? quote.bid_price ?? quote.bid);
+
+  const ask = Number(quote.ap ?? quote.ask_price ?? quote.ask);
+
+  return {
+
+    bid: Number.isFinite(bid) ? bid : null,
+
+    ask: Number.isFinite(ask) ? ask : null,
+
+  };
+
+}
+
+async function fetchOrderById(orderId) {
+
+  const response = await axios.get(`${ALPACA_BASE_URL}/orders/${orderId}`, { headers: HEADERS });
+
+  return response.data;
+
+}
+
+async function cancelOrderSafe(orderId) {
+
+  try {
+
+    await cancelOrder(orderId);
+
+    return true;
+
+  } catch (err) {
+
+    console.warn('cancel_order_failed', { orderId, error: err?.response?.data || err.message });
+
+    return false;
+
+  }
+
+}
+
+async function submitLimitSell({
+
+  symbol,
+
+  qty,
+
+  limitPrice,
+
+  reason,
+
+}) {
+
+  const response = await axios.post(
+
+    `${ALPACA_BASE_URL}/orders`,
+
+    {
+
+      symbol,
+
+      qty,
+
+      side: 'sell',
+
+      type: 'limit',
+
+      time_in_force: 'gtc',
+
+      limit_price: limitPrice,
+
+    },
+
+    { headers: HEADERS }
+
+  );
+
+  console.log('submit_limit_sell', { symbol, qty, limitPrice, reason, orderId: response.data?.id });
+
+  return response.data;
+
+}
+
+async function submitMarketSell({
+
+  symbol,
+
+  qty,
+
+  reason,
+
+}) {
+
+  const response = await axios.post(
+
+    `${ALPACA_BASE_URL}/orders`,
+
+    {
+
+      symbol,
+
+      qty,
+
+      side: 'sell',
+
+      type: 'market',
+
+      time_in_force: 'gtc',
+
+    },
+
+    { headers: HEADERS }
+
+  );
+
+  console.log('submit_market_sell', { symbol, qty, reason, orderId: response.data?.id });
+
+  return response.data;
+
+}
+
+async function handleBuyFill({
+
+  symbol: rawSymbol,
+
+  qty,
+
+  entryPrice,
+
+}) {
+
+  const symbol = normalizeSymbol(rawSymbol);
+
+  const entryPriceNum = Number(entryPrice);
+
+  const qtyNum = Number(qty);
+
+  const notionalUsd = qtyNum * entryPriceNum;
+
+  const minNetProfitBps = await feeAwareMinProfitBps(symbol, notionalUsd);
+
+  const targetPrice = roundPrice(entryPriceNum * (1 + minNetProfitBps / 10000));
+
+  const sellOrder = await submitLimitSell({
+
+    symbol,
+
+    qty: qtyNum,
+
+    limitPrice: targetPrice,
+
+    reason: 'initial_target',
+
+  });
+
+  const now = Date.now();
+
+  exitState.set(symbol, {
+
+    symbol,
+
+    qty: qtyNum,
+
+    entryPrice: entryPriceNum,
+
+    entryTime: now,
+
+    notionalUsd,
+
+    minNetProfitBps,
+
+    targetPrice,
+
+    sellOrderId: sellOrder.id,
+
+    sellOrderSubmittedAt: now,
+
+    sellOrderLimit: targetPrice,
+
+  });
+
+  logExitDecision({
+
+    symbol,
+
+    heldSeconds: 0,
+
+    entryPrice: entryPriceNum,
+
+    targetPrice,
+
+    bid: null,
+
+    ask: null,
+
+    minNetProfitBps,
+
+    actionTaken: 'placed_initial_limit_sell',
+
+  });
+
+  return sellOrder;
+
+}
+
+async function manageExitStates() {
+
+  const now = Date.now();
+
+  for (const [symbol, state] of exitState.entries()) {
+
+    const heldSeconds = (now - state.entryTime) / 1000;
+
+    let bid = null;
+
+    let ask = null;
+
+    try {
+
+      const quote = await getLatestQuote(symbol);
+
+      bid = quote.bid;
+
+      ask = quote.ask;
+
+    } catch (err) {
+
+      console.warn('quote_fetch_failed', { symbol, error: err?.message || err });
+
+    }
+
+
+    let actionTaken = 'none';
+
+
+    if (heldSeconds >= FORCE_EXIT_SECONDS) {
+
+      if (state.sellOrderId) {
+
+        await cancelOrderSafe(state.sellOrderId);
+
+      }
+
+      await submitMarketSell({ symbol, qty: state.qty, reason: 'forced_exit_timeout' });
+
+      exitState.delete(symbol);
+
+      logExitDecision({
+
+        symbol,
+
+        heldSeconds,
+
+        entryPrice: state.entryPrice,
+
+        targetPrice: state.targetPrice,
+
+        bid,
+
+        ask,
+
+        minNetProfitBps: state.minNetProfitBps,
+
+        actionTaken: 'forced_exit_timeout',
+
+      });
+
+      continue;
+
+    }
+
+
+    if (heldSeconds >= MAX_HOLD_SECONDS && Number.isFinite(bid)) {
+
+      const netProfitBps = ((bid - state.entryPrice) / state.entryPrice) * 10000;
+
+      if (netProfitBps >= state.minNetProfitBps) {
+
+        if (state.sellOrderId) {
+
+          await cancelOrderSafe(state.sellOrderId);
+
+        }
+
+        await submitMarketSell({ symbol, qty: state.qty, reason: 'profit_exit' });
+
+        exitState.delete(symbol);
+
+        logExitDecision({
+
+          symbol,
+
+          heldSeconds,
+
+          entryPrice: state.entryPrice,
+
+          targetPrice: state.targetPrice,
+
+          bid,
+
+          ask,
+
+          minNetProfitBps: state.minNetProfitBps,
+
+          actionTaken: 'profit_exit_market',
+
+        });
+
+        continue;
+
+      }
+
+    }
+
+
+    if (state.sellOrderId) {
+
+      let order;
+
+      try {
+
+        order = await fetchOrderById(state.sellOrderId);
+
+      } catch (err) {
+
+        console.warn('order_fetch_failed', { symbol, orderId: state.sellOrderId, error: err?.message || err });
+
+      }
+
+      if (order && ['canceled', 'expired', 'rejected'].includes(order.status)) {
+
+        state.sellOrderId = null;
+
+        state.sellOrderSubmittedAt = null;
+
+        state.sellOrderLimit = null;
+
+      }
+
+      if (!state.sellOrderId) {
+
+        const replacement = await submitLimitSell({
+
+          symbol,
+
+          qty: state.qty,
+
+          limitPrice: state.targetPrice,
+
+          reason: 'missing_sell_order',
+
+        });
+
+        state.sellOrderId = replacement.id;
+
+        state.sellOrderSubmittedAt = Date.now();
+
+        state.sellOrderLimit = state.targetPrice;
+
+        actionTaken = 'recreate_limit_sell';
+
+      } else if (order && order.status === 'filled') {
+
+        exitState.delete(symbol);
+
+        actionTaken = 'sell_filled';
+
+        logExitDecision({
+
+          symbol,
+
+          heldSeconds,
+
+          entryPrice: state.entryPrice,
+
+          targetPrice: state.targetPrice,
+
+          bid,
+
+          ask,
+
+          minNetProfitBps: state.minNetProfitBps,
+
+          actionTaken,
+
+        });
+
+        continue;
+
+      } else {
+
+        const orderAgeSeconds = state.sellOrderSubmittedAt ? (now - state.sellOrderSubmittedAt) / 1000 : 0;
+
+        if (orderAgeSeconds >= REPRICE_EVERY_SECONDS && Number.isFinite(ask)) {
+
+          if (ask < state.sellOrderLimit - PRICE_TICK) {
+
+            await cancelOrderSafe(state.sellOrderId);
+
+            const newLimit = roundPrice(Math.max(state.targetPrice, ask - PRICE_TICK));
+
+            const replacement = await submitLimitSell({
+
+              symbol,
+
+              qty: state.qty,
+
+              limitPrice: newLimit,
+
+              reason: 'reprice_lower_ask',
+
+            });
+
+            state.sellOrderId = replacement.id;
+
+            state.sellOrderSubmittedAt = Date.now();
+
+            state.sellOrderLimit = newLimit;
+
+            actionTaken = 'reprice_cancel_replace';
+
+          }
+
+        }
+
+      }
+
+    } else {
+
+      const replacement = await submitLimitSell({
+
+        symbol,
+
+        qty: state.qty,
+
+        limitPrice: state.targetPrice,
+
+        reason: 'missing_sell_order',
+
+      });
+
+      state.sellOrderId = replacement.id;
+
+      state.sellOrderSubmittedAt = Date.now();
+
+      state.sellOrderLimit = state.targetPrice;
+
+      actionTaken = 'recreate_limit_sell';
+
+    }
+
+
+    logExitDecision({
+
+      symbol,
+
+      heldSeconds,
+
+      entryPrice: state.entryPrice,
+
+      targetPrice: state.targetPrice,
+
+      bid,
+
+      ask,
+
+      minNetProfitBps: state.minNetProfitBps,
+
+      actionTaken,
+
+    });
+
+  }
+
+}
+
+function startExitManager() {
+
+  setInterval(() => {
+
+    manageExitStates().catch((err) => {
+
+      console.error('exit_manager_failed', err?.message || err);
+
+    });
+
+  }, REPRICE_EVERY_SECONDS * 1000);
+
+  console.log('exit_manager_started', { intervalSeconds: REPRICE_EVERY_SECONDS });
 
 }
 
@@ -617,51 +1173,21 @@ async function placeMarketBuyThenSell(symbol) {
 
  
 
-  // Wait 10 seconds before selling
-
-  await sleep(10000);
-
- 
-
   const avgPrice = parseFloat(filled.filled_avg_price);
-
-  const notionalUsd = Number(filled.filled_qty) * avgPrice;
-
-  const minProfitBps = await feeAwareMinProfitBps(normalizedSymbol, notionalUsd);
-
-  // Mark up sell price to cover fees, slippage, and preserve desired profit margin
-
-  const limitPrice = roundPrice(avgPrice * (1 + minProfitBps / 10000));
-
- 
 
   try {
 
-    const sellRes = await axios.post(
+    const sellOrder = await handleBuyFill({
 
-      `${ALPACA_BASE_URL}/orders`,
+      symbol: normalizedSymbol,
 
-      {
+      qty: filled.filled_qty,
 
-        symbol: normalizedSymbol,
+      entryPrice: avgPrice,
 
-        qty: filled.filled_qty,
+    });
 
-        side: 'sell',
-
-        type: 'limit',
-
-        time_in_force: 'gtc',
-
-        limit_price: limitPrice,
-
-      },
-
-      { headers: HEADERS }
-
-    );
-
-    return { buy: filled, sell: sellRes.data };
+    return { buy: filled, sell: sellOrder };
 
   } catch (err) {
 
@@ -779,6 +1305,18 @@ async function fetchOrders(params = {}) {
 
   const response = await axios.get(`${ALPACA_BASE_URL}/orders`, { headers: HEADERS, params });
 
+  if (Array.isArray(response.data)) {
+
+    return response.data.map((order) => ({
+
+      ...order,
+
+      symbol: normalizeSymbol(order.symbol),
+
+    }));
+
+  }
+
   return response.data;
 
 }
@@ -806,5 +1344,7 @@ module.exports = {
   cancelOrder,
 
   normalizeSymbol,
+
+  startExitManager,
 
 };
