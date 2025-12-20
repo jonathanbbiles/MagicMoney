@@ -5,6 +5,7 @@ const axios = require('axios');
 const ALPACA_BASE_URL = process.env.ALPACA_API_BASE || 'https://api.alpaca.markets/v2';
 
 const DATA_URL = 'https://data.alpaca.markets/v1beta2';
+const STOCKS_DATA_URL = 'https://data.alpaca.markets/v2/stocks';
 
 const API_KEY = process.env.ALPACA_API_KEY;
 
@@ -45,6 +46,32 @@ function sleep(ms) {
 function logSkip(reason, details = {}) {
 
   console.log(`Skip — ${reason}`, details);
+
+}
+
+function normalizeSymbol(rawSymbol) {
+
+  if (!rawSymbol) return rawSymbol;
+
+  const symbol = String(rawSymbol).trim().toUpperCase();
+
+  return symbol.includes('/') ? symbol.replace(/\//g, '') : symbol;
+
+}
+
+function logBuyDecision(symbol, computedNotionalUsd, decision) {
+
+  console.log('buy_gate', {
+
+    symbol,
+
+    computedNotionalUsd,
+
+    minOrderNotionalUsd: MIN_ORDER_NOTIONAL_USD,
+
+    decision,
+
+  });
 
 }
 
@@ -220,11 +247,25 @@ async function feeAwareMinProfitBps(symbol, notionalUsd) {
 
 async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
+  const normalizedSymbol = normalizeSymbol(symbol);
+
   const intendedNotional = Number(qty) * Number(limitPrice);
 
-  if (!Number.isFinite(intendedNotional) || intendedNotional < MIN_ORDER_NOTIONAL_USD) {
+  const decision = Number.isFinite(intendedNotional) && intendedNotional >= MIN_ORDER_NOTIONAL_USD ? 'BUY' : 'SKIP';
 
-    logSkip('notional_too_small', { symbol, intendedNotional, minNotionalUsd: MIN_ORDER_NOTIONAL_USD });
+  logBuyDecision(normalizedSymbol, intendedNotional, decision);
+
+  if (decision === 'SKIP') {
+
+    logSkip('notional_too_small', {
+
+      symbol: normalizedSymbol,
+
+      intendedNotional,
+
+      minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
+
+    });
 
     return { skipped: true, reason: 'notional_too_small', notionalUsd: intendedNotional };
 
@@ -238,7 +279,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
     {
 
-      symbol,
+      symbol: normalizedSymbol,
 
       qty,
 
@@ -296,13 +337,13 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   const avgPrice = parseFloat(filledOrder.filled_avg_price);
 
-  updateInventoryFromBuy(symbol, filledOrder.filled_qty, avgPrice);
+  updateInventoryFromBuy(normalizedSymbol, filledOrder.filled_qty, avgPrice);
 
-  const inventory = inventoryState.get(symbol);
+  const inventory = inventoryState.get(normalizedSymbol);
 
   if (!inventory || inventory.qty <= 0) {
 
-    logSkip('no_inventory_for_sell', { symbol, qty: filledOrder.filled_qty });
+    logSkip('no_inventory_for_sell', { symbol: normalizedSymbol, qty: filledOrder.filled_qty });
 
     return { buy: filledOrder, sell: null, sellError: 'No inventory to sell' };
 
@@ -310,7 +351,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   const notionalUsd = Number(filledOrder.filled_qty) * avgPrice;
 
-  const minProfitBps = await feeAwareMinProfitBps(symbol, notionalUsd);
+  const minProfitBps = await feeAwareMinProfitBps(normalizedSymbol, notionalUsd);
 
   // Mark up sell price to cover fees, slippage, and desired profit
 
@@ -324,7 +365,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
     {
 
-      symbol,
+      symbol: normalizedSymbol,
 
       qty: filledOrder.filled_qty,
 
@@ -354,11 +395,35 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
 // Fetch latest trade price for a symbol
 
+function isCryptoSymbol(symbol) {
+
+  return /USD$/.test(symbol);
+
+}
+
 async function getLatestPrice(symbol) {
+
+  if (isCryptoSymbol(symbol)) {
+
+    const res = await axios.get(
+
+      `${DATA_URL}/crypto/latest/trades?symbols=${symbol}`,
+
+      { headers: HEADERS }
+
+    );
+
+    const trade = res.data.trades && res.data.trades[symbol];
+
+    if (!trade) throw new Error(`Price not available for ${symbol}`);
+
+    return parseFloat(trade.p);
+
+  }
 
   const res = await axios.get(
 
-    `${DATA_URL}/crypto/latest/trades?symbols=${symbol}`,
+    `${STOCKS_DATA_URL}/trades/latest?symbols=${encodeURIComponent(symbol)}`,
 
     { headers: HEADERS }
 
@@ -368,7 +433,7 @@ async function getLatestPrice(symbol) {
 
   if (!trade) throw new Error(`Price not available for ${symbol}`);
 
-  return parseFloat(trade.p);
+  return parseFloat(trade.p ?? trade.price);
 
 }
 
@@ -422,9 +487,11 @@ function roundPrice(price) {
 
 async function placeMarketBuyThenSell(symbol) {
 
+  const normalizedSymbol = normalizeSymbol(symbol);
+
   const [price, account] = await Promise.all([
 
-    getLatestPrice(symbol),
+    getLatestPrice(normalizedSymbol),
 
     getAccountInfo(),
 
@@ -442,9 +509,21 @@ async function placeMarketBuyThenSell(symbol) {
 
   const amountToSpend = Math.min(targetTradeAmount, buyingPower);
 
-  if (!Number.isFinite(amountToSpend) || amountToSpend < MIN_ORDER_NOTIONAL_USD) {
+  const decision = Number.isFinite(amountToSpend) && amountToSpend >= MIN_ORDER_NOTIONAL_USD ? 'BUY' : 'SKIP';
 
-    logSkip('notional_too_small', { symbol, intendedNotional: amountToSpend, minNotionalUsd: MIN_ORDER_NOTIONAL_USD });
+  logBuyDecision(normalizedSymbol, amountToSpend, decision);
+
+  if (decision === 'SKIP') {
+
+    logSkip('notional_too_small', {
+
+      symbol: normalizedSymbol,
+
+      intendedNotional: amountToSpend,
+
+      minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
+
+    });
 
     return { skipped: true, reason: 'notional_too_small', notionalUsd: amountToSpend };
 
@@ -474,7 +553,7 @@ async function placeMarketBuyThenSell(symbol) {
 
     {
 
-      symbol,
+      symbol: normalizedSymbol,
 
       qty,
 
@@ -524,13 +603,13 @@ async function placeMarketBuyThenSell(symbol) {
 
   }
 
-  updateInventoryFromBuy(symbol, filled.filled_qty, filled.filled_avg_price);
+  updateInventoryFromBuy(normalizedSymbol, filled.filled_qty, filled.filled_avg_price);
 
-  const inventory = inventoryState.get(symbol);
+  const inventory = inventoryState.get(normalizedSymbol);
 
   if (!inventory || inventory.qty <= 0) {
 
-    logSkip('no_inventory_for_sell', { symbol, qty: filled.filled_qty });
+    logSkip('no_inventory_for_sell', { symbol: normalizedSymbol, qty: filled.filled_qty });
 
     return { buy: filled, sell: null, sellError: 'No inventory to sell' };
 
@@ -548,7 +627,7 @@ async function placeMarketBuyThenSell(symbol) {
 
   const notionalUsd = Number(filled.filled_qty) * avgPrice;
 
-  const minProfitBps = await feeAwareMinProfitBps(symbol, notionalUsd);
+  const minProfitBps = await feeAwareMinProfitBps(normalizedSymbol, notionalUsd);
 
   // Mark up sell price to cover fees, slippage, and preserve desired profit margin
 
@@ -564,7 +643,7 @@ async function placeMarketBuyThenSell(symbol) {
 
       {
 
-        symbol,
+        symbol: normalizedSymbol,
 
         qty: filled.filled_qty,
 
@@ -594,7 +673,123 @@ async function placeMarketBuyThenSell(symbol) {
 
 }
 
- 
+async function submitOrder(order = {}) {
+
+  const {
+
+    symbol: rawSymbol,
+
+    qty,
+
+    side,
+
+    type,
+
+    time_in_force,
+
+    limit_price,
+
+    notional,
+
+  } = order;
+
+  const normalizedSymbol = normalizeSymbol(rawSymbol);
+
+  const sideLower = String(side || '').toLowerCase();
+
+  let computedNotionalUsd = Number(notional);
+
+  if (!Number.isFinite(computedNotionalUsd) || computedNotionalUsd <= 0) {
+
+    const qtyNum = Number(qty);
+
+    const limitPriceNum = Number(limit_price);
+
+    if (Number.isFinite(qtyNum) && qtyNum > 0 && Number.isFinite(limitPriceNum) && limitPriceNum > 0) {
+
+      computedNotionalUsd = qtyNum * limitPriceNum;
+
+    } else if (Number.isFinite(qtyNum) && qtyNum > 0 && sideLower === 'buy') {
+
+      const price = await getLatestPrice(normalizedSymbol);
+
+      computedNotionalUsd = qtyNum * price;
+
+    }
+
+  }
+
+  if (sideLower === 'buy') {
+
+    const decision =
+
+      Number.isFinite(computedNotionalUsd) && computedNotionalUsd >= MIN_ORDER_NOTIONAL_USD ? 'BUY' : 'SKIP';
+
+    logBuyDecision(normalizedSymbol, computedNotionalUsd, decision);
+
+    if (decision === 'SKIP') {
+
+      logSkip('notional_too_small', {
+
+        symbol: normalizedSymbol,
+
+        intendedNotional: computedNotionalUsd,
+
+        minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
+
+      });
+
+      return { skipped: true, reason: 'notional_too_small', notionalUsd: computedNotionalUsd };
+
+    }
+
+  }
+
+  const response = await axios.post(
+
+    `${ALPACA_BASE_URL}/orders`,
+
+    {
+
+      symbol: normalizedSymbol,
+
+      qty,
+
+      side,
+
+      type,
+
+      time_in_force,
+
+      limit_price,
+
+      notional,
+
+    },
+
+    { headers: HEADERS }
+
+  );
+
+  return response.data;
+
+}
+
+async function fetchOrders(params = {}) {
+
+  const response = await axios.get(`${ALPACA_BASE_URL}/orders`, { headers: HEADERS, params });
+
+  return response.data;
+
+}
+
+async function cancelOrder(orderId) {
+
+  const response = await axios.delete(`${ALPACA_BASE_URL}/orders/${orderId}`, { headers: HEADERS });
+
+  return response.data;
+
+}
 
 module.exports = {
 
@@ -603,5 +798,13 @@ module.exports = {
   placeMarketBuyThenSell,
 
   initializeInventoryFromPositions,
+
+  submitOrder,
+
+  fetchOrders,
+
+  cancelOrder,
+
+  normalizeSymbol,
 
 };

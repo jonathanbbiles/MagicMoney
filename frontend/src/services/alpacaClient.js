@@ -1,5 +1,7 @@
 import {
   ALPACA_BASE_URL,
+  BACKEND_BASE_URL,
+  BACKEND_HEADERS,
   DATA_LOCATIONS,
   DATA_ROOT_CRYPTO,
   DATA_ROOT_STOCKS_V2,
@@ -470,8 +472,8 @@ export const getAllPositionsCached = async (ttlMs = 2000) => {
 
 export const getOpenOrders = async () => {
   try {
-    const res = await fetchWithBudget(`${ALPACA_BASE_URL}/orders?status=open&nested=true&limit=100`, {
-      headers: HEADERS,
+    const res = await fetchWithBudget(`${BACKEND_BASE_URL}/orders?status=open&nested=true&limit=100`, {
+      headers: BACKEND_HEADERS,
     });
     if (!res.ok) return [];
     const arr = await res.json();
@@ -498,9 +500,9 @@ export const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
     );
     await Promise.all(
       targets.map((o) =>
-        fetchWithBudget(`${ALPACA_BASE_URL}/orders/${o.id}`, {
+        fetchWithBudget(`${BACKEND_BASE_URL}/orders/${o.id}`, {
           method: 'DELETE',
-          headers: HEADERS,
+          headers: BACKEND_HEADERS,
         }).catch(() => null)
       )
     );
@@ -515,7 +517,7 @@ export const cancelAllOrders = async () => {
     const orders = await getOpenOrdersCached();
     await Promise.all(
       (orders || []).map((o) =>
-        fetchWithBudget(`${ALPACA_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null)
+        fetchWithBudget(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)
       )
     );
     openOrdersCache = { ts: 0, items: [] };

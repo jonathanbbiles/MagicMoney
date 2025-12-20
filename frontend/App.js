@@ -24,6 +24,7 @@ const ALPACA_KEY = 'AKANN0IP04IH45Z6FG3L';
 const ALPACA_SECRET = 'qvaKRqP9Q3XMVMEYqVnq2BEgPGhQQQfWg1JT7bWV';
 // Force LIVE trading endpoint, ignoring EX/APCA overrides
 const ALPACA_BASE_URL = EX.APCA_API_BASE || 'https://api.alpaca.markets/v2';
+const BACKEND_BASE_URL = EX.BACKEND_BASE_URL || 'http://localhost:3000';
 
 const DATA_ROOT_CRYPTO = 'https://data.alpaca.markets/v1beta3/crypto';
 // IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
@@ -33,6 +34,10 @@ const DATA_ROOT_STOCKS_V2 = 'https://data.alpaca.markets/v2/stocks';
 const HEADERS = {
   'APCA-API-KEY-ID': ALPACA_KEY,
   'APCA-API-SECRET-KEY': ALPACA_SECRET,
+  Accept: 'application/json',
+  'Content-Type': 'application/json',
+};
+const BACKEND_HEADERS = {
   Accept: 'application/json',
   'Content-Type': 'application/json',
 };
@@ -1786,7 +1791,7 @@ const getAllPositions = async () => {
 };
 const getOpenOrders = async () => {
   try {
-    const r = await f(`${ALPACA_BASE_URL}/orders?status=open&nested=true&limit=100`, { headers: HEADERS });
+    const r = await f(`${BACKEND_BASE_URL}/orders?status=open&nested=true&limit=100`, { headers: BACKEND_HEADERS });
     if (!r.ok) return [];
     const arr = await r.json();
     return Array.isArray(arr) ? arr : [];
@@ -1859,7 +1864,7 @@ const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
     );
     await Promise.all(
       targets.map((o) =>
-        f(`${ALPACA_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null)
+        f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)
       )
     );
     __openOrdersCache = { ts: 0, items: [] };
@@ -1868,7 +1873,7 @@ const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
 const cancelAllOrders = async () => {
   try {
     const orders = await getOpenOrdersCached();
-    await Promise.all((orders || []).map((o) => f(`${ALPACA_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null)));
+    await Promise.all((orders || []).map((o) => f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)));
     __openOrdersCache = { ts: 0, items: [] };
   } catch {}
 };
@@ -1881,7 +1886,7 @@ async function getOpenSellOrderBySymbol(symbol, cached = null) {
 async function cancelOrder(orderId) {
   if (!orderId) return false;
   try {
-    await f(`${ALPACA_BASE_URL}/orders/${orderId}`, { method: 'DELETE', headers: HEADERS });
+    await f(`${BACKEND_BASE_URL}/orders/${orderId}`, { method: 'DELETE', headers: BACKEND_HEADERS });
     __openOrdersCache = { ts: 0, items: [] };
     return true;
   } catch (err) {
@@ -2073,7 +2078,7 @@ async function cleanupStaleBuyOrders(maxAgeSec = 30) {
     );
     await Promise.all(
       stale.map(async (o) => {
-        await f(`${ALPACA_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null);
+        await f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null);
       })
     );
     if (stale.length) {
@@ -2575,7 +2580,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     const needReplace = !lastOrderId || ticksDrift >= 2 || join < (placedLimit - TICK);
     if (needReplace && (nowTs - lastReplaceAt) > 1800) {
       if (lastOrderId) {
-        try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
+        try { await f(`${BACKEND_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: BACKEND_HEADERS }); } catch {}
         __openOrdersCache = { ts: 0, items: [] };
       }
       const order = {
@@ -2583,7 +2588,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         limit_price: formatLimit(join),
       };
       try {
-        const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(order) });
+        const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         if (res.ok && data.id) {
           lastOrderId = data.id; placedLimit = join; lastReplaceAt = nowTs;
@@ -2598,7 +2603,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     const pos = await getPositionInfo(symbol);
     if (pos && pos.qty > 0) {
       if (lastOrderId) {
-        try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
+        try { await f(`${BACKEND_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: BACKEND_HEADERS }); } catch {}
         __openOrdersCache = { ts: 0, items: [] };
       }
       logTradeAction('buy_success', symbol, {
@@ -2612,7 +2617,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   }
 
   if (lastOrderId) {
-    try { await f(`${ALPACA_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: HEADERS }); } catch {}
+    try { await f(`${BACKEND_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: BACKEND_HEADERS }); } catch {}
     __openOrdersCache = { ts: 0, items: [] };
     logTradeAction('buy_unfilled_canceled', symbol, {});
   }
@@ -2640,7 +2645,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       const tif = isStock(symbol) ? 'day' : 'gtc';
       const order = { symbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif };
       try {
-        const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(order) });
+        const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         if (res.ok && data.id) {
           logTradeAction('buy_success', symbol, { qty: mQty, limit: 'mkt' });
@@ -2675,7 +2680,7 @@ async function marketSell(symbol, qty) {
     return { dryRun: true, order: mkt };
   }
   try {
-    const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(mkt) });
+    const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(mkt) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     if (res.ok && data.id) {
       __positionsCache = { ts: 0, items: [] };
@@ -2815,7 +2820,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
             const open = await getOpenOrdersCached();
             const ex = open.find((o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol);
             if (ex) {
-              await f(`${ALPACA_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null);
+              await f(`${BACKEND_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null);
               __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
@@ -2870,7 +2875,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
             const open = await getOpenOrdersCached();
             const ex = open.find((o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol);
             if (ex) {
-              await f(`${ALPACA_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null);
+              await f(`${BACKEND_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null);
               __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
@@ -2908,11 +2913,11 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
   try {
     const decimals = isStock(symbol) ? 2 : 5;
     const order = { symbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit.toFixed(decimals) };
-    const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(order) });
+    const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     if (res.ok && data.id) {
       tradeStateRef.current[symbol] = { ...(state || {}), lastLimitPostTs: now };
-      if (existing) { await f(`${ALPACA_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: HEADERS }).catch(() => null); }
+      if (existing) { await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null); }
       logTradeAction('tp_limit_set', symbol, { id: data.id, limit: order.limit_price });
     } else {
       const msg = data?.message || data?.raw?.slice?.(0, 100) || '';
@@ -3501,7 +3506,7 @@ export default function App() {
           if (mv > 0 && mv < SETTINGS.dustFlattenMaxUsd && avail > 0 && !openSellBySym.has(sym)) {
             const mkt = { symbol: sym, qty: avail, side: 'sell', type: 'market', time_in_force: 'gtc' };
             try {
-              const res = await f(`${ALPACA_BASE_URL}/orders`, { method: 'POST', headers: HEADERS, body: JSON.stringify(mkt) });
+              const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(mkt) });
               if (res.ok) {
                 __positionsCache = { ts: 0, items: [] };
                 __openOrdersCache = { ts: 0, items: [] };
