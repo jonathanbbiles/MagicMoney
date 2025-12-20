@@ -4,7 +4,7 @@ const express = require('express');
 
 const axios = require('axios');
 
-const { placeMarketBuyThenSell } = require('./trade');
+const { placeMarketBuyThenSell, initializeInventoryFromPositions } = require('./trade');
 
 const app = express();
 
@@ -102,8 +102,26 @@ app.post('/buy', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
+initializeInventoryFromPositions()
 
-  console.log(`Backend server running on port ${PORT}`);
+  .then((inventory) => {
 
-});
+    console.log(`Initialized inventory for ${inventory.size} symbols.`);
+
+  })
+
+  .catch((err) => {
+
+    console.error('Failed to initialize inventory', err?.response?.data || err.message);
+
+  })
+
+  .finally(() => {
+
+    app.listen(PORT, () => {
+
+      console.log(`Backend server running on port ${PORT}`);
+
+    });
+
+  });

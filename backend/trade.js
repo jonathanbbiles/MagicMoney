@@ -22,13 +22,17 @@ const HEADERS = {
 
  
 
-// Offsets taker fees when calculating profit target
+const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 15);
 
-const FEE_BUFFER = 0.0025; // 0.25% taker fee
+const USER_MIN_PROFIT_BPS = Number(process.env.USER_MIN_PROFIT_BPS || 5);
 
-const TARGET_PROFIT = 0.0005; // 0.05% desired profit
+const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 10);
 
-const TOTAL_MARKUP = FEE_BUFFER + TARGET_PROFIT;
+const BUFFER_BPS = Number(process.env.BUFFER_BPS || 15);
+
+const inventoryState = new Map();
+
+const cfeeCache = { ts: 0, items: [] };
 
  
 
@@ -38,11 +42,193 @@ function sleep(ms) {
 
 }
 
+function logSkip(reason, details = {}) {
+
+  console.log(`Skip — ${reason}`, details);
+
+}
+
+function updateInventoryFromBuy(symbol, qty, price) {
+
+  const qtyNum = Number(qty);
+
+  const priceNum = Number(price);
+
+  if (!Number.isFinite(qtyNum) || !Number.isFinite(priceNum) || qtyNum <= 0 || priceNum <= 0) {
+
+    return;
+
+  }
+
+  const current = inventoryState.get(symbol) || { qty: 0, costBasis: 0, avgPrice: 0 };
+
+  const newQty = current.qty + qtyNum;
+
+  const newCost = current.costBasis + qtyNum * priceNum;
+
+  const avgPrice = newQty > 0 ? newCost / newQty : 0;
+
+  inventoryState.set(symbol, { qty: newQty, costBasis: newCost, avgPrice });
+
+}
+
+async function initializeInventoryFromPositions() {
+
+  const res = await axios.get(`${ALPACA_BASE_URL}/positions`, { headers: HEADERS });
+
+  const positions = Array.isArray(res.data) ? res.data : [];
+
+  inventoryState.clear();
+
+  for (const pos of positions) {
+
+    const qty = Number(pos.qty ?? pos.quantity ?? 0);
+
+    const avgPrice = Number(pos.avg_entry_price ?? pos.avgEntryPrice ?? 0);
+
+    if (!Number.isFinite(qty) || !Number.isFinite(avgPrice) || qty <= 0 || avgPrice <= 0) {
+
+      continue;
+
+    }
+
+    inventoryState.set(pos.symbol, { qty, costBasis: qty * avgPrice, avgPrice });
+
+  }
+
+  return inventoryState;
+
+}
+
+async function fetchRecentCfeeEntries(limit = 25) {
+
+  const now = Date.now();
+
+  if (now - cfeeCache.ts < 60000 && cfeeCache.items.length) {
+
+    return cfeeCache.items;
+
+  }
+
+  const params = new URLSearchParams({
+
+    activity_types: 'CFEE',
+
+    direction: 'desc',
+
+    page_size: String(limit),
+
+  });
+
+  const res = await axios.get(`${ALPACA_BASE_URL}/account/activities?${params.toString()}`, {
+
+    headers: HEADERS,
+
+  });
+
+  const items = Array.isArray(res.data) ? res.data : [];
+
+  cfeeCache.ts = now;
+
+  cfeeCache.items = items;
+
+  return items;
+
+}
+
+function parseCashFlowUsd(entry) {
+
+  const raw =
+
+    entry.cashflow_usd ??
+
+    entry.cashflowUSD ??
+
+    entry.cash_flow_usd ??
+
+    entry.cash_flow ??
+
+    entry.net_amount ??
+
+    entry.amount;
+
+  const val = Number(raw);
+
+  return Number.isFinite(val) ? val : null;
+
+}
+
+async function feeAwareMinProfitBps(symbol, notionalUsd) {
+
+  if (!Number.isFinite(notionalUsd) || notionalUsd <= 0) {
+
+    return USER_MIN_PROFIT_BPS;
+
+  }
+
+  let feeUsd = 0;
+
+  let entries = [];
+
+  try {
+
+    entries = await fetchRecentCfeeEntries();
+
+  } catch (err) {
+
+    console.warn('CFEE fetch failed, falling back to user min profit', err?.message || err);
+
+  }
+
+  for (const entry of entries) {
+
+    const cashFlowUsd = parseCashFlowUsd(entry);
+
+    if (cashFlowUsd != null && cashFlowUsd < 0) {
+
+      feeUsd += Math.abs(cashFlowUsd);
+
+    }
+
+    const qty = Number(entry.qty ?? entry.quantity ?? 0);
+
+    const price = Number(entry.price ?? entry.fill_price ?? 0);
+
+    if (Number.isFinite(qty) && Number.isFinite(price) && qty < 0 && price > 0) {
+
+      feeUsd += Math.abs(qty) * price;
+
+    }
+
+  }
+
+  const feeBps = (feeUsd / notionalUsd) * 10000;
+
+  const feeFloor = feeBps + SLIPPAGE_BPS + BUFFER_BPS;
+
+  const minBps = Math.max(USER_MIN_PROFIT_BPS, feeFloor);
+
+  console.log('feeAwareMinProfitBps', { symbol, notionalUsd, feeUsd, feeBps, minBps });
+
+  return minBps;
+
+}
+
  
 
 // Places a limit buy order first, then a limit sell after the buy is filled.
 
 async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
+
+  const intendedNotional = Number(qty) * Number(limitPrice);
+
+  if (!Number.isFinite(intendedNotional) || intendedNotional < MIN_ORDER_NOTIONAL_USD) {
+
+    logSkip('notional_too_small', { symbol, intendedNotional, minNotionalUsd: MIN_ORDER_NOTIONAL_USD });
+
+    return { skipped: true, reason: 'notional_too_small', notionalUsd: intendedNotional };
+
+  }
 
   // submit the limit buy order
 
@@ -110,9 +296,25 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   const avgPrice = parseFloat(filledOrder.filled_avg_price);
 
-  // Mark up sell price to cover taker fees and capture desired profit
+  updateInventoryFromBuy(symbol, filledOrder.filled_qty, avgPrice);
 
-  const sellPrice = roundPrice(avgPrice * (1 + TOTAL_MARKUP));
+  const inventory = inventoryState.get(symbol);
+
+  if (!inventory || inventory.qty <= 0) {
+
+    logSkip('no_inventory_for_sell', { symbol, qty: filledOrder.filled_qty });
+
+    return { buy: filledOrder, sell: null, sellError: 'No inventory to sell' };
+
+  }
+
+  const notionalUsd = Number(filledOrder.filled_qty) * avgPrice;
+
+  const minProfitBps = await feeAwareMinProfitBps(symbol, notionalUsd);
+
+  // Mark up sell price to cover fees, slippage, and desired profit
+
+  const sellPrice = roundPrice(avgPrice * (1 + minProfitBps / 10000));
 
  
 
@@ -240,7 +442,13 @@ async function placeMarketBuyThenSell(symbol) {
 
   const amountToSpend = Math.min(targetTradeAmount, buyingPower);
 
- 
+  if (!Number.isFinite(amountToSpend) || amountToSpend < MIN_ORDER_NOTIONAL_USD) {
+
+    logSkip('notional_too_small', { symbol, intendedNotional: amountToSpend, minNotionalUsd: MIN_ORDER_NOTIONAL_USD });
+
+    return { skipped: true, reason: 'notional_too_small', notionalUsd: amountToSpend };
+
+  }
 
   if (amountToSpend < 10) {
 
@@ -316,6 +524,18 @@ async function placeMarketBuyThenSell(symbol) {
 
   }
 
+  updateInventoryFromBuy(symbol, filled.filled_qty, filled.filled_avg_price);
+
+  const inventory = inventoryState.get(symbol);
+
+  if (!inventory || inventory.qty <= 0) {
+
+    logSkip('no_inventory_for_sell', { symbol, qty: filled.filled_qty });
+
+    return { buy: filled, sell: null, sellError: 'No inventory to sell' };
+
+  }
+
  
 
   // Wait 10 seconds before selling
@@ -324,13 +544,15 @@ async function placeMarketBuyThenSell(symbol) {
 
  
 
-  // Mark up sell price to cover taker fees and preserve desired profit margin
+  const avgPrice = parseFloat(filled.filled_avg_price);
 
-  const limitPrice = roundPrice(
+  const notionalUsd = Number(filled.filled_qty) * avgPrice;
 
-    parseFloat(filled.filled_avg_price) * (1 + TOTAL_MARKUP)
+  const minProfitBps = await feeAwareMinProfitBps(symbol, notionalUsd);
 
-  );
+  // Mark up sell price to cover fees, slippage, and preserve desired profit margin
+
+  const limitPrice = roundPrice(avgPrice * (1 + minProfitBps / 10000));
 
  
 
@@ -379,5 +601,7 @@ module.exports = {
   placeLimitBuyThenSell,
 
   placeMarketBuyThenSell,
+
+  initializeInventoryFromPositions,
 
 };
