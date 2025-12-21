@@ -9,6 +9,8 @@ const {
   fetchOrders,
   cancelOrder,
   startExitManager,
+  getConcurrencyGuardStatus,
+  getLastQuoteSnapshot,
 } = require('./trade');
 
 const app = express();
@@ -96,6 +98,24 @@ app.delete('/orders/:id', async (req, res) => {
     res.json(result || { canceled: true, id: req.params.id });
   } catch (error) {
     console.error('Order cancel error:', error?.response?.data || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/debug/status', async (req, res) => {
+  try {
+    const guardStatus = await getConcurrencyGuardStatus();
+    const lastQuoteAt = getLastQuoteSnapshot();
+    res.json({
+      openPositions: guardStatus.openPositions,
+      openOrders: guardStatus.openOrders,
+      activeSlotsUsed: guardStatus.activeSlotsUsed,
+      capMax: guardStatus.capMax,
+      lastScanAt: guardStatus.lastScanAt,
+      lastQuoteAt,
+    });
+  } catch (error) {
+    console.error('Status debug error:', error?.response?.data || error.message);
     res.status(500).json({ error: error.message });
   }
 });

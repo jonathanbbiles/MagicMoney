@@ -38,12 +38,17 @@ const REPRICE_EVERY_SECONDS = Number(process.env.REPRICE_EVERY_SECONDS || 20);
 const FORCE_EXIT_SECONDS = Number(process.env.FORCE_EXIT_SECONDS || 600);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
+const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 8);
+const QUOTE_CACHE_MAX_AGE_SECONDS = 60;
 
 const inventoryState = new Map();
 
 const exitState = new Map();
 
 const cfeeCache = { ts: 0, items: [] };
+const quoteCache = new Map();
+const lastQuoteAt = new Map();
+const scanState = { lastScanAt: null };
 
  
 
@@ -57,6 +62,27 @@ function logSkip(reason, details = {}) {
 
   console.log(`Skip — ${reason}`, details);
 
+}
+
+function parseQuoteTimestamp(quote) {
+  const raw = quote?.t ?? quote?.timestamp ?? quote?.time ?? quote?.ts;
+  if (!raw) return null;
+  const parsed = new Date(raw).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getResponseSnippet(data) {
+  if (data == null) return '';
+  const raw = typeof data === 'string' ? data : JSON.stringify(data);
+  return raw.slice(0, 200);
+}
+
+function setLastQuoteAt(symbol, tsMs) {
+  if (Number.isFinite(tsMs)) {
+    lastQuoteAt.set(symbol, tsMs);
+  } else {
+    lastQuoteAt.set(symbol, null);
+  }
 }
 
 function normalizeSymbol(rawSymbol) {
@@ -504,57 +530,73 @@ async function getLatestQuote(rawSymbol) {
 
   const symbol = normalizeSymbol(rawSymbol);
 
-  if (isCryptoSymbol(symbol)) {
-
-    const res = await axios.get(
-
-      `${DATA_URL}/crypto/latest/quotes?symbols=${symbol}`,
-
-      { headers: HEADERS }
-
-    );
-
-    const quote = res.data.quotes && res.data.quotes[symbol];
-
-    if (!quote) throw new Error(`Quote not available for ${symbol}`);
-
-    const bid = Number(quote.bp ?? quote.bid_price ?? quote.bid);
-
-    const ask = Number(quote.ap ?? quote.ask_price ?? quote.ask);
-
-    return {
-
-      bid: Number.isFinite(bid) ? bid : null,
-
-      ask: Number.isFinite(ask) ? ask : null,
-
-    };
-
+  const now = Date.now();
+  const cached = quoteCache.get(symbol);
+  let staleCache = false;
+  if (cached && Number.isFinite(cached.tsMs)) {
+    const ageSeconds = (now - cached.tsMs) / 1000;
+    if (ageSeconds <= QUOTE_CACHE_MAX_AGE_SECONDS) {
+      return {
+        bid: cached.bid,
+        ask: cached.ask,
+        tsMs: cached.tsMs,
+      };
+    }
+    staleCache = true;
+  } else if (cached) {
+    staleCache = true;
   }
 
-  const res = await axios.get(
+  if (staleCache) {
+    quoteCache.delete(symbol);
+  }
 
-    `${STOCKS_DATA_URL}/quotes/latest?symbols=${encodeURIComponent(symbol)}`,
+  const isCrypto = isCryptoSymbol(symbol);
+  const url = isCrypto
+    ? `${DATA_URL}/crypto/latest/quotes?symbols=${symbol}`
+    : `${STOCKS_DATA_URL}/quotes/latest?symbols=${encodeURIComponent(symbol)}`;
 
-    { headers: HEADERS }
-
-  );
+  let res;
+  try {
+    res = await axios.get(url, { headers: HEADERS });
+  } catch (err) {
+    const statusCode = err?.response?.status ?? null;
+    const responseSnippet = getResponseSnippet(err?.response?.data);
+    console.warn('quote_fetch_failed', {
+      symbol,
+      url,
+      statusCode,
+      errorMessage: err?.message || err,
+      responseSnippet,
+    });
+    logSkip('no_quote', { symbol, reason: 'api_error' });
+    throw err;
+  }
 
   const quote = res.data.quotes && res.data.quotes[symbol];
+  if (!quote) {
+    const reason = staleCache ? 'stale_cache' : 'no_data';
+    logSkip('no_quote', { symbol, reason });
+    throw new Error(`Quote not available for ${symbol}`);
+  }
 
-  if (!quote) throw new Error(`Quote not available for ${symbol}`);
+  const tsMs = parseQuoteTimestamp(quote);
+  if (!Number.isFinite(tsMs)) {
+    setLastQuoteAt(symbol, null);
+    logSkip('no_quote', { symbol, reason: 'parse_error' });
+    throw new Error(`Quote timestamp missing for ${symbol}`);
+  }
 
   const bid = Number(quote.bp ?? quote.bid_price ?? quote.bid);
-
   const ask = Number(quote.ap ?? quote.ask_price ?? quote.ask);
-
-  return {
-
+  const normalizedQuote = {
     bid: Number.isFinite(bid) ? bid : null,
-
     ask: Number.isFinite(ask) ? ask : null,
-
+    tsMs,
   };
+  quoteCache.set(symbol, normalizedQuote);
+  setLastQuoteAt(symbol, tsMs);
+  return normalizedQuote;
 
 }
 
@@ -1321,6 +1363,72 @@ async function fetchOrders(params = {}) {
 
 }
 
+async function fetchOpenPositions() {
+  const res = await axios.get(`${ALPACA_BASE_URL}/positions`, { headers: HEADERS });
+  const positions = Array.isArray(res.data) ? res.data : [];
+  return positions
+    .map((pos) => ({
+      symbol: normalizeSymbol(pos.symbol),
+      qty: Number(pos.qty ?? pos.quantity ?? 0),
+    }))
+    .filter((pos) => Number.isFinite(pos.qty) && pos.qty > 0);
+}
+
+async function fetchOpenOrders() {
+  const orders = await fetchOrders({ status: 'open' });
+  const list = Array.isArray(orders) ? orders : [];
+  return list
+    .map((order) => ({
+      symbol: normalizeSymbol(order.symbol),
+      side: order.side,
+      status: order.status,
+    }))
+    .filter((order) => String(order.status || '').toLowerCase() === 'open');
+}
+
+async function getConcurrencyGuardStatus() {
+  scanState.lastScanAt = new Date().toISOString();
+  const [openPositions, openOrders] = await Promise.all([
+    fetchOpenPositions(),
+    fetchOpenOrders(),
+  ]);
+  const positionSymbols = new Set(openPositions.map((pos) => pos.symbol));
+  const orderSymbols = new Set(openOrders.map((order) => order.symbol));
+  const activeSymbols = new Set([...positionSymbols, ...orderSymbols]);
+  const activeSlotsUsed = activeSymbols.size;
+  const positionsCount = positionSymbols.size;
+  const ordersCount = orderSymbols.size;
+  console.log(
+    `Concurrency guard: used=${activeSlotsUsed} cap=${MAX_CONCURRENT_POSITIONS} positions=${positionsCount} orders=${ordersCount}`
+  );
+  return {
+    openPositions,
+    openOrders,
+    activeSlotsUsed,
+    capMax: MAX_CONCURRENT_POSITIONS,
+    lastScanAt: scanState.lastScanAt,
+  };
+}
+
+function getLastQuoteSnapshot() {
+  const now = Date.now();
+  const snapshot = {};
+  for (const [symbol, tsMs] of lastQuoteAt.entries()) {
+    if (Number.isFinite(tsMs)) {
+      snapshot[symbol] = {
+        timestamp: new Date(tsMs).toISOString(),
+        ageSeconds: (now - tsMs) / 1000,
+      };
+    } else {
+      snapshot[symbol] = {
+        timestamp: null,
+        ageSeconds: null,
+      };
+    }
+  }
+  return snapshot;
+}
+
 async function cancelOrder(orderId) {
 
   const response = await axios.delete(`${ALPACA_BASE_URL}/orders/${orderId}`, { headers: HEADERS });
@@ -1346,5 +1454,7 @@ module.exports = {
   normalizeSymbol,
 
   startExitManager,
+  getConcurrencyGuardStatus,
+  getLastQuoteSnapshot,
 
 };
