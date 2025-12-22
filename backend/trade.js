@@ -1,6 +1,6 @@
 const { randomUUID } = require('crypto');
 
-const httpClient = require('./httpClient');
+const { httpGetJson, httpPostJson, httpDeleteJson } = require('./httpClient');
 
  
 
@@ -172,9 +172,8 @@ function updateInventoryFromBuy(symbol, qty, price) {
 
 async function initializeInventoryFromPositions() {
 
-  const res = await httpClient.get(`${ALPACA_BASE_URL}/positions`, {
+  const res = await httpGetJson(`${ALPACA_BASE_URL}/positions`, {
     headers: HEADERS,
-    purpose: 'get_positions',
   });
 
   const positions = Array.isArray(res) ? res : [];
@@ -213,7 +212,7 @@ async function fetchRecentCfeeEntries(limit = 25) {
 
   }
 
-  const res = await httpClient.get(
+  const res = await httpGetJson(
     buildUrlWithParams(`${ALPACA_BASE_URL}/account/activities`, {
       activity_types: 'CFEE',
       direction: 'desc',
@@ -221,7 +220,6 @@ async function fetchRecentCfeeEntries(limit = 25) {
     }),
     {
       headers: HEADERS,
-      purpose: 'get_account_activities',
     }
   );
 
@@ -358,7 +356,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   // submit the limit buy order
 
-  const buyOrder = await httpClient.post(
+  const buyOrder = await httpPostJson(
     `${ALPACA_BASE_URL}/orders`,
     {
       symbol: normalizedSymbol,
@@ -372,9 +370,6 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     },
     {
       headers: HEADERS,
-      purpose: 'place_order',
-      symbol: normalizedSymbol,
-      allowRetry: true,
     }
   );
 
@@ -386,10 +381,8 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   for (let i = 0; i < 20; i++) {
 
-    const check = await httpClient.get(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
+    const check = await httpGetJson(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
       headers: HEADERS,
-      purpose: 'get_order',
-      symbol: normalizedSymbol,
     });
 
     filledOrder = check;
@@ -452,10 +445,8 @@ async function getLatestPrice(symbol) {
 
   if (isCryptoSymbol(symbol)) {
 
-    const res = await httpClient.get(`${DATA_URL}/crypto/latest/trades?symbols=${symbol}`, {
+    const res = await httpGetJson(`${DATA_URL}/crypto/latest/trades?symbols=${symbol}`, {
       headers: HEADERS,
-      purpose: 'get_latest_trade',
-      symbol,
     });
 
     const trade = res.trades && res.trades[symbol];
@@ -466,12 +457,10 @@ async function getLatestPrice(symbol) {
 
   }
 
-  const res = await httpClient.get(
+  const res = await httpGetJson(
     `${STOCKS_DATA_URL}/trades/latest?symbols=${encodeURIComponent(symbol)}`,
     {
       headers: HEADERS,
-      purpose: 'get_latest_trade',
-      symbol,
     }
   );
 
@@ -489,9 +478,8 @@ async function getLatestPrice(symbol) {
 
 async function getAccountInfo() {
 
-  const res = await httpClient.get(`${ALPACA_BASE_URL}/account`, {
+  const res = await httpGetJson(`${ALPACA_BASE_URL}/account`, {
     headers: HEADERS,
-    purpose: 'get_account',
   });
 
   const portfolioValue = parseFloat(res.portfolio_value);
@@ -560,10 +548,8 @@ async function getLatestQuote(rawSymbol) {
 
   let res;
   try {
-    res = await httpClient.get(url, {
+    res = await httpGetJson(url, {
       headers: HEADERS,
-      purpose: 'quote_fetch',
-      symbol,
     });
   } catch (err) {
     if (err?.errorCode === 'COOLDOWN') {
@@ -603,9 +589,8 @@ async function getLatestQuote(rawSymbol) {
 
 async function fetchOrderById(orderId) {
 
-  const response = await httpClient.get(`${ALPACA_BASE_URL}/orders/${orderId}`, {
+  const response = await httpGetJson(`${ALPACA_BASE_URL}/orders/${orderId}`, {
     headers: HEADERS,
-    purpose: 'get_order',
   });
 
   return response;
@@ -642,7 +627,7 @@ async function submitLimitSell({
 
 }) {
 
-  const response = await httpClient.post(
+  const response = await httpPostJson(
 
     `${ALPACA_BASE_URL}/orders`,
 
@@ -665,9 +650,6 @@ async function submitLimitSell({
 
     {
       headers: HEADERS,
-      purpose: 'place_order',
-      symbol,
-      allowRetry: true,
     }
 
   );
@@ -688,7 +670,7 @@ async function submitMarketSell({
 
 }) {
 
-  const response = await httpClient.post(
+  const response = await httpPostJson(
 
     `${ALPACA_BASE_URL}/orders`,
 
@@ -709,9 +691,6 @@ async function submitMarketSell({
 
     {
       headers: HEADERS,
-      purpose: 'place_order',
-      symbol,
-      allowRetry: true,
     }
 
   );
@@ -1161,7 +1140,7 @@ async function placeMarketBuyThenSell(symbol) {
 
  
 
-  const buyOrder = await httpClient.post(
+  const buyOrder = await httpPostJson(
     `${ALPACA_BASE_URL}/orders`,
     {
       symbol: normalizedSymbol,
@@ -1173,9 +1152,6 @@ async function placeMarketBuyThenSell(symbol) {
     },
     {
       headers: HEADERS,
-      purpose: 'place_order',
-      symbol: normalizedSymbol,
-      allowRetry: true,
     }
   );
 
@@ -1187,10 +1163,8 @@ async function placeMarketBuyThenSell(symbol) {
 
   for (let i = 0; i < 20; i++) {
 
-    const chk = await httpClient.get(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
+    const chk = await httpGetJson(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
       headers: HEADERS,
-      purpose: 'get_order',
-      symbol: normalizedSymbol,
     });
 
     filled = chk;
@@ -1321,7 +1295,7 @@ async function submitOrder(order = {}) {
 
   }
 
-  const response = await httpClient.post(
+  const response = await httpPostJson(
     `${ALPACA_BASE_URL}/orders`,
     {
       symbol: normalizedSymbol,
@@ -1335,9 +1309,6 @@ async function submitOrder(order = {}) {
     },
     {
       headers: HEADERS,
-      purpose: 'place_order',
-      symbol: normalizedSymbol,
-      allowRetry: true,
     }
   );
 
@@ -1347,9 +1318,8 @@ async function submitOrder(order = {}) {
 
 async function fetchOrders(params = {}) {
 
-  const response = await httpClient.get(buildUrlWithParams(`${ALPACA_BASE_URL}/orders`, params), {
+  const response = await httpGetJson(buildUrlWithParams(`${ALPACA_BASE_URL}/orders`, params), {
     headers: HEADERS,
-    purpose: 'get_orders',
   });
 
   if (Array.isArray(response)) {
@@ -1369,9 +1339,8 @@ async function fetchOrders(params = {}) {
 }
 
 async function fetchOpenPositions() {
-  const res = await httpClient.get(`${ALPACA_BASE_URL}/positions`, {
+  const res = await httpGetJson(`${ALPACA_BASE_URL}/positions`, {
     headers: HEADERS,
-    purpose: 'get_positions',
   });
   const positions = Array.isArray(res) ? res : [];
   return positions
@@ -1439,9 +1408,8 @@ function getLastQuoteSnapshot() {
 
 async function cancelOrder(orderId) {
 
-  const response = await httpClient.del(`${ALPACA_BASE_URL}/orders/${orderId}`, {
+  const response = await httpDeleteJson(`${ALPACA_BASE_URL}/orders/${orderId}`, {
     headers: HEADERS,
-    purpose: 'cancel_order',
   });
 
   return response;
