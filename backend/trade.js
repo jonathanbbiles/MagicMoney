@@ -1,27 +1,47 @@
 const { randomUUID } = require('crypto');
 
-const { httpGetJson, httpPostJson, httpDeleteJson } = require('./httpClient');
-
- 
+const { httpJson } = require('./httpClient');
 
 const ALPACA_BASE_URL = process.env.ALPACA_API_BASE || 'https://api.alpaca.markets/v2';
 
 const DATA_URL = 'https://data.alpaca.markets/v1beta2';
 const STOCKS_DATA_URL = 'https://data.alpaca.markets/v2/stocks';
 
-const API_KEY = process.env.ALPACA_API_KEY;
+const resolvedAlpacaAuth = (() => {
+  const keyId = process.env.ALPACA_KEY_ID || process.env.APCA_API_KEY_ID || '';
+  const secretKey = process.env.ALPACA_SECRET_KEY || process.env.APCA_API_SECRET_KEY || '';
+  const alpacaKeyIdPresent = Boolean(keyId);
+  const alpacaAuthOk = Boolean(keyId && secretKey);
+  if (!alpacaAuthOk) {
+    console.error(
+      'ALPACA AUTH MISSING: set ALPACA_KEY_ID + ALPACA_SECRET_KEY (or APCA_API_KEY_ID + APCA_API_SECRET_KEY) on Render.'
+    );
+  }
+  return {
+    keyId,
+    secretKey,
+    alpacaKeyIdPresent,
+    alpacaAuthOk,
+  };
+})();
 
-const SECRET_KEY = process.env.ALPACA_SECRET_KEY;
+function alpacaHeaders() {
+  const headers = {};
+  if (resolvedAlpacaAuth.keyId) {
+    headers['APCA-API-KEY-ID'] = resolvedAlpacaAuth.keyId;
+  }
+  if (resolvedAlpacaAuth.secretKey) {
+    headers['APCA-API-SECRET-KEY'] = resolvedAlpacaAuth.secretKey;
+  }
+  return headers;
+}
 
- 
-
-const HEADERS = {
-
-  'APCA-API-KEY-ID': API_KEY,
-
-  'APCA-API-SECRET-KEY': SECRET_KEY,
-
-};
+function alpacaJsonHeaders() {
+  return {
+    'Content-Type': 'application/json',
+    ...alpacaHeaders(),
+  };
+}
 
  
 
@@ -51,6 +71,7 @@ const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
+let lastHttpError = null;
 
  
 
@@ -64,6 +85,48 @@ function logSkip(reason, details = {}) {
 
   console.log(`Skip — ${reason}`, details);
 
+}
+
+function logHttpError({ symbol, phase, url, error }) {
+  const statusCode = error?.statusCode ?? null;
+  const errorMessage = error?.errorMessage || error?.message || 'Unknown error';
+  const snippet = error?.responseSnippet200 || '';
+  console.error('alpaca_http_error', {
+    symbol,
+    phase,
+    url,
+    statusCode,
+    errorMessage,
+    snippet,
+  });
+  if (statusCode === 401 || statusCode === 403) {
+    console.error('AUTH_ERROR: check Render env vars');
+  }
+}
+
+async function requestJson({
+  method,
+  url,
+  headers,
+  body,
+  timeoutMs,
+  retries,
+}) {
+  const result = await httpJson({
+    method,
+    url,
+    headers,
+    body,
+    timeoutMs,
+    retries,
+  });
+
+  if (result.error) {
+    lastHttpError = result.error;
+    throw result.error;
+  }
+
+  return result.data;
 }
 
 function parseQuoteTimestamp(quote) {
@@ -171,10 +234,18 @@ function updateInventoryFromBuy(symbol, qty, price) {
 }
 
 async function initializeInventoryFromPositions() {
-
-  const res = await httpGetJson(`${ALPACA_BASE_URL}/positions`, {
-    headers: HEADERS,
-  });
+  const url = `${ALPACA_BASE_URL}/positions`;
+  let res;
+  try {
+    res = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    logHttpError({ phase: 'positions', url, error: err });
+    throw err;
+  }
 
   const positions = Array.isArray(res) ? res : [];
 
@@ -212,16 +283,22 @@ async function fetchRecentCfeeEntries(limit = 25) {
 
   }
 
-  const res = await httpGetJson(
-    buildUrlWithParams(`${ALPACA_BASE_URL}/account/activities`, {
-      activity_types: 'CFEE',
-      direction: 'desc',
-      page_size: String(limit),
-    }),
-    {
-      headers: HEADERS,
-    }
-  );
+  const url = buildUrlWithParams(`${ALPACA_BASE_URL}/account/activities`, {
+    activity_types: 'CFEE',
+    direction: 'desc',
+    page_size: String(limit),
+  });
+  let res;
+  try {
+    res = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    logHttpError({ phase: 'orders', url, error: err });
+    throw err;
+  }
 
   const items = Array.isArray(res)
     ? res.map((entry) => ({
@@ -356,22 +433,33 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   // submit the limit buy order
 
-  const buyOrder = await httpPostJson(
-    `${ALPACA_BASE_URL}/orders`,
-    {
+  const buyOrderUrl = `${ALPACA_BASE_URL}/orders`;
+  let buyOrder;
+  try {
+    buyOrder = await requestJson({
+      method: 'POST',
+      url: buyOrderUrl,
+      headers: alpacaJsonHeaders(),
+      body: JSON.stringify({
+        symbol: normalizedSymbol,
+        qty,
+        side: 'buy',
+        type: 'limit',
+        // crypto orders must be GTC
+        time_in_force: 'gtc',
+        limit_price: limitPrice,
+        client_order_id: buildClientOrderId(normalizedSymbol, 'limit-buy'),
+      }),
+    });
+  } catch (err) {
+    logHttpError({
       symbol: normalizedSymbol,
-      qty,
-      side: 'buy',
-      type: 'limit',
-      // crypto orders must be GTC
-      time_in_force: 'gtc',
-      limit_price: limitPrice,
-      client_order_id: buildClientOrderId(normalizedSymbol, 'limit-buy'),
-    },
-    {
-      headers: HEADERS,
-    }
-  );
+      phase: 'order',
+      url: buyOrderUrl,
+      error: err,
+    });
+    throw err;
+  }
 
  
 
@@ -381,9 +469,23 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   for (let i = 0; i < 20; i++) {
 
-    const check = await httpGetJson(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
-      headers: HEADERS,
-    });
+    const checkUrl = `${ALPACA_BASE_URL}/orders/${buyOrder.id}`;
+    let check;
+    try {
+      check = await requestJson({
+        method: 'GET',
+        url: checkUrl,
+        headers: alpacaHeaders(),
+      });
+    } catch (err) {
+      logHttpError({
+        symbol: normalizedSymbol,
+        phase: 'orders',
+        url: checkUrl,
+        error: err,
+      });
+      throw err;
+    }
 
     filledOrder = check;
 
@@ -444,10 +546,18 @@ function isCryptoSymbol(symbol) {
 async function getLatestPrice(symbol) {
 
   if (isCryptoSymbol(symbol)) {
-
-    const res = await httpGetJson(`${DATA_URL}/crypto/latest/trades?symbols=${symbol}`, {
-      headers: HEADERS,
-    });
+    const url = `${DATA_URL}/crypto/latest/trades?symbols=${symbol}`;
+    let res;
+    try {
+      res = await requestJson({
+        method: 'GET',
+        url,
+        headers: alpacaHeaders(),
+      });
+    } catch (err) {
+      logHttpError({ symbol, phase: 'quote', url, error: err });
+      throw err;
+    }
 
     const trade = res.trades && res.trades[symbol];
 
@@ -457,12 +567,18 @@ async function getLatestPrice(symbol) {
 
   }
 
-  const res = await httpGetJson(
-    `${STOCKS_DATA_URL}/trades/latest?symbols=${encodeURIComponent(symbol)}`,
-    {
-      headers: HEADERS,
-    }
-  );
+  const url = `${STOCKS_DATA_URL}/trades/latest?symbols=${encodeURIComponent(symbol)}`;
+  let res;
+  try {
+    res = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    logHttpError({ symbol, phase: 'quote', url, error: err });
+    throw err;
+  }
 
   const trade = res.trades && res.trades[symbol];
 
@@ -477,10 +593,18 @@ async function getLatestPrice(symbol) {
 // Get portfolio value and buying power from the Alpaca account
 
 async function getAccountInfo() {
-
-  const res = await httpGetJson(`${ALPACA_BASE_URL}/account`, {
-    headers: HEADERS,
-  });
+  const url = `${ALPACA_BASE_URL}/account`;
+  let res;
+  try {
+    res = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    logHttpError({ phase: 'orders', url, error: err });
+    throw err;
+  }
 
   const portfolioValue = parseFloat(res.portfolio_value);
 
@@ -548,10 +672,13 @@ async function getLatestQuote(rawSymbol) {
 
   let res;
   try {
-    res = await httpGetJson(url, {
-      headers: HEADERS,
+    res = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
     });
   } catch (err) {
+    logHttpError({ symbol, phase: 'quote', url, error: err });
     if (err?.errorCode === 'COOLDOWN') {
       logSkip('no_quote', { symbol, reason: 'cooldown' });
     } else {
@@ -588,10 +715,18 @@ async function getLatestQuote(rawSymbol) {
 }
 
 async function fetchOrderById(orderId) {
-
-  const response = await httpGetJson(`${ALPACA_BASE_URL}/orders/${orderId}`, {
-    headers: HEADERS,
-  });
+  const url = `${ALPACA_BASE_URL}/orders/${orderId}`;
+  let response;
+  try {
+    response = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    logHttpError({ phase: 'orders', url, error: err });
+    throw err;
+  }
 
   return response;
 
@@ -607,7 +742,10 @@ async function cancelOrderSafe(orderId) {
 
   } catch (err) {
 
-    console.warn('cancel_order_failed', { orderId, error: err?.responseSnippet || err.message });
+    console.warn('cancel_order_failed', {
+      orderId,
+      error: err?.responseSnippet200 || err?.errorMessage || err.message,
+    });
 
     return false;
 
@@ -627,32 +765,27 @@ async function submitLimitSell({
 
 }) {
 
-  const response = await httpPostJson(
-
-    `${ALPACA_BASE_URL}/orders`,
-
-    {
-
-      symbol,
-
-      qty,
-
-      side: 'sell',
-
-      type: 'limit',
-
-      time_in_force: 'gtc',
-
-      limit_price: limitPrice,
-      client_order_id: buildClientOrderId(symbol, 'limit-sell'),
-
-    },
-
-    {
-      headers: HEADERS,
-    }
-
-  );
+  const url = `${ALPACA_BASE_URL}/orders`;
+  let response;
+  try {
+    response = await requestJson({
+      method: 'POST',
+      url,
+      headers: alpacaJsonHeaders(),
+      body: JSON.stringify({
+        symbol,
+        qty,
+        side: 'sell',
+        type: 'limit',
+        time_in_force: 'gtc',
+        limit_price: limitPrice,
+        client_order_id: buildClientOrderId(symbol, 'limit-sell'),
+      }),
+    });
+  } catch (err) {
+    logHttpError({ symbol, phase: 'order', url, error: err });
+    throw err;
+  }
 
   console.log('submit_limit_sell', { symbol, qty, limitPrice, reason, orderId: response?.id });
 
@@ -670,30 +803,26 @@ async function submitMarketSell({
 
 }) {
 
-  const response = await httpPostJson(
-
-    `${ALPACA_BASE_URL}/orders`,
-
-    {
-
-      symbol,
-
-      qty,
-
-      side: 'sell',
-
-      type: 'market',
-
-      time_in_force: 'gtc',
-      client_order_id: buildClientOrderId(symbol, 'market-sell'),
-
-    },
-
-    {
-      headers: HEADERS,
-    }
-
-  );
+  const url = `${ALPACA_BASE_URL}/orders`;
+  let response;
+  try {
+    response = await requestJson({
+      method: 'POST',
+      url,
+      headers: alpacaJsonHeaders(),
+      body: JSON.stringify({
+        symbol,
+        qty,
+        side: 'sell',
+        type: 'market',
+        time_in_force: 'gtc',
+        client_order_id: buildClientOrderId(symbol, 'market-sell'),
+      }),
+    });
+  } catch (err) {
+    logHttpError({ symbol, phase: 'order', url, error: err });
+    throw err;
+  }
 
   console.log('submit_market_sell', { symbol, qty, reason, orderId: response?.id });
 
@@ -1140,20 +1269,31 @@ async function placeMarketBuyThenSell(symbol) {
 
  
 
-  const buyOrder = await httpPostJson(
-    `${ALPACA_BASE_URL}/orders`,
-    {
+  const buyOrderUrl = `${ALPACA_BASE_URL}/orders`;
+  let buyOrder;
+  try {
+    buyOrder = await requestJson({
+      method: 'POST',
+      url: buyOrderUrl,
+      headers: alpacaJsonHeaders(),
+      body: JSON.stringify({
+        symbol: normalizedSymbol,
+        qty,
+        side: 'buy',
+        type: 'market',
+        time_in_force: 'gtc',
+        client_order_id: buildClientOrderId(normalizedSymbol, 'market-buy'),
+      }),
+    });
+  } catch (err) {
+    logHttpError({
       symbol: normalizedSymbol,
-      qty,
-      side: 'buy',
-      type: 'market',
-      time_in_force: 'gtc',
-      client_order_id: buildClientOrderId(normalizedSymbol, 'market-buy'),
-    },
-    {
-      headers: HEADERS,
-    }
-  );
+      phase: 'order',
+      url: buyOrderUrl,
+      error: err,
+    });
+    throw err;
+  }
 
  
 
@@ -1163,9 +1303,23 @@ async function placeMarketBuyThenSell(symbol) {
 
   for (let i = 0; i < 20; i++) {
 
-    const chk = await httpGetJson(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
-      headers: HEADERS,
-    });
+    const checkUrl = `${ALPACA_BASE_URL}/orders/${buyOrder.id}`;
+    let chk;
+    try {
+      chk = await requestJson({
+        method: 'GET',
+        url: checkUrl,
+        headers: alpacaHeaders(),
+      });
+    } catch (err) {
+      logHttpError({
+        symbol: normalizedSymbol,
+        phase: 'orders',
+        url: checkUrl,
+        error: err,
+      });
+      throw err;
+    }
 
     filled = chk;
 
@@ -1215,7 +1369,7 @@ async function placeMarketBuyThenSell(symbol) {
 
   } catch (err) {
 
-    console.error('Sell order failed:', err?.responseSnippet || err.message);
+    console.error('Sell order failed:', err?.responseSnippet200 || err?.errorMessage || err.message);
 
     return { buy: filled, sell: null, sellError: err.message };
 
@@ -1295,32 +1449,46 @@ async function submitOrder(order = {}) {
 
   }
 
-  const response = await httpPostJson(
-    `${ALPACA_BASE_URL}/orders`,
-    {
-      symbol: normalizedSymbol,
-      qty,
-      side,
-      type,
-      time_in_force,
-      limit_price,
-      notional,
-      client_order_id: buildClientOrderId(normalizedSymbol, 'order'),
-    },
-    {
-      headers: HEADERS,
-    }
-  );
+  const url = `${ALPACA_BASE_URL}/orders`;
+  let response;
+  try {
+    response = await requestJson({
+      method: 'POST',
+      url,
+      headers: alpacaJsonHeaders(),
+      body: JSON.stringify({
+        symbol: normalizedSymbol,
+        qty,
+        side,
+        type,
+        time_in_force,
+        limit_price,
+        notional,
+        client_order_id: buildClientOrderId(normalizedSymbol, 'order'),
+      }),
+    });
+  } catch (err) {
+    logHttpError({ symbol: normalizedSymbol, phase: 'order', url, error: err });
+    throw err;
+  }
 
   return response;
 
 }
 
 async function fetchOrders(params = {}) {
-
-  const response = await httpGetJson(buildUrlWithParams(`${ALPACA_BASE_URL}/orders`, params), {
-    headers: HEADERS,
-  });
+  const url = buildUrlWithParams(`${ALPACA_BASE_URL}/orders`, params);
+  let response;
+  try {
+    response = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    logHttpError({ phase: 'orders', url, error: err });
+    throw err;
+  }
 
   if (Array.isArray(response)) {
 
@@ -1339,9 +1507,18 @@ async function fetchOrders(params = {}) {
 }
 
 async function fetchOpenPositions() {
-  const res = await httpGetJson(`${ALPACA_BASE_URL}/positions`, {
-    headers: HEADERS,
-  });
+  const url = `${ALPACA_BASE_URL}/positions`;
+  let res;
+  try {
+    res = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    logHttpError({ phase: 'positions', url, error: err });
+    throw err;
+  }
   const positions = Array.isArray(res) ? res : [];
   return positions
     .map((pos) => ({
@@ -1406,11 +1583,30 @@ function getLastQuoteSnapshot() {
   return snapshot;
 }
 
-async function cancelOrder(orderId) {
+function getAlpacaAuthStatus() {
+  return {
+    alpacaAuthOk: resolvedAlpacaAuth.alpacaAuthOk,
+    alpacaKeyIdPresent: resolvedAlpacaAuth.alpacaKeyIdPresent,
+  };
+}
 
-  const response = await httpDeleteJson(`${ALPACA_BASE_URL}/orders/${orderId}`, {
-    headers: HEADERS,
-  });
+function getLastHttpError() {
+  return lastHttpError;
+}
+
+async function cancelOrder(orderId) {
+  const url = `${ALPACA_BASE_URL}/orders/${orderId}`;
+  let response;
+  try {
+    response = await requestJson({
+      method: 'DELETE',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    logHttpError({ phase: 'orders', url, error: err });
+    throw err;
+  }
 
   return response;
 
@@ -1435,5 +1631,7 @@ module.exports = {
   startExitManager,
   getConcurrencyGuardStatus,
   getLastQuoteSnapshot,
+  getAlpacaAuthStatus,
+  getLastHttpError,
 
 };

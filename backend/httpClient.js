@@ -1,6 +1,7 @@
 const { alpacaLimiter, quoteLimiter } = require('./limiters');
 
-const REQUEST_TIMEOUT_MS = Number(process.env.HTTP_REQUEST_TIMEOUT_MS || 2000);
+const DEFAULT_TIMEOUT_MS = 10000;
+const DEFAULT_RETRIES = 2;
 
 function getLimiterForUrl(url) {
   const host = new URL(url).hostname;
@@ -13,78 +14,135 @@ function getLimiterForUrl(url) {
   return null;
 }
 
-async function executeFetch(url, options, timeoutMs) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetry(error) {
+  if (!error) return false;
+  if (error.isTimeout || error.isNetworkError) return true;
+  if (Number.isFinite(error.statusCode) && error.statusCode >= 500) return true;
+  return false;
+}
+
+function getBackoffDelayMs(attempt) {
+  const baseDelays = [250, 750, 1750, 3750];
+  const base = baseDelays[Math.min(attempt, baseDelays.length - 1)];
+  const jitter = Math.floor(Math.random() * 120);
+  return base + jitter;
+}
+
+async function executeFetch({ method, url, headers, body, timeoutMs }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(url, {
-      ...options,
+      method,
+      headers,
+      body,
       signal: controller.signal,
     });
 
     const text = await response.text();
+    const snippet = text ? text.slice(0, 200) : '';
 
     if (!response.ok) {
-      const snippet = text.slice(0, 200);
-      throw new Error(
-        `HTTP ${response.status} ${response.statusText} for ${url}: ${snippet}`,
-      );
+      return {
+        data: null,
+        error: {
+          url,
+          method,
+          statusCode: response.status,
+          errorMessage: `HTTP ${response.status} ${response.statusText}`,
+          responseSnippet200: snippet,
+          isTimeout: false,
+          isNetworkError: false,
+        },
+      };
     }
 
-    if (!text) return null;
+    if (!text) {
+      return { data: null, error: null };
+    }
+
     try {
-      return JSON.parse(text);
+      return { data: JSON.parse(text), error: null };
     } catch (err) {
-      return text;
+      return {
+        data: null,
+        error: {
+          url,
+          method,
+          statusCode: response.status,
+          errorMessage: 'parse_error',
+          responseSnippet200: snippet,
+          isTimeout: false,
+          isNetworkError: false,
+          parse_error: true,
+        },
+      };
     }
   } catch (err) {
-    const causeCode = err?.cause?.code;
-    const causeText = causeCode ? ` (cause: ${causeCode})` : '';
-    const name = err?.name || 'Error';
-    const message = err?.message || 'Unknown error';
-    throw new Error(`Fetch error for ${url}: ${name}: ${message}${causeText}`);
+    const isTimeout = err?.name === 'AbortError';
+    const message = err?.message || 'Network error';
+    return {
+      data: null,
+      error: {
+        url,
+        method,
+        statusCode: null,
+        errorMessage: message,
+        responseSnippet200: '',
+        isTimeout,
+        isNetworkError: !isTimeout,
+      },
+    };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function fetchJson(method, url, { headers, body, timeoutMs = REQUEST_TIMEOUT_MS } = {}) {
+async function httpJson({
+  method,
+  url,
+  headers,
+  body,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  retries = DEFAULT_RETRIES,
+} = {}) {
   const limiter = getLimiterForUrl(url);
-  const options = {
-    method,
-    headers,
-    body,
-  };
 
-  if (limiter) {
-    return limiter.schedule(() => executeFetch(url, options, timeoutMs));
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const runner = () => executeFetch({ method, url, headers, body, timeoutMs });
+    const result = limiter ? await limiter.schedule(runner) : await runner();
+
+    if (!result.error) {
+      return result;
+    }
+
+    if (attempt < retries && shouldRetry(result.error)) {
+      await sleep(getBackoffDelayMs(attempt));
+      continue;
+    }
+
+    return result;
   }
 
-  return executeFetch(url, options, timeoutMs);
-}
-
-async function httpGetJson(url, { headers, timeoutMs } = {}) {
-  return fetchJson('GET', url, { headers, timeoutMs });
-}
-
-async function httpPostJson(url, body, { headers, timeoutMs } = {}) {
-  return fetchJson('POST', url, {
-    headers: {
-      'Content-Type': 'application/json',
-      ...(headers || {}),
+  return {
+    data: null,
+    error: {
+      url,
+      method,
+      statusCode: null,
+      errorMessage: 'Unknown HTTP error',
+      responseSnippet200: '',
+      isTimeout: false,
+      isNetworkError: false,
     },
-    body: body == null ? undefined : JSON.stringify(body),
-    timeoutMs,
-  });
-}
-
-async function httpDeleteJson(url, { headers, timeoutMs } = {}) {
-  return fetchJson('DELETE', url, { headers, timeoutMs });
+  };
 }
 
 module.exports = {
-  httpGetJson,
-  httpPostJson,
-  httpDeleteJson,
+  httpJson,
 };
