@@ -1,4 +1,6 @@
-const axios = require('axios');
+const { randomUUID } = require('crypto');
+
+const httpClient = require('./httpClient');
 
  
 
@@ -71,12 +73,6 @@ function parseQuoteTimestamp(quote) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function getResponseSnippet(data) {
-  if (data == null) return '';
-  const raw = typeof data === 'string' ? data : JSON.stringify(data);
-  return raw.slice(0, 200);
-}
-
 function setLastQuoteAt(symbol, tsMs) {
   if (Number.isFinite(tsMs)) {
     lastQuoteAt.set(symbol, tsMs);
@@ -93,6 +89,21 @@ function normalizeSymbol(rawSymbol) {
 
   return symbol.includes('/') ? symbol.replace(/\//g, '') : symbol;
 
+}
+
+function buildUrlWithParams(baseUrl, params = {}) {
+  const searchParams = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value == null) return;
+    searchParams.append(key, String(value));
+  });
+  const query = searchParams.toString();
+  return query ? `${baseUrl}?${query}` : baseUrl;
+}
+
+function buildClientOrderId(symbol, purpose) {
+  const normalized = normalizeSymbol(symbol) || 'UNKNOWN';
+  return `${normalized}-${purpose}-${randomUUID()}`;
 }
 
 function logBuyDecision(symbol, computedNotionalUsd, decision) {
@@ -161,9 +172,12 @@ function updateInventoryFromBuy(symbol, qty, price) {
 
 async function initializeInventoryFromPositions() {
 
-  const res = await axios.get(`${ALPACA_BASE_URL}/positions`, { headers: HEADERS });
+  const res = await httpClient.get(`${ALPACA_BASE_URL}/positions`, {
+    headers: HEADERS,
+    purpose: 'get_positions',
+  });
 
-  const positions = Array.isArray(res.data) ? res.data : [];
+  const positions = Array.isArray(res) ? res : [];
 
   inventoryState.clear();
 
@@ -199,24 +213,20 @@ async function fetchRecentCfeeEntries(limit = 25) {
 
   }
 
-  const params = new URLSearchParams({
+  const res = await httpClient.get(
+    buildUrlWithParams(`${ALPACA_BASE_URL}/account/activities`, {
+      activity_types: 'CFEE',
+      direction: 'desc',
+      page_size: String(limit),
+    }),
+    {
+      headers: HEADERS,
+      purpose: 'get_account_activities',
+    }
+  );
 
-    activity_types: 'CFEE',
-
-    direction: 'desc',
-
-    page_size: String(limit),
-
-  });
-
-  const res = await axios.get(`${ALPACA_BASE_URL}/account/activities?${params.toString()}`, {
-
-    headers: HEADERS,
-
-  });
-
-  const items = Array.isArray(res.data)
-    ? res.data.map((entry) => ({
+  const items = Array.isArray(res)
+    ? res.map((entry) => ({
       ...entry,
       symbol: normalizeSymbol(entry.symbol),
     }))
@@ -348,35 +358,25 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   // submit the limit buy order
 
-  const buyRes = await axios.post(
-
+  const buyOrder = await httpClient.post(
     `${ALPACA_BASE_URL}/orders`,
-
     {
-
       symbol: normalizedSymbol,
-
       qty,
-
       side: 'buy',
-
       type: 'limit',
-
       // crypto orders must be GTC
-
       time_in_force: 'gtc',
-
       limit_price: limitPrice,
-
+      client_order_id: buildClientOrderId(normalizedSymbol, 'limit-buy'),
     },
-
-    { headers: HEADERS }
-
+    {
+      headers: HEADERS,
+      purpose: 'place_order',
+      symbol: normalizedSymbol,
+      allowRetry: true,
+    }
   );
-
- 
-
-  const buyOrder = buyRes.data;
 
  
 
@@ -386,13 +386,13 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   for (let i = 0; i < 20; i++) {
 
-    const check = await axios.get(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
-
+    const check = await httpClient.get(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
       headers: HEADERS,
-
+      purpose: 'get_order',
+      symbol: normalizedSymbol,
     });
 
-    filledOrder = check.data;
+    filledOrder = check;
 
     if (filledOrder.status === 'filled') break;
 
@@ -452,15 +452,13 @@ async function getLatestPrice(symbol) {
 
   if (isCryptoSymbol(symbol)) {
 
-    const res = await axios.get(
+    const res = await httpClient.get(`${DATA_URL}/crypto/latest/trades?symbols=${symbol}`, {
+      headers: HEADERS,
+      purpose: 'get_latest_trade',
+      symbol,
+    });
 
-      `${DATA_URL}/crypto/latest/trades?symbols=${symbol}`,
-
-      { headers: HEADERS }
-
-    );
-
-    const trade = res.data.trades && res.data.trades[symbol];
+    const trade = res.trades && res.trades[symbol];
 
     if (!trade) throw new Error(`Price not available for ${symbol}`);
 
@@ -468,15 +466,16 @@ async function getLatestPrice(symbol) {
 
   }
 
-  const res = await axios.get(
-
+  const res = await httpClient.get(
     `${STOCKS_DATA_URL}/trades/latest?symbols=${encodeURIComponent(symbol)}`,
-
-    { headers: HEADERS }
-
+    {
+      headers: HEADERS,
+      purpose: 'get_latest_trade',
+      symbol,
+    }
   );
 
-  const trade = res.data.trades && res.data.trades[symbol];
+  const trade = res.trades && res.trades[symbol];
 
   if (!trade) throw new Error(`Price not available for ${symbol}`);
 
@@ -490,11 +489,14 @@ async function getLatestPrice(symbol) {
 
 async function getAccountInfo() {
 
-  const res = await axios.get(`${ALPACA_BASE_URL}/account`, { headers: HEADERS });
+  const res = await httpClient.get(`${ALPACA_BASE_URL}/account`, {
+    headers: HEADERS,
+    purpose: 'get_account',
+  });
 
-  const portfolioValue = parseFloat(res.data.portfolio_value);
+  const portfolioValue = parseFloat(res.portfolio_value);
 
-  const buyingPower = parseFloat(res.data.buying_power);
+  const buyingPower = parseFloat(res.buying_power);
 
   return {
 
@@ -558,22 +560,21 @@ async function getLatestQuote(rawSymbol) {
 
   let res;
   try {
-    res = await axios.get(url, { headers: HEADERS });
-  } catch (err) {
-    const statusCode = err?.response?.status ?? null;
-    const responseSnippet = getResponseSnippet(err?.response?.data);
-    console.warn('quote_fetch_failed', {
+    res = await httpClient.get(url, {
+      headers: HEADERS,
+      purpose: 'quote_fetch',
       symbol,
-      url,
-      statusCode,
-      errorMessage: err?.message || err,
-      responseSnippet,
     });
-    logSkip('no_quote', { symbol, reason: 'api_error' });
+  } catch (err) {
+    if (err?.errorCode === 'COOLDOWN') {
+      logSkip('no_quote', { symbol, reason: 'cooldown' });
+    } else {
+      logSkip('no_quote', { symbol, reason: 'api_error' });
+    }
     throw err;
   }
 
-  const quote = res.data.quotes && res.data.quotes[symbol];
+  const quote = res.quotes && res.quotes[symbol];
   if (!quote) {
     const reason = staleCache ? 'stale_cache' : 'no_data';
     logSkip('no_quote', { symbol, reason });
@@ -602,9 +603,12 @@ async function getLatestQuote(rawSymbol) {
 
 async function fetchOrderById(orderId) {
 
-  const response = await axios.get(`${ALPACA_BASE_URL}/orders/${orderId}`, { headers: HEADERS });
+  const response = await httpClient.get(`${ALPACA_BASE_URL}/orders/${orderId}`, {
+    headers: HEADERS,
+    purpose: 'get_order',
+  });
 
-  return response.data;
+  return response;
 
 }
 
@@ -618,7 +622,7 @@ async function cancelOrderSafe(orderId) {
 
   } catch (err) {
 
-    console.warn('cancel_order_failed', { orderId, error: err?.response?.data || err.message });
+    console.warn('cancel_order_failed', { orderId, error: err?.responseSnippet || err.message });
 
     return false;
 
@@ -638,7 +642,7 @@ async function submitLimitSell({
 
 }) {
 
-  const response = await axios.post(
+  const response = await httpClient.post(
 
     `${ALPACA_BASE_URL}/orders`,
 
@@ -655,16 +659,22 @@ async function submitLimitSell({
       time_in_force: 'gtc',
 
       limit_price: limitPrice,
+      client_order_id: buildClientOrderId(symbol, 'limit-sell'),
 
     },
 
-    { headers: HEADERS }
+    {
+      headers: HEADERS,
+      purpose: 'place_order',
+      symbol,
+      allowRetry: true,
+    }
 
   );
 
-  console.log('submit_limit_sell', { symbol, qty, limitPrice, reason, orderId: response.data?.id });
+  console.log('submit_limit_sell', { symbol, qty, limitPrice, reason, orderId: response?.id });
 
-  return response.data;
+  return response;
 
 }
 
@@ -678,7 +688,7 @@ async function submitMarketSell({
 
 }) {
 
-  const response = await axios.post(
+  const response = await httpClient.post(
 
     `${ALPACA_BASE_URL}/orders`,
 
@@ -693,16 +703,22 @@ async function submitMarketSell({
       type: 'market',
 
       time_in_force: 'gtc',
+      client_order_id: buildClientOrderId(symbol, 'market-sell'),
 
     },
 
-    { headers: HEADERS }
+    {
+      headers: HEADERS,
+      purpose: 'place_order',
+      symbol,
+      allowRetry: true,
+    }
 
   );
 
-  console.log('submit_market_sell', { symbol, qty, reason, orderId: response.data?.id });
+  console.log('submit_market_sell', { symbol, qty, reason, orderId: response?.id });
 
-  return response.data;
+  return response;
 
 }
 
@@ -1145,31 +1161,23 @@ async function placeMarketBuyThenSell(symbol) {
 
  
 
-  const buyRes = await axios.post(
-
+  const buyOrder = await httpClient.post(
     `${ALPACA_BASE_URL}/orders`,
-
     {
-
       symbol: normalizedSymbol,
-
       qty,
-
       side: 'buy',
-
       type: 'market',
-
       time_in_force: 'gtc',
-
+      client_order_id: buildClientOrderId(normalizedSymbol, 'market-buy'),
     },
-
-    { headers: HEADERS }
-
+    {
+      headers: HEADERS,
+      purpose: 'place_order',
+      symbol: normalizedSymbol,
+      allowRetry: true,
+    }
   );
-
- 
-
-  const buyOrder = buyRes.data;
 
  
 
@@ -1179,13 +1187,13 @@ async function placeMarketBuyThenSell(symbol) {
 
   for (let i = 0; i < 20; i++) {
 
-    const chk = await axios.get(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
-
+    const chk = await httpClient.get(`${ALPACA_BASE_URL}/orders/${buyOrder.id}`, {
       headers: HEADERS,
-
+      purpose: 'get_order',
+      symbol: normalizedSymbol,
     });
 
-    filled = chk.data;
+    filled = chk;
 
     if (filled.status === 'filled') break;
 
@@ -1233,7 +1241,7 @@ async function placeMarketBuyThenSell(symbol) {
 
   } catch (err) {
 
-    console.error('Sell order failed:', err?.response?.data || err.message);
+    console.error('Sell order failed:', err?.responseSnippet || err.message);
 
     return { buy: filled, sell: null, sellError: err.message };
 
@@ -1313,43 +1321,40 @@ async function submitOrder(order = {}) {
 
   }
 
-  const response = await axios.post(
-
+  const response = await httpClient.post(
     `${ALPACA_BASE_URL}/orders`,
-
     {
-
       symbol: normalizedSymbol,
-
       qty,
-
       side,
-
       type,
-
       time_in_force,
-
       limit_price,
-
       notional,
-
+      client_order_id: buildClientOrderId(normalizedSymbol, 'order'),
     },
-
-    { headers: HEADERS }
-
+    {
+      headers: HEADERS,
+      purpose: 'place_order',
+      symbol: normalizedSymbol,
+      allowRetry: true,
+    }
   );
 
-  return response.data;
+  return response;
 
 }
 
 async function fetchOrders(params = {}) {
 
-  const response = await axios.get(`${ALPACA_BASE_URL}/orders`, { headers: HEADERS, params });
+  const response = await httpClient.get(buildUrlWithParams(`${ALPACA_BASE_URL}/orders`, params), {
+    headers: HEADERS,
+    purpose: 'get_orders',
+  });
 
-  if (Array.isArray(response.data)) {
+  if (Array.isArray(response)) {
 
-    return response.data.map((order) => ({
+    return response.map((order) => ({
 
       ...order,
 
@@ -1359,13 +1364,16 @@ async function fetchOrders(params = {}) {
 
   }
 
-  return response.data;
+  return response;
 
 }
 
 async function fetchOpenPositions() {
-  const res = await axios.get(`${ALPACA_BASE_URL}/positions`, { headers: HEADERS });
-  const positions = Array.isArray(res.data) ? res.data : [];
+  const res = await httpClient.get(`${ALPACA_BASE_URL}/positions`, {
+    headers: HEADERS,
+    purpose: 'get_positions',
+  });
+  const positions = Array.isArray(res) ? res : [];
   return positions
     .map((pos) => ({
       symbol: normalizeSymbol(pos.symbol),
@@ -1431,9 +1439,12 @@ function getLastQuoteSnapshot() {
 
 async function cancelOrder(orderId) {
 
-  const response = await axios.delete(`${ALPACA_BASE_URL}/orders/${orderId}`, { headers: HEADERS });
+  const response = await httpClient.del(`${ALPACA_BASE_URL}/orders/${orderId}`, {
+    headers: HEADERS,
+    purpose: 'cancel_order',
+  });
 
-  return response.data;
+  return response;
 
 }
 

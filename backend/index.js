@@ -12,6 +12,8 @@ const {
   getConcurrencyGuardStatus,
   getLastQuoteSnapshot,
 } = require('./trade');
+const { getLimiterStatus } = require('./limiters');
+const { getFailureSnapshot } = require('./symbolFailures');
 
 const app = express();
 
@@ -33,7 +35,7 @@ app.post('/trade', async (req, res) => {
 
   } catch (err) {
 
-    console.error('Trade error:', err?.response?.data || err.message);
+    console.error('Trade error:', err?.responseSnippet || err.message);
 
     res.status(500).json({ error: err.message });
 
@@ -64,7 +66,7 @@ app.post('/buy', async (req, res) => {
 
   } catch (error) {
 
-    console.error('Buy error:', error?.response?.data || error.message);
+    console.error('Buy error:', error?.responseSnippet || error.message);
 
     res.status(500).json({ error: error.message });
 
@@ -77,7 +79,7 @@ app.get('/orders', async (req, res) => {
     const orders = await fetchOrders(req.query || {});
     res.json(orders);
   } catch (error) {
-    console.error('Orders fetch error:', error?.response?.data || error.message);
+    console.error('Orders fetch error:', error?.responseSnippet || error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -87,7 +89,7 @@ app.post('/orders', async (req, res) => {
     const result = await submitOrder(req.body || {});
     res.json(result);
   } catch (error) {
-    console.error('Order submit error:', error?.response?.data || error.message);
+    console.error('Order submit error:', error?.responseSnippet || error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -97,7 +99,7 @@ app.delete('/orders/:id', async (req, res) => {
     const result = await cancelOrder(req.params.id);
     res.json(result || { canceled: true, id: req.params.id });
   } catch (error) {
-    console.error('Order cancel error:', error?.response?.data || error.message);
+    console.error('Order cancel error:', error?.responseSnippet || error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -115,7 +117,19 @@ app.get('/debug/status', async (req, res) => {
       lastQuoteAt,
     });
   } catch (error) {
-    console.error('Status debug error:', error?.response?.data || error.message);
+    console.error('Status debug error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/debug/net', (req, res) => {
+  try {
+    res.json({
+      limiters: getLimiterStatus(),
+      failures: getFailureSnapshot(),
+    });
+  } catch (error) {
+    console.error('Net debug error:', error?.responseSnippet || error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -134,7 +148,7 @@ initializeInventoryFromPositions()
 
   .catch((err) => {
 
-    console.error('Failed to initialize inventory', err?.response?.data || err.message);
+    console.error('Failed to initialize inventory', err?.responseSnippet || err.message);
 
   })
 
