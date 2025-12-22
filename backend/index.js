@@ -11,6 +11,8 @@ const {
   startExitManager,
   getConcurrencyGuardStatus,
   getLastQuoteSnapshot,
+  getAlpacaAuthStatus,
+  getLastHttpError,
 } = require('./trade');
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
@@ -108,6 +110,7 @@ app.get('/debug/status', async (req, res) => {
   try {
     const guardStatus = await getConcurrencyGuardStatus();
     const lastQuoteAt = getLastQuoteSnapshot();
+    const authStatus = getAlpacaAuthStatus();
     res.json({
       openPositions: guardStatus.openPositions,
       openOrders: guardStatus.openOrders,
@@ -115,6 +118,11 @@ app.get('/debug/status', async (req, res) => {
       capMax: guardStatus.capMax,
       lastScanAt: guardStatus.lastScanAt,
       lastQuoteAt,
+      alpacaAuthOk: authStatus.alpacaAuthOk,
+      alpacaKeyIdPresent: authStatus.alpacaKeyIdPresent,
+      lastHttpError: getLastHttpError(),
+      nodeVersion: process.version,
+      portPresent: Boolean(process.env.PORT),
     });
   } catch (error) {
     console.error('Status debug error:', error?.responseSnippet || error.message);
