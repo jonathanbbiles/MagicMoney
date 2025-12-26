@@ -15,6 +15,7 @@ function normalizeDataBase(baseUrl) {
   if (!baseUrl) return 'https://data.alpaca.markets';
   let trimmed = baseUrl.replace(/\/+$/, '');
   trimmed = trimmed.replace(/\/v1beta2$/, '');
+  trimmed = trimmed.replace(/\/v1beta3$/, '');
   trimmed = trimmed.replace(/\/v2\/stocks$/, '');
   trimmed = trimmed.replace(/\/v2$/, '');
   return trimmed;
@@ -23,8 +24,9 @@ function normalizeDataBase(baseUrl) {
 const TRADE_BASE = normalizeTradeBase(RAW_TRADE_BASE);
 const DATA_BASE = normalizeDataBase(RAW_DATA_BASE);
 const ALPACA_BASE_URL = `${TRADE_BASE}/v2`;
-const DATA_URL = `${DATA_BASE}/v1beta2`;
+const DATA_URL = `${DATA_BASE}/v1beta3`;
 const STOCKS_DATA_URL = `${DATA_BASE}/v2/stocks`;
+const CRYPTO_DATA_URL = `${DATA_URL}/crypto`;
 
 const resolvedAlpacaAuth = (() => {
   const envStatus = {
@@ -72,6 +74,11 @@ function alpacaJsonHeaders() {
  
 
 const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 15);
+const MIN_TRADE_QTY = Number(process.env.MIN_TRADE_QTY || 1e-6);
+const MARKET_DATA_TIMEOUT_MS = Number(process.env.MARKET_DATA_TIMEOUT_MS || 9000);
+const MARKET_DATA_RETRIES = Number(process.env.MARKET_DATA_RETRIES || 2);
+const MARKET_DATA_FAILURE_LIMIT = Number(process.env.MARKET_DATA_FAILURE_LIMIT || 5);
+const MARKET_DATA_COOLDOWN_MS = Number(process.env.MARKET_DATA_COOLDOWN_MS || 60000);
 
 const USER_MIN_PROFIT_BPS = Number(process.env.USER_MIN_PROFIT_BPS || 5);
 
@@ -99,6 +106,11 @@ const quoteCache = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let lastHttpError = null;
+const marketDataState = {
+  consecutiveFailures: 0,
+  cooldownUntil: 0,
+  cooldownLoggedAt: 0,
+};
 
  
 
@@ -112,6 +124,60 @@ function logSkip(reason, details = {}) {
 
   console.log(`Skip — ${reason}`, details);
 
+}
+
+function buildAlpacaUrl({ baseUrl, path, params, label }) {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  const cleanPath = String(path || '').replace(/^\/+/, '');
+  const url = new URL(`${base}/${cleanPath}`);
+  if (params) {
+    Object.entries(params).forEach(([key, value]) => {
+      if (value == null) return;
+      url.searchParams.set(key, String(value));
+    });
+  }
+  const finalUrl = url.toString();
+  console.log('alpaca_request_url', { label, url: finalUrl });
+  return finalUrl;
+}
+
+function normalizeDataSymbol(rawSymbol) {
+  if (!rawSymbol) return rawSymbol;
+  const symbol = String(rawSymbol).trim().toUpperCase();
+  if (symbol.includes('/')) {
+    return symbol.replace(/\/+/g, '/');
+  }
+  if (symbol.endsWith('USD') && symbol.length > 3) {
+    return `${symbol.slice(0, -3)}/USD`;
+  }
+  return symbol;
+}
+
+function isMarketDataCooldown() {
+  return Date.now() < marketDataState.cooldownUntil;
+}
+
+function markMarketDataFailure() {
+  marketDataState.consecutiveFailures += 1;
+  if (marketDataState.consecutiveFailures >= MARKET_DATA_FAILURE_LIMIT && !isMarketDataCooldown()) {
+    marketDataState.cooldownUntil = Date.now() + MARKET_DATA_COOLDOWN_MS;
+    marketDataState.cooldownLoggedAt = Date.now();
+    console.error('DATA DOWN — pausing scans 60s');
+  }
+}
+
+function markMarketDataSuccess() {
+  marketDataState.consecutiveFailures = 0;
+}
+
+function logMarketDataDiagnostics({ type, url, statusCode, snippet, errorType }) {
+  console.log('alpaca_marketdata', {
+    type,
+    url,
+    statusCode,
+    errorType,
+    snippet,
+  });
 }
 
 function logHttpError({ symbol, phase, url, error }) {
@@ -155,6 +221,57 @@ async function requestJson({
     throw result.error;
   }
 
+  return result.data;
+}
+
+async function requestMarketDataJson({ type, url, symbol }) {
+  if (isMarketDataCooldown()) {
+    const err = new Error('Market data cooldown active');
+    err.errorCode = 'COOLDOWN';
+    logMarketDataDiagnostics({
+      type,
+      url,
+      statusCode: null,
+      snippet: '',
+      errorType: 'cooldown',
+    });
+    throw err;
+  }
+
+  const result = await httpJson({
+    method: 'GET',
+    url,
+    headers: alpacaHeaders(),
+    timeoutMs: MARKET_DATA_TIMEOUT_MS,
+    retries: MARKET_DATA_RETRIES,
+  });
+
+  if (result.error) {
+    const errorType = result.error.isNetworkError || result.error.isTimeout ? 'network' : 'http';
+    logMarketDataDiagnostics({
+      type,
+      url,
+      statusCode: result.error.statusCode ?? null,
+      snippet: result.error.responseSnippet200 || '',
+      errorType,
+    });
+    markMarketDataFailure();
+    lastHttpError = result.error;
+    const err = new Error(result.error.errorMessage || 'Market data request failed');
+    err.errorCode = errorType === 'network' ? 'NETWORK' : 'HTTP_ERROR';
+    err.statusCode = result.error.statusCode ?? null;
+    err.responseSnippet200 = result.error.responseSnippet200 || '';
+    throw err;
+  }
+
+  logMarketDataDiagnostics({
+    type,
+    url,
+    statusCode: result.statusCode ?? 200,
+    snippet: '',
+    errorType: 'ok',
+  });
+  markMarketDataSuccess();
   return result.data;
 }
 
@@ -269,7 +386,7 @@ function updateInventoryFromBuy(symbol, qty, price) {
 }
 
 async function initializeInventoryFromPositions() {
-  const url = `${ALPACA_BASE_URL}/positions`;
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions_init' });
   let res;
   try {
     res = await requestJson({
@@ -324,10 +441,15 @@ async function fetchRecentCfeeEntries(limit = 25) {
 
   }
 
-  const url = buildUrlWithParams(`${ALPACA_BASE_URL}/account/activities`, {
-    activity_types: 'CFEE',
-    direction: 'desc',
-    page_size: String(limit),
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'account/activities',
+    params: {
+      activity_types: 'CFEE',
+      direction: 'desc',
+      page_size: String(limit),
+    },
+    label: 'account_activities_cfee',
   });
   let res;
   try {
@@ -472,9 +594,26 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   }
 
+  const sizeGuard = guardTradeSize({
+    symbol: normalizedSymbol,
+    qty,
+    notional: intendedNotional,
+    price: Number(limitPrice),
+    side: 'buy',
+    context: 'limit_buy',
+  });
+  if (sizeGuard.skip) {
+    return { skipped: true, reason: 'below_min_trade', notionalUsd: sizeGuard.notional };
+  }
+  const finalQty = sizeGuard.qty ?? qty;
+
   // submit the limit buy order
 
-  const buyOrderUrl = `${ALPACA_BASE_URL}/orders`;
+  const buyOrderUrl = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'orders',
+    label: 'orders_limit_buy',
+  });
   let buyOrder;
   try {
     buyOrder = await requestJson({
@@ -483,7 +622,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
       headers: alpacaJsonHeaders(),
       body: JSON.stringify({
         symbol: normalizedSymbol,
-        qty,
+        qty: finalQty,
         side: 'buy',
         type: 'limit',
         // crypto orders must be GTC
@@ -510,7 +649,11 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   for (let i = 0; i < 20; i++) {
 
-    const checkUrl = `${ALPACA_BASE_URL}/orders/${buyOrder.id}`;
+    const checkUrl = buildAlpacaUrl({
+      baseUrl: ALPACA_BASE_URL,
+      path: `orders/${buyOrder.id}`,
+      label: 'orders_limit_buy_check',
+    });
     let check;
     try {
       check = await requestJson({
@@ -587,43 +730,56 @@ function isCryptoSymbol(symbol) {
 async function getLatestPrice(symbol) {
 
   if (isCryptoSymbol(symbol)) {
-    const url = `${DATA_URL}/crypto/latest/trades?symbols=${symbol}`;
+    const dataSymbol = normalizeDataSymbol(symbol);
+    const url = buildAlpacaUrl({
+      baseUrl: CRYPTO_DATA_URL,
+      path: 'us/latest/trades',
+      params: { symbols: dataSymbol },
+      label: 'crypto_latest_trades',
+    });
     let res;
     try {
-      res = await requestJson({
-        method: 'GET',
-        url,
-        headers: alpacaHeaders(),
-      });
+      res = await requestMarketDataJson({ type: 'TRADE', url, symbol });
     } catch (err) {
       logHttpError({ symbol, phase: 'quote', url, error: err });
+      logSkip('no_quote', { symbol, reason: err?.errorCode === 'COOLDOWN' ? 'cooldown' : 'request_failed' });
       throw err;
     }
 
-    const trade = res.trades && res.trades[symbol];
+    const trade = res.trades && res.trades[dataSymbol];
 
-    if (!trade) throw new Error(`Price not available for ${symbol}`);
+    if (!trade) {
+      markMarketDataFailure();
+      logSkip('no_quote', { symbol, reason: 'no_data' });
+      throw new Error(`Price not available for ${symbol}`);
+    }
 
     return parseFloat(trade.p);
 
   }
 
-  const url = `${STOCKS_DATA_URL}/trades/latest?symbols=${encodeURIComponent(symbol)}`;
+  const url = buildAlpacaUrl({
+    baseUrl: STOCKS_DATA_URL,
+    path: 'trades/latest',
+    params: { symbols: symbol },
+    label: 'stock_latest_trades',
+  });
   let res;
   try {
-    res = await requestJson({
-      method: 'GET',
-      url,
-      headers: alpacaHeaders(),
-    });
+    res = await requestMarketDataJson({ type: 'TRADE', url, symbol });
   } catch (err) {
     logHttpError({ symbol, phase: 'quote', url, error: err });
+    logSkip('no_quote', { symbol, reason: err?.errorCode === 'COOLDOWN' ? 'cooldown' : 'request_failed' });
     throw err;
   }
 
   const trade = res.trades && res.trades[symbol];
 
-  if (!trade) throw new Error(`Price not available for ${symbol}`);
+  if (!trade) {
+    markMarketDataFailure();
+    logSkip('no_quote', { symbol, reason: 'no_data' });
+    throw new Error(`Price not available for ${symbol}`);
+  }
 
   return parseFloat(trade.p ?? trade.price);
 
@@ -634,7 +790,7 @@ async function getLatestPrice(symbol) {
 // Get portfolio value and buying power from the Alpaca account
 
 async function getAccountInfo() {
-  const url = `${ALPACA_BASE_URL}/account`;
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'account', label: 'account' });
   let res;
   try {
     res = await requestJson({
@@ -667,8 +823,47 @@ async function getAccountInfo() {
 
 function roundQty(qty) {
 
-  return parseFloat(Number(qty).toFixed(8));
+  return parseFloat(Number(qty).toFixed(9));
 
+}
+
+function roundNotional(notional) {
+  return parseFloat(Number(notional).toFixed(2));
+}
+
+function guardTradeSize({ symbol, qty, notional, price, side, context }) {
+  const qtyNum = Number(qty);
+  const notionalNum = Number(notional);
+  const roundedQty = Number.isFinite(qtyNum) ? roundQty(qtyNum) : null;
+  const roundedNotional = Number.isFinite(notionalNum) ? roundNotional(notionalNum) : null;
+  let computedNotional = roundedNotional;
+  if (!Number.isFinite(computedNotional) && Number.isFinite(roundedQty) && Number.isFinite(price)) {
+    computedNotional = roundNotional(roundedQty * price);
+  }
+
+  if (Number.isFinite(roundedQty) && roundedQty > 0 && roundedQty < MIN_TRADE_QTY) {
+    logSkip('below_min_trade', {
+      symbol,
+      side,
+      qty: roundedQty,
+      minQty: MIN_TRADE_QTY,
+      context,
+    });
+    return { skip: true, qty: roundedQty, notional: computedNotional };
+  }
+
+  if (Number.isFinite(computedNotional) && computedNotional < MIN_ORDER_NOTIONAL_USD) {
+    logSkip('below_min_trade', {
+      symbol,
+      side,
+      notionalUsd: computedNotional,
+      minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
+      context,
+    });
+    return { skip: true, qty: roundedQty, notional: computedNotional };
+  }
+
+  return { skip: false, qty: roundedQty ?? qty, notional: roundedNotional ?? notional, computedNotional };
 }
 
  
@@ -709,32 +904,41 @@ async function getLatestQuote(rawSymbol) {
   }
 
   const isCrypto = isCryptoSymbol(symbol);
+  const dataSymbol = isCrypto ? normalizeDataSymbol(symbol) : symbol;
   const url = isCrypto
-    ? `${DATA_URL}/crypto/latest/quotes?symbols=${symbol}`
-    : `${STOCKS_DATA_URL}/quotes/latest?symbols=${encodeURIComponent(symbol)}`;
+    ? buildAlpacaUrl({
+      baseUrl: CRYPTO_DATA_URL,
+      path: 'us/latest/quotes',
+      params: { symbols: dataSymbol },
+      label: 'crypto_latest_quotes',
+    })
+    : buildAlpacaUrl({
+      baseUrl: STOCKS_DATA_URL,
+      path: 'quotes/latest',
+      params: { symbols: symbol },
+      label: 'stock_latest_quotes',
+    });
 
   let res;
   try {
-    res = await requestJson({
-      method: 'GET',
-      url,
-      headers: alpacaHeaders(),
-    });
+    res = await requestMarketDataJson({ type: 'QUOTE', url, symbol });
   } catch (err) {
     logHttpError({ symbol, phase: 'quote', url, error: err });
     if (err?.errorCode === 'COOLDOWN') {
       logSkip('no_quote', { symbol, reason: 'cooldown' });
     } else {
-      logSkip('no_quote', { symbol, reason: 'api_error' });
+      logSkip('no_quote', { symbol, reason: 'request_failed' });
     }
-    recordLastQuoteAt(symbol, { tsMs: cachedTsMs, source: 'error', reason: 'api_error' });
+    recordLastQuoteAt(symbol, { tsMs: cachedTsMs, source: 'error', reason: 'request_failed' });
     throw err;
   }
 
-  const quote = res.quotes && res.quotes[symbol];
+  const quoteKey = isCrypto ? dataSymbol : symbol;
+  const quote = res.quotes && res.quotes[quoteKey];
   if (!quote) {
     const reason = staleCache ? 'stale_cache' : 'no_data';
     logSkip('no_quote', { symbol, reason });
+    markMarketDataFailure();
     recordLastQuoteAt(symbol, {
       tsMs: staleCache ? cachedTsMs : null,
       source: staleCache ? 'stale' : 'error',
@@ -764,7 +968,11 @@ async function getLatestQuote(rawSymbol) {
 }
 
 async function fetchOrderById(orderId) {
-  const url = `${ALPACA_BASE_URL}/orders/${orderId}`;
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: `orders/${orderId}`,
+    label: 'orders_get',
+  });
   let response;
   try {
     response = await requestJson({
@@ -814,7 +1022,19 @@ async function submitLimitSell({
 
 }) {
 
-  const url = `${ALPACA_BASE_URL}/orders`;
+  const sizeGuard = guardTradeSize({
+    symbol,
+    qty,
+    price: Number(limitPrice),
+    side: 'sell',
+    context: 'limit_sell',
+  });
+  if (sizeGuard.skip) {
+    return { skipped: true, reason: 'below_min_trade' };
+  }
+  const finalQty = sizeGuard.qty ?? qty;
+
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_limit_sell' });
   let response;
   try {
     response = await requestJson({
@@ -823,7 +1043,7 @@ async function submitLimitSell({
       headers: alpacaJsonHeaders(),
       body: JSON.stringify({
         symbol,
-        qty,
+        qty: finalQty,
         side: 'sell',
         type: 'limit',
         time_in_force: 'gtc',
@@ -852,7 +1072,18 @@ async function submitMarketSell({
 
 }) {
 
-  const url = `${ALPACA_BASE_URL}/orders`;
+  const sizeGuard = guardTradeSize({
+    symbol,
+    qty,
+    side: 'sell',
+    context: 'market_sell',
+  });
+  if (sizeGuard.skip) {
+    return { skipped: true, reason: 'below_min_trade' };
+  }
+  const finalQty = sizeGuard.qty ?? qty;
+
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_market_sell' });
   let response;
   try {
     response = await requestJson({
@@ -861,7 +1092,7 @@ async function submitMarketSell({
       headers: alpacaJsonHeaders(),
       body: JSON.stringify({
         symbol,
-        qty,
+        qty: finalQty,
         side: 'sell',
         type: 'market',
         time_in_force: 'gtc',
@@ -1316,9 +1547,24 @@ async function placeMarketBuyThenSell(symbol) {
 
   }
 
- 
+  const sizeGuard = guardTradeSize({
+    symbol: normalizedSymbol,
+    qty,
+    notional: amountToSpend,
+    price,
+    side: 'buy',
+    context: 'market_buy',
+  });
+  if (sizeGuard.skip) {
+    return { skipped: true, reason: 'below_min_trade', notionalUsd: sizeGuard.notional };
+  }
+  const finalQty = sizeGuard.qty ?? qty;
 
-  const buyOrderUrl = `${ALPACA_BASE_URL}/orders`;
+  const buyOrderUrl = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'orders',
+    label: 'orders_market_buy',
+  });
   let buyOrder;
   try {
     buyOrder = await requestJson({
@@ -1327,7 +1573,7 @@ async function placeMarketBuyThenSell(symbol) {
       headers: alpacaJsonHeaders(),
       body: JSON.stringify({
         symbol: normalizedSymbol,
-        qty,
+        qty: finalQty,
         side: 'buy',
         type: 'market',
         time_in_force: 'gtc',
@@ -1352,7 +1598,11 @@ async function placeMarketBuyThenSell(symbol) {
 
   for (let i = 0; i < 20; i++) {
 
-    const checkUrl = `${ALPACA_BASE_URL}/orders/${buyOrder.id}`;
+    const checkUrl = buildAlpacaUrl({
+      baseUrl: ALPACA_BASE_URL,
+      path: `orders/${buyOrder.id}`,
+      label: 'orders_market_buy_check',
+    });
     let chk;
     try {
       chk = await requestJson({
@@ -1449,14 +1699,12 @@ async function submitOrder(order = {}) {
   const normalizedSymbol = normalizeSymbol(rawSymbol);
 
   const sideLower = String(side || '').toLowerCase();
+  const qtyNum = Number(qty);
+  const limitPriceNum = Number(limit_price);
 
   let computedNotionalUsd = Number(notional);
 
   if (!Number.isFinite(computedNotionalUsd) || computedNotionalUsd <= 0) {
-
-    const qtyNum = Number(qty);
-
-    const limitPriceNum = Number(limit_price);
 
     if (Number.isFinite(qtyNum) && qtyNum > 0 && Number.isFinite(limitPriceNum) && limitPriceNum > 0) {
 
@@ -1498,7 +1746,21 @@ async function submitOrder(order = {}) {
 
   }
 
-  const url = `${ALPACA_BASE_URL}/orders`;
+  const sizeGuard = guardTradeSize({
+    symbol: normalizedSymbol,
+    qty: qtyNum,
+    notional: Number.isFinite(computedNotionalUsd) ? computedNotionalUsd : notional,
+    price: Number.isFinite(limitPriceNum) ? limitPriceNum : null,
+    side: sideLower,
+    context: 'submit_order',
+  });
+  if (sizeGuard.skip) {
+    return { skipped: true, reason: 'below_min_trade', notionalUsd: sizeGuard.notional };
+  }
+  const finalQty = sizeGuard.qty ?? qty;
+  const finalNotional = sizeGuard.notional ?? notional;
+
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_submit' });
   let response;
   try {
     response = await requestJson({
@@ -1507,12 +1769,12 @@ async function submitOrder(order = {}) {
       headers: alpacaJsonHeaders(),
       body: JSON.stringify({
         symbol: normalizedSymbol,
-        qty,
+        qty: finalQty,
         side,
         type,
         time_in_force,
         limit_price,
-        notional,
+        notional: finalNotional,
         client_order_id: buildClientOrderId(normalizedSymbol, 'order'),
       }),
     });
@@ -1526,7 +1788,12 @@ async function submitOrder(order = {}) {
 }
 
 async function fetchOrders(params = {}) {
-  const url = buildUrlWithParams(`${ALPACA_BASE_URL}/orders`, params);
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'orders',
+    params,
+    label: 'orders_list',
+  });
   let response;
   try {
     response = await requestJson({
@@ -1556,7 +1823,7 @@ async function fetchOrders(params = {}) {
 }
 
 async function fetchOpenPositions() {
-  const url = `${ALPACA_BASE_URL}/positions`;
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions_list' });
   let res;
   try {
     res = await requestJson({
@@ -1699,7 +1966,11 @@ function getLastHttpError() {
 }
 
 async function cancelOrder(orderId) {
-  const url = `${ALPACA_BASE_URL}/orders/${orderId}`;
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: `orders/${orderId}`,
+    label: 'orders_cancel',
+  });
   let response;
   try {
     response = await requestJson({
@@ -1718,9 +1989,14 @@ async function cancelOrder(orderId) {
 
 async function getAlpacaConnectivityStatus() {
   const hasAuth = resolvedAlpacaAuth.alpacaAuthOk;
-  const tradeUrl = `${ALPACA_BASE_URL}/account`;
+  const tradeUrl = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'account', label: 'account_health' });
   const dataSymbol = 'AAPL';
-  const dataUrl = `${STOCKS_DATA_URL}/quotes/latest?symbols=${encodeURIComponent(dataSymbol)}`;
+  const dataUrl = buildAlpacaUrl({
+    baseUrl: STOCKS_DATA_URL,
+    path: 'quotes/latest',
+    params: { symbols: dataSymbol },
+    label: 'stocks_health_quote',
+  });
 
   const tradeResult = await httpJson({
     method: 'GET',
