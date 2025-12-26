@@ -28,21 +28,40 @@ const DATA_URL = `${DATA_BASE}/v1beta3`;
 const STOCKS_DATA_URL = `${DATA_BASE}/v2/stocks`;
 const CRYPTO_DATA_URL = `${DATA_URL}/crypto`;
 
+const ALPACA_KEY_ENV_VARS = ['APCA_API_KEY_ID', 'ALPACA_KEY_ID', 'ALPACA_API_KEY_ID', 'ALPACA_API_KEY'];
+const ALPACA_SECRET_ENV_VARS = ['APCA_API_SECRET_KEY', 'ALPACA_SECRET_KEY', 'ALPACA_API_SECRET_KEY'];
+
 const resolvedAlpacaAuth = (() => {
   const envStatus = {
     ALPACA_KEY_ID: Boolean(process.env.ALPACA_KEY_ID),
     ALPACA_SECRET_KEY: Boolean(process.env.ALPACA_SECRET_KEY),
     APCA_API_KEY_ID: Boolean(process.env.APCA_API_KEY_ID),
     APCA_API_SECRET_KEY: Boolean(process.env.APCA_API_SECRET_KEY),
+    ALPACA_API_KEY_ID: Boolean(process.env.ALPACA_API_KEY_ID),
     ALPACA_API_KEY: Boolean(process.env.ALPACA_API_KEY),
   };
   console.log('alpaca_auth_env', envStatus);
   const keyId =
-    process.env.ALPACA_KEY_ID ||
     process.env.APCA_API_KEY_ID ||
+    process.env.ALPACA_KEY_ID ||
+    process.env.ALPACA_API_KEY_ID ||
     process.env.ALPACA_API_KEY ||
     '';
-  const secretKey = process.env.ALPACA_SECRET_KEY || process.env.APCA_API_SECRET_KEY || '';
+  const secretKey =
+    process.env.APCA_API_SECRET_KEY ||
+    process.env.ALPACA_SECRET_KEY ||
+    process.env.ALPACA_API_SECRET_KEY ||
+    '';
+  if (!keyId || !secretKey) {
+    const missing = [];
+    if (!keyId) missing.push('key id');
+    if (!secretKey) missing.push('secret key');
+    throw new Error(
+      `Missing Alpaca ${missing.join(' and ')}. Checked env vars: key id -> ${ALPACA_KEY_ENV_VARS.join(
+        ', '
+      )}; secret -> ${ALPACA_SECRET_ENV_VARS.join(', ')}.`
+    );
+  }
   const alpacaKeyIdPresent = Boolean(keyId);
   const alpacaAuthOk = Boolean(keyId && secretKey);
   return {
@@ -54,7 +73,7 @@ const resolvedAlpacaAuth = (() => {
 })();
 
 function alpacaHeaders() {
-  const headers = {};
+  const headers = { Accept: 'application/json' };
   if (resolvedAlpacaAuth.keyId) {
     headers['APCA-API-KEY-ID'] = resolvedAlpacaAuth.keyId;
   }
@@ -67,6 +86,7 @@ function alpacaHeaders() {
 function alpacaJsonHeaders() {
   return {
     'Content-Type': 'application/json',
+    Accept: 'application/json',
     ...alpacaHeaders(),
   };
 }
@@ -170,27 +190,48 @@ function markMarketDataSuccess() {
   marketDataState.consecutiveFailures = 0;
 }
 
+function formatLogUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.host}${parsed.pathname}${parsed.search}`;
+  } catch (err) {
+    return url;
+  }
+}
+
+function getMarketDataLabel(type) {
+  const normalized = String(type || '').toUpperCase();
+  if (normalized === 'QUOTE' || normalized === 'QUOTES') return 'quotes';
+  if (normalized === 'TRADE' || normalized === 'TRADES') return 'trades';
+  if (normalized === 'BAR' || normalized === 'BARS') return 'bars';
+  return normalized.toLowerCase() || 'marketdata';
+}
+
 function logMarketDataDiagnostics({ type, url, statusCode, snippet, errorType }) {
+  const label = getMarketDataLabel(type);
   console.log('alpaca_marketdata', {
+    label,
     type,
-    url,
+    url: formatLogUrl(url),
     statusCode,
     errorType,
     snippet,
   });
 }
 
-function logHttpError({ symbol, phase, url, error }) {
+function logHttpError({ symbol, label, url, error }) {
   const statusCode = error?.statusCode ?? null;
   const errorMessage = error?.errorMessage || error?.message || 'Unknown error';
   const snippet = error?.responseSnippet200 || '';
   const method = error?.method || null;
+  const errorType = error?.isNetworkError || error?.isTimeout ? 'network' : 'http';
   console.error('alpaca_http_error', {
     symbol,
-    phase,
+    label,
     method,
-    url,
+    url: formatLogUrl(url),
     statusCode,
+    errorType,
     errorMessage,
     snippet,
   });
@@ -395,7 +436,7 @@ async function initializeInventoryFromPositions() {
       headers: alpacaHeaders(),
     });
   } catch (err) {
-    logHttpError({ phase: 'positions', url, error: err });
+    logHttpError({ label: 'positions', url, error: err });
     throw err;
   }
 
@@ -459,7 +500,7 @@ async function fetchRecentCfeeEntries(limit = 25) {
       headers: alpacaHeaders(),
     });
   } catch (err) {
-    logHttpError({ phase: 'orders', url, error: err });
+    logHttpError({ label: 'account', url, error: err });
     throw err;
   }
 
@@ -634,7 +675,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
   } catch (err) {
     logHttpError({
       symbol: normalizedSymbol,
-      phase: 'order',
+      label: 'orders',
       url: buyOrderUrl,
       error: err,
     });
@@ -664,7 +705,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     } catch (err) {
       logHttpError({
         symbol: normalizedSymbol,
-        phase: 'orders',
+        label: 'orders',
         url: checkUrl,
         error: err,
       });
@@ -741,7 +782,7 @@ async function getLatestPrice(symbol) {
     try {
       res = await requestMarketDataJson({ type: 'TRADE', url, symbol });
     } catch (err) {
-      logHttpError({ symbol, phase: 'quote', url, error: err });
+      logHttpError({ symbol, label: 'trades', url, error: err });
       logSkip('no_quote', { symbol, reason: err?.errorCode === 'COOLDOWN' ? 'cooldown' : 'request_failed' });
       throw err;
     }
@@ -768,7 +809,7 @@ async function getLatestPrice(symbol) {
   try {
     res = await requestMarketDataJson({ type: 'TRADE', url, symbol });
   } catch (err) {
-    logHttpError({ symbol, phase: 'quote', url, error: err });
+    logHttpError({ symbol, label: 'trades', url, error: err });
     logSkip('no_quote', { symbol, reason: err?.errorCode === 'COOLDOWN' ? 'cooldown' : 'request_failed' });
     throw err;
   }
@@ -799,7 +840,7 @@ async function getAccountInfo() {
       headers: alpacaHeaders(),
     });
   } catch (err) {
-    logHttpError({ phase: 'orders', url, error: err });
+    logHttpError({ label: 'account', url, error: err });
     throw err;
   }
 
@@ -923,7 +964,7 @@ async function getLatestQuote(rawSymbol) {
   try {
     res = await requestMarketDataJson({ type: 'QUOTE', url, symbol });
   } catch (err) {
-    logHttpError({ symbol, phase: 'quote', url, error: err });
+    logHttpError({ symbol, label: 'quotes', url, error: err });
     if (err?.errorCode === 'COOLDOWN') {
       logSkip('no_quote', { symbol, reason: 'cooldown' });
     } else {
@@ -981,7 +1022,7 @@ async function fetchOrderById(orderId) {
       headers: alpacaHeaders(),
     });
   } catch (err) {
-    logHttpError({ phase: 'orders', url, error: err });
+    logHttpError({ label: 'orders', url, error: err });
     throw err;
   }
 
@@ -1052,7 +1093,7 @@ async function submitLimitSell({
       }),
     });
   } catch (err) {
-    logHttpError({ symbol, phase: 'order', url, error: err });
+    logHttpError({ symbol, label: 'orders', url, error: err });
     throw err;
   }
 
@@ -1100,7 +1141,7 @@ async function submitMarketSell({
       }),
     });
   } catch (err) {
-    logHttpError({ symbol, phase: 'order', url, error: err });
+    logHttpError({ symbol, label: 'orders', url, error: err });
     throw err;
   }
 
@@ -1583,7 +1624,7 @@ async function placeMarketBuyThenSell(symbol) {
   } catch (err) {
     logHttpError({
       symbol: normalizedSymbol,
-      phase: 'order',
+      label: 'orders',
       url: buyOrderUrl,
       error: err,
     });
@@ -1613,7 +1654,7 @@ async function placeMarketBuyThenSell(symbol) {
     } catch (err) {
       logHttpError({
         symbol: normalizedSymbol,
-        phase: 'orders',
+        label: 'orders',
         url: checkUrl,
         error: err,
       });
@@ -1779,7 +1820,7 @@ async function submitOrder(order = {}) {
       }),
     });
   } catch (err) {
-    logHttpError({ symbol: normalizedSymbol, phase: 'order', url, error: err });
+    logHttpError({ symbol: normalizedSymbol, label: 'orders', url, error: err });
     throw err;
   }
 
@@ -1802,7 +1843,7 @@ async function fetchOrders(params = {}) {
       headers: alpacaHeaders(),
     });
   } catch (err) {
-    logHttpError({ phase: 'orders', url, error: err });
+    logHttpError({ label: 'orders', url, error: err });
     throw err;
   }
 
@@ -1832,7 +1873,7 @@ async function fetchOpenPositions() {
       headers: alpacaHeaders(),
     });
   } catch (err) {
-    logHttpError({ phase: 'positions', url, error: err });
+    logHttpError({ label: 'positions', url, error: err });
     throw err;
   }
   const positions = Array.isArray(res) ? res : [];
@@ -1979,7 +2020,7 @@ async function cancelOrder(orderId) {
       headers: alpacaHeaders(),
     });
   } catch (err) {
-    logHttpError({ phase: 'orders', url, error: err });
+    logHttpError({ label: 'orders', url, error: err });
     throw err;
   }
 
@@ -2004,7 +2045,7 @@ async function getAlpacaConnectivityStatus() {
     headers: alpacaHeaders(),
   });
   if (tradeResult.error) {
-    logHttpError({ phase: 'account', url: tradeUrl, error: tradeResult.error });
+    logHttpError({ label: 'account', url: tradeUrl, error: tradeResult.error });
   }
 
   const dataResult = await httpJson({
@@ -2013,7 +2054,7 @@ async function getAlpacaConnectivityStatus() {
     headers: alpacaHeaders(),
   });
   if (dataResult.error) {
-    logHttpError({ phase: 'quote', url: dataUrl, error: dataResult.error });
+    logHttpError({ label: 'quotes', url: dataUrl, error: dataResult.error });
   }
 
   const tradeErrorMessage = tradeResult.error
