@@ -2,21 +2,47 @@ const { randomUUID } = require('crypto');
 
 const { httpJson } = require('./httpClient');
 
-const ALPACA_BASE_URL = process.env.ALPACA_API_BASE || 'https://api.alpaca.markets/v2';
+const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
+const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
 
-const DATA_URL = 'https://data.alpaca.markets/v1beta2';
-const STOCKS_DATA_URL = 'https://data.alpaca.markets/v2/stocks';
+function normalizeTradeBase(baseUrl) {
+  if (!baseUrl) return 'https://api.alpaca.markets';
+  const trimmed = baseUrl.replace(/\/+$/, '');
+  return trimmed.replace(/\/v2$/, '');
+}
+
+function normalizeDataBase(baseUrl) {
+  if (!baseUrl) return 'https://data.alpaca.markets';
+  let trimmed = baseUrl.replace(/\/+$/, '');
+  trimmed = trimmed.replace(/\/v1beta2$/, '');
+  trimmed = trimmed.replace(/\/v2\/stocks$/, '');
+  trimmed = trimmed.replace(/\/v2$/, '');
+  return trimmed;
+}
+
+const TRADE_BASE = normalizeTradeBase(RAW_TRADE_BASE);
+const DATA_BASE = normalizeDataBase(RAW_DATA_BASE);
+const ALPACA_BASE_URL = `${TRADE_BASE}/v2`;
+const DATA_URL = `${DATA_BASE}/v1beta2`;
+const STOCKS_DATA_URL = `${DATA_BASE}/v2/stocks`;
 
 const resolvedAlpacaAuth = (() => {
-  const keyId = process.env.ALPACA_KEY_ID || process.env.APCA_API_KEY_ID || '';
+  const envStatus = {
+    ALPACA_KEY_ID: Boolean(process.env.ALPACA_KEY_ID),
+    ALPACA_SECRET_KEY: Boolean(process.env.ALPACA_SECRET_KEY),
+    APCA_API_KEY_ID: Boolean(process.env.APCA_API_KEY_ID),
+    APCA_API_SECRET_KEY: Boolean(process.env.APCA_API_SECRET_KEY),
+    ALPACA_API_KEY: Boolean(process.env.ALPACA_API_KEY),
+  };
+  console.log('alpaca_auth_env', envStatus);
+  const keyId =
+    process.env.ALPACA_KEY_ID ||
+    process.env.APCA_API_KEY_ID ||
+    process.env.ALPACA_API_KEY ||
+    '';
   const secretKey = process.env.ALPACA_SECRET_KEY || process.env.APCA_API_SECRET_KEY || '';
   const alpacaKeyIdPresent = Boolean(keyId);
   const alpacaAuthOk = Boolean(keyId && secretKey);
-  if (!alpacaAuthOk) {
-    console.error(
-      'ALPACA AUTH MISSING: set ALPACA_KEY_ID + ALPACA_SECRET_KEY (or APCA_API_KEY_ID + APCA_API_SECRET_KEY) on Render.'
-    );
-  }
   return {
     keyId,
     secretKey,
@@ -91,9 +117,11 @@ function logHttpError({ symbol, phase, url, error }) {
   const statusCode = error?.statusCode ?? null;
   const errorMessage = error?.errorMessage || error?.message || 'Unknown error';
   const snippet = error?.responseSnippet200 || '';
+  const method = error?.method || null;
   console.error('alpaca_http_error', {
     symbol,
     phase,
+    method,
     url,
     statusCode,
     errorMessage,
@@ -1612,6 +1640,50 @@ async function cancelOrder(orderId) {
 
 }
 
+async function getAlpacaConnectivityStatus() {
+  const hasAuth = resolvedAlpacaAuth.alpacaAuthOk;
+  const tradeUrl = `${ALPACA_BASE_URL}/account`;
+  const dataSymbol = 'AAPL';
+  const dataUrl = `${STOCKS_DATA_URL}/quotes/latest?symbols=${encodeURIComponent(dataSymbol)}`;
+
+  const tradeResult = await httpJson({
+    method: 'GET',
+    url: tradeUrl,
+    headers: alpacaHeaders(),
+  });
+  if (tradeResult.error) {
+    logHttpError({ phase: 'account', url: tradeUrl, error: tradeResult.error });
+  }
+
+  const dataResult = await httpJson({
+    method: 'GET',
+    url: dataUrl,
+    headers: alpacaHeaders(),
+  });
+  if (dataResult.error) {
+    logHttpError({ phase: 'quote', url: dataUrl, error: dataResult.error });
+  }
+
+  const tradeErrorMessage = tradeResult.error
+    ? tradeResult.error.errorMessage || tradeResult.error.message || 'Unknown error'
+    : null;
+  const dataErrorMessage = dataResult.error
+    ? dataResult.error.errorMessage || dataResult.error.message || 'Unknown error'
+    : null;
+  const errors = [tradeErrorMessage ? `trade: ${tradeErrorMessage}` : null, dataErrorMessage ? `data: ${dataErrorMessage}` : null]
+    .filter(Boolean)
+    .join('; ') || null;
+
+  return {
+    hasAuth,
+    tradeAccountOk: !tradeResult.error,
+    tradeStatus: tradeResult.error ? tradeResult.error.statusCode ?? null : 200,
+    dataQuoteOk: !dataResult.error,
+    dataStatus: dataResult.error ? dataResult.error.statusCode ?? null : 200,
+    error: errors,
+  };
+}
+
 module.exports = {
 
   placeLimitBuyThenSell,
@@ -1633,5 +1705,6 @@ module.exports = {
   getLastQuoteSnapshot,
   getAlpacaAuthStatus,
   getLastHttpError,
+  getAlpacaConnectivityStatus,
 
 };
