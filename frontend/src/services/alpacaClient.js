@@ -3,8 +3,6 @@ import {
   BACKEND_BASE_URL,
   BACKEND_HEADERS,
   DATA_LOCATIONS,
-  DATA_ROOT_CRYPTO,
-  DATA_ROOT_STOCKS_V2,
   HEADERS,
 } from '../config/alpaca';
 import { getSettings } from '../state/settingsStore';
@@ -34,8 +32,8 @@ const marketDataState = {
   cooldownLoggedAt: 0,
 };
 
-const buildAlpacaUrl = ({ baseUrl, path, params, label }) => {
-  const base = String(baseUrl || '').replace(/\/+$/, '');
+const buildBackendUrl = ({ path, params, label }) => {
+  const base = String(BACKEND_BASE_URL || '').replace(/\/+$/, '');
   const cleanPath = String(path || '').replace(/^\/+/, '');
   const url = new URL(`${base}/${cleanPath}`);
   if (params) {
@@ -45,7 +43,7 @@ const buildAlpacaUrl = ({ baseUrl, path, params, label }) => {
     });
   }
   const finalUrl = url.toString();
-  console.log('alpaca_request_url', { label, url: finalUrl });
+  console.log('backend_request_url', { label, url: finalUrl });
   return finalUrl;
 };
 
@@ -82,7 +80,7 @@ const fetchMarketData = async (type, url) => {
   }
 
   try {
-    const res = await fetchWithBudget(url, { headers: HEADERS }, MARKET_DATA_TIMEOUT_MS, MARKET_DATA_RETRIES);
+    const res = await fetchWithBudget(url, { headers: BACKEND_HEADERS }, MARKET_DATA_TIMEOUT_MS, MARKET_DATA_RETRIES);
     const status = res?.status;
     if (!res?.ok) {
       const body = await res.text().catch(() => '');
@@ -152,10 +150,9 @@ export const clearQuoteCache = () => quoteCache.clear();
 
 const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
   const normalized = symbols.map((s) => toDataSymbol(s)).join(',');
-  return buildAlpacaUrl({
-    baseUrl: DATA_ROOT_CRYPTO,
-    path: `${loc}/latest/${what}`,
-    params: { symbols: normalized, ...params },
+  return buildBackendUrl({
+    path: `market/crypto/${what}`,
+    params: { symbols: normalized, location: loc, ...params },
     label: `crypto_${what}`,
   });
 };
@@ -329,10 +326,9 @@ export const getCryptoBars1m = async (symbol, limit = 6) => {
   const settings = getSettings();
   for (const loc of DATA_LOCATIONS) {
     try {
-      const url = buildAlpacaUrl({
-        baseUrl: DATA_ROOT_CRYPTO,
-        path: `${loc}/bars`,
-        params: { timeframe: '1Min', limit: String(limit), symbols: dsym },
+      const url = buildBackendUrl({
+        path: 'market/crypto/bars',
+        params: { timeframe: '1Min', limit: String(limit), symbols: dsym, location: loc },
         label: 'crypto_bars',
       });
       const payload = await fetchMarketData('BARS', url);
@@ -380,10 +376,9 @@ export const getCryptoBars1mBatch = async (symbols = [], limit = 6) => {
 
   for (const loc of DATA_LOCATIONS) {
     try {
-      const url = buildAlpacaUrl({
-        baseUrl: DATA_ROOT_CRYPTO,
-        path: `${loc}/bars`,
-        params: { timeframe: '1Min', limit: String(limit), symbols: missing.join(',') },
+      const url = buildBackendUrl({
+        path: 'market/crypto/bars',
+        params: { timeframe: '1Min', limit: String(limit), symbols: missing.join(','), location: loc },
         label: 'crypto_bars_batch',
       });
       const payload = await fetchMarketData('BARS', url);
@@ -422,9 +417,8 @@ export const stocksLatestQuotesBatch = async (symbols = []) => {
   if (!symbols.length) return new Map();
   const csv = symbols.join(',');
   try {
-    const url = buildAlpacaUrl({
-      baseUrl: DATA_ROOT_STOCKS_V2,
-      path: 'quotes/latest',
+    const url = buildBackendUrl({
+      path: 'market/stocks/quotes',
       params: { symbols: csv },
       label: 'stocks_latest_quotes',
     });
