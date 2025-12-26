@@ -13,6 +13,7 @@ const {
   getLastQuoteSnapshot,
   getAlpacaAuthStatus,
   getLastHttpError,
+  getAlpacaConnectivityStatus,
 } = require('./trade');
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
@@ -138,6 +139,16 @@ app.get('/debug/net', (req, res) => {
     });
   } catch (error) {
     console.error('Net debug error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/debug/alpaca', async (req, res) => {
+  try {
+    const status = await getAlpacaConnectivityStatus();
+    res.json(status);
+  } catch (error) {
+    console.error('Alpaca debug error:', error?.responseSnippet || error.message);
     res.status(500).json({ error: error.message });
   }
 });
