@@ -8,12 +8,30 @@ const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
 function normalizeTradeBase(baseUrl) {
   if (!baseUrl) return 'https://api.alpaca.markets';
   const trimmed = baseUrl.replace(/\/+$/, '');
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname.includes('data.alpaca.markets')) {
+      console.warn('trade_base_invalid_host', { host: parsed.hostname });
+      return 'https://api.alpaca.markets';
+    }
+  } catch (err) {
+    console.warn('trade_base_parse_failed', { baseUrl: trimmed });
+  }
   return trimmed.replace(/\/v2$/, '');
 }
 
 function normalizeDataBase(baseUrl) {
   if (!baseUrl) return 'https://data.alpaca.markets';
   let trimmed = baseUrl.replace(/\/+$/, '');
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname.includes('api.alpaca.markets') || parsed.hostname.includes('paper-api.alpaca.markets')) {
+      console.warn('data_base_invalid_host', { host: parsed.hostname });
+      return 'https://data.alpaca.markets';
+    }
+  } catch (err) {
+    console.warn('data_base_parse_failed', { baseUrl: trimmed });
+  }
   trimmed = trimmed.replace(/\/v1beta2$/, '');
   trimmed = trimmed.replace(/\/v1beta3$/, '');
   trimmed = trimmed.replace(/\/v2\/stocks$/, '');
@@ -177,12 +195,15 @@ function isMarketDataCooldown() {
   return Date.now() < marketDataState.cooldownUntil;
 }
 
-function markMarketDataFailure() {
+function markMarketDataFailure(statusCode) {
+  if (statusCode !== 429) {
+    return;
+  }
   marketDataState.consecutiveFailures += 1;
   if (marketDataState.consecutiveFailures >= MARKET_DATA_FAILURE_LIMIT && !isMarketDataCooldown()) {
     marketDataState.cooldownUntil = Date.now() + MARKET_DATA_COOLDOWN_MS;
     marketDataState.cooldownLoggedAt = Date.now();
-    console.error('DATA DOWN — pausing scans 60s');
+    console.error('DATA DOWN — rate limit, pausing scans 60s');
   }
 }
 
@@ -207,12 +228,15 @@ function getMarketDataLabel(type) {
   return normalized.toLowerCase() || 'marketdata';
 }
 
-function logMarketDataDiagnostics({ type, url, statusCode, snippet, errorType }) {
+function logMarketDataDiagnostics({ type, url, statusCode, snippet, errorType, requestId, urlHost, urlPath }) {
   const label = getMarketDataLabel(type);
   console.log('alpaca_marketdata', {
     label,
     type,
     url: formatLogUrl(url),
+    urlHost: urlHost || null,
+    urlPath: urlPath || null,
+    requestId: requestId || null,
     statusCode,
     errorType,
     snippet,
@@ -224,12 +248,18 @@ function logHttpError({ symbol, label, url, error }) {
   const errorMessage = error?.errorMessage || error?.message || 'Unknown error';
   const snippet = error?.responseSnippet200 || '';
   const method = error?.method || null;
+  const requestId = error?.requestId || null;
+  const urlHost = error?.urlHost || null;
+  const urlPath = error?.urlPath || null;
   const errorType = error?.isNetworkError || error?.isTimeout ? 'network' : 'http';
   console.error('alpaca_http_error', {
     symbol,
     label,
     method,
     url: formatLogUrl(url),
+    urlHost,
+    urlPath,
+    requestId,
     statusCode,
     errorType,
     errorMessage,
@@ -295,13 +325,19 @@ async function requestMarketDataJson({ type, url, symbol }) {
       statusCode: result.error.statusCode ?? null,
       snippet: result.error.responseSnippet200 || '',
       errorType,
+      requestId: result.error.requestId || null,
+      urlHost: result.error.urlHost || null,
+      urlPath: result.error.urlPath || null,
     });
-    markMarketDataFailure();
+    markMarketDataFailure(result.error.statusCode ?? null);
     lastHttpError = result.error;
     const err = new Error(result.error.errorMessage || 'Market data request failed');
     err.errorCode = errorType === 'network' ? 'NETWORK' : 'HTTP_ERROR';
     err.statusCode = result.error.statusCode ?? null;
     err.responseSnippet200 = result.error.responseSnippet200 || '';
+    err.requestId = result.error.requestId || null;
+    err.urlHost = result.error.urlHost || null;
+    err.urlPath = result.error.urlPath || null;
     throw err;
   }
 
@@ -311,6 +347,9 @@ async function requestMarketDataJson({ type, url, symbol }) {
     statusCode: result.statusCode ?? 200,
     snippet: '',
     errorType: 'ok',
+    requestId: result.requestId || null,
+    urlHost: result.urlHost || null,
+    urlPath: result.urlPath || null,
   });
   markMarketDataSuccess();
   return result.data;
@@ -790,7 +829,7 @@ async function getLatestPrice(symbol) {
     const trade = res.trades && res.trades[dataSymbol];
 
     if (!trade) {
-      markMarketDataFailure();
+      markMarketDataFailure(null);
       logSkip('no_quote', { symbol, reason: 'no_data' });
       throw new Error(`Price not available for ${symbol}`);
     }
@@ -817,7 +856,7 @@ async function getLatestPrice(symbol) {
   const trade = res.trades && res.trades[symbol];
 
   if (!trade) {
-    markMarketDataFailure();
+    markMarketDataFailure(null);
     logSkip('no_quote', { symbol, reason: 'no_data' });
     throw new Error(`Price not available for ${symbol}`);
   }
@@ -979,7 +1018,7 @@ async function getLatestQuote(rawSymbol) {
   if (!quote) {
     const reason = staleCache ? 'stale_cache' : 'no_data';
     logSkip('no_quote', { symbol, reason });
-    markMarketDataFailure();
+    markMarketDataFailure(null);
     recordLastQuoteAt(symbol, {
       tsMs: staleCache ? cachedTsMs : null,
       source: staleCache ? 'stale' : 'error',
@@ -1006,6 +1045,78 @@ async function getLatestQuote(rawSymbol) {
   recordLastQuoteAt(symbol, { tsMs, source: 'fresh' });
   return normalizedQuote;
 
+}
+
+function normalizeSymbolsParam(rawSymbols) {
+  if (!rawSymbols) return [];
+  if (Array.isArray(rawSymbols)) return rawSymbols.map((s) => String(s).trim()).filter(Boolean);
+  return String(rawSymbols)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+async function fetchCryptoQuotes({ symbols, location = 'us' }) {
+  const dataSymbols = symbols.map((s) => normalizeDataSymbol(s));
+  const url = buildAlpacaUrl({
+    baseUrl: CRYPTO_DATA_URL,
+    path: `${location}/latest/quotes`,
+    params: { symbols: dataSymbols.join(',') },
+    label: 'crypto_latest_quotes_batch',
+  });
+  return requestMarketDataJson({ type: 'QUOTE', url, symbol: dataSymbols.join(',') });
+}
+
+async function fetchCryptoTrades({ symbols, location = 'us' }) {
+  const dataSymbols = symbols.map((s) => normalizeDataSymbol(s));
+  const url = buildAlpacaUrl({
+    baseUrl: CRYPTO_DATA_URL,
+    path: `${location}/latest/trades`,
+    params: { symbols: dataSymbols.join(',') },
+    label: 'crypto_latest_trades_batch',
+  });
+  return requestMarketDataJson({ type: 'TRADE', url, symbol: dataSymbols.join(',') });
+}
+
+async function fetchCryptoBars({ symbols, location = 'us', limit = 6, timeframe = '1Min' }) {
+  const dataSymbols = symbols.map((s) => normalizeDataSymbol(s));
+  const url = buildAlpacaUrl({
+    baseUrl: CRYPTO_DATA_URL,
+    path: `${location}/bars`,
+    params: { symbols: dataSymbols.join(','), limit: String(limit), timeframe },
+    label: 'crypto_bars_batch',
+  });
+  return requestMarketDataJson({ type: 'BARS', url, symbol: dataSymbols.join(',') });
+}
+
+async function fetchStockQuotes({ symbols }) {
+  const url = buildAlpacaUrl({
+    baseUrl: STOCKS_DATA_URL,
+    path: 'quotes/latest',
+    params: { symbols: symbols.join(',') },
+    label: 'stocks_latest_quotes_batch',
+  });
+  return requestMarketDataJson({ type: 'QUOTE', url, symbol: symbols.join(',') });
+}
+
+async function fetchStockTrades({ symbols }) {
+  const url = buildAlpacaUrl({
+    baseUrl: STOCKS_DATA_URL,
+    path: 'trades/latest',
+    params: { symbols: symbols.join(',') },
+    label: 'stocks_latest_trades_batch',
+  });
+  return requestMarketDataJson({ type: 'TRADE', url, symbol: symbols.join(',') });
+}
+
+async function fetchStockBars({ symbols, limit = 6, timeframe = '1Min' }) {
+  const url = buildAlpacaUrl({
+    baseUrl: STOCKS_DATA_URL,
+    path: 'bars',
+    params: { symbols: symbols.join(','), limit: String(limit), timeframe },
+    label: 'stocks_bars_batch',
+  });
+  return requestMarketDataJson({ type: 'BARS', url, symbol: symbols.join(',') });
 }
 
 async function fetchOrderById(orderId) {
@@ -2068,11 +2179,34 @@ async function getAlpacaConnectivityStatus() {
     .join('; ') || null;
 
   return {
-    hasAuth,
+    auth: {
+      hasAuth,
+      alpacaAuthOk: resolvedAlpacaAuth.alpacaAuthOk,
+      alpacaKeyIdPresent: resolvedAlpacaAuth.alpacaKeyIdPresent,
+    },
     tradeAccountOk: !tradeResult.error,
-    tradeStatus: tradeResult.error ? tradeResult.error.statusCode ?? null : 200,
+    tradeStatus: tradeResult.error ? tradeResult.error.statusCode ?? null : tradeResult.statusCode ?? 200,
+    tradeSnippet: tradeResult.error
+      ? tradeResult.error.responseSnippet200 || ''
+      : tradeResult.responseSnippet200 || '',
+    tradeRequestId: tradeResult.error ? tradeResult.error.requestId || null : tradeResult.requestId || null,
     dataQuoteOk: !dataResult.error,
-    dataStatus: dataResult.error ? dataResult.error.statusCode ?? null : 200,
+    dataStatus: dataResult.error ? dataResult.error.statusCode ?? null : dataResult.statusCode ?? 200,
+    dataSnippet: dataResult.error
+      ? dataResult.error.responseSnippet200 || ''
+      : dataResult.responseSnippet200 || '',
+    dataRequestId: dataResult.error ? dataResult.error.requestId || null : dataResult.requestId || null,
+    baseUrls: {
+      tradeBase: TRADE_BASE,
+      dataBase: DATA_BASE,
+    },
+    resolvedUrls: {
+      tradeBaseUrl: ALPACA_BASE_URL,
+      cryptoDataUrl: CRYPTO_DATA_URL,
+      stocksDataUrl: STOCKS_DATA_URL,
+      tradeAccountUrl: tradeUrl,
+      dataQuoteUrl: dataUrl,
+    },
     error: errors,
   };
 }
@@ -2092,6 +2226,15 @@ module.exports = {
   cancelOrder,
 
   normalizeSymbol,
+  normalizeSymbolsParam,
+  getLatestQuote,
+  getLatestPrice,
+  fetchCryptoQuotes,
+  fetchCryptoTrades,
+  fetchCryptoBars,
+  fetchStockQuotes,
+  fetchStockTrades,
+  fetchStockBars,
 
   startExitManager,
   getConcurrencyGuardStatus,

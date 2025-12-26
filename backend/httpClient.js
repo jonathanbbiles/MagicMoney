@@ -3,6 +3,29 @@ const { alpacaLimiter, quoteLimiter } = require('./limiters');
 const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_RETRIES = 2;
 
+function parseUrlDetails(url) {
+  try {
+    const parsed = new URL(url);
+    return {
+      urlHost: parsed.host,
+      urlPath: `${parsed.pathname}${parsed.search || ''}`,
+    };
+  } catch (err) {
+    return { urlHost: null, urlPath: null };
+  }
+}
+
+function getRequestId(headers) {
+  if (!headers) return null;
+  return (
+    headers.get?.('x-request-id') ||
+    headers.get?.('x-requestid') ||
+    headers.get?.('x-alpaca-request-id') ||
+    headers.get?.('x-alpaca-requestid') ||
+    null
+  );
+}
+
 function getLimiterForUrl(url) {
   const host = new URL(url).hostname;
   if (host.includes('data.alpaca.markets')) {
@@ -38,6 +61,7 @@ function getBackoffDelayMs(attempt, error) {
 }
 
 async function executeFetch({ method, url, headers, body, timeoutMs }) {
+  const { urlHost, urlPath } = parseUrlDetails(url);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -51,6 +75,7 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
 
     const text = await response.text();
     const snippet = text ? text.slice(0, 200) : '';
+    const requestId = getRequestId(response.headers);
 
     if (!response.ok) {
       return {
@@ -63,17 +88,40 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
           responseSnippet200: snippet,
           isTimeout: false,
           isNetworkError: false,
+          requestId,
+          urlHost,
+          urlPath,
         },
+        responseSnippet200: snippet,
+        requestId,
+        urlHost,
+        urlPath,
         statusCode: response.status,
       };
     }
 
     if (!text) {
-      return { data: null, error: null, statusCode: response.status };
+      return {
+        data: null,
+        error: null,
+        statusCode: response.status,
+        responseSnippet200: '',
+        requestId,
+        urlHost,
+        urlPath,
+      };
     }
 
     try {
-      return { data: JSON.parse(text), error: null, statusCode: response.status };
+      return {
+        data: JSON.parse(text),
+        error: null,
+        statusCode: response.status,
+        responseSnippet200: snippet,
+        requestId,
+        urlHost,
+        urlPath,
+      };
     } catch (err) {
       return {
         data: null,
@@ -86,7 +134,14 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
           isTimeout: false,
           isNetworkError: false,
           parse_error: true,
+          requestId,
+          urlHost,
+          urlPath,
         },
+        responseSnippet200: snippet,
+        requestId,
+        urlHost,
+        urlPath,
         statusCode: response.status,
       };
     }
@@ -103,8 +158,15 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
         responseSnippet200: '',
         isTimeout,
         isNetworkError: !isTimeout,
+        requestId: null,
+        urlHost,
+        urlPath,
       },
       statusCode: null,
+      responseSnippet200: '',
+      requestId: null,
+      urlHost,
+      urlPath,
     };
   } finally {
     clearTimeout(timeout);
