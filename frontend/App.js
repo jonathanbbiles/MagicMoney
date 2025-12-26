@@ -73,6 +73,7 @@ const DUST_FLATTEN_MAX_USD = 0.75;
 const DUST_SWEEP_MINUTES = 12;
 const MIN_BID_SIZE_LOOSE = 1;
 const MIN_BID_NOTIONAL_LOOSE_USD = 5; // gate by ~$ value, not raw size
+const MIN_TRADE_QTY = 0.000001;
 
 const MAX_EQUITIES = 400;
 const MAX_CRYPTOS = 400;
@@ -266,7 +267,8 @@ async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
       clearTimeout(t);
       if (res.status === 429 || res.status >= 500) {
         if (i === retries) return res;
-        await sleep(400 * Math.pow(2, i) + Math.floor(Math.random() * 300));
+        const extra = res.status === 429 ? 1200 + Math.floor(Math.random() * 800) : 0;
+        await sleep(400 * Math.pow(2, i) + Math.floor(Math.random() * 300) + extra);
         continue;
       }
       return res;
@@ -278,6 +280,118 @@ async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
     }
   }
   throw lastErr || new Error('fetch failed');
+}
+
+const MARKET_DATA_TIMEOUT_MS = 9000;
+const MARKET_DATA_RETRIES = 3;
+const MARKET_DATA_FAILURE_LIMIT = 5;
+const MARKET_DATA_COOLDOWN_MS = 60000;
+const marketDataState = {
+  consecutiveFailures: 0,
+  cooldownUntil: 0,
+  cooldownLoggedAt: 0,
+};
+
+function buildAlpacaUrl({ baseUrl, path, params, label }) {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  const cleanPath = String(path || '').replace(/^\/+/, '');
+  const url = new URL(`${base}/${cleanPath}`);
+  if (params) {
+    Object.entries(params).forEach(([key, value]) => {
+      if (value == null) return;
+      url.searchParams.set(key, String(value));
+    });
+  }
+  const finalUrl = url.toString();
+  console.log('alpaca_request_url', { label, url: finalUrl });
+  return finalUrl;
+}
+
+const isMarketDataCooldown = () => Date.now() < marketDataState.cooldownUntil;
+
+const markMarketDataFailure = () => {
+  marketDataState.consecutiveFailures += 1;
+  if (marketDataState.consecutiveFailures >= MARKET_DATA_FAILURE_LIMIT && !isMarketDataCooldown()) {
+    marketDataState.cooldownUntil = Date.now() + MARKET_DATA_COOLDOWN_MS;
+    marketDataState.cooldownLoggedAt = Date.now();
+    console.warn('DATA DOWN — pausing scans 60s');
+  }
+};
+
+const markMarketDataSuccess = () => {
+  marketDataState.consecutiveFailures = 0;
+};
+
+const logMarketDataDiagnostics = ({ type, url, statusCode, snippet, errorType }) => {
+  console.log('alpaca_marketdata', {
+    type,
+    url,
+    statusCode,
+    errorType,
+    snippet,
+  });
+};
+
+async function fetchMarketData(type, url, opts = {}) {
+  if (isMarketDataCooldown()) {
+    logMarketDataDiagnostics({ type, url, statusCode: null, snippet: '', errorType: 'cooldown' });
+    const err = new Error('Market data cooldown active');
+    err.code = 'COOLDOWN';
+    throw err;
+  }
+
+  try {
+    const res = await f(url, opts, MARKET_DATA_TIMEOUT_MS, MARKET_DATA_RETRIES);
+    const status = res?.status;
+    if (!res?.ok) {
+      const body = await res.text().catch(() => '');
+      logMarketDataDiagnostics({
+        type,
+        url,
+        statusCode: status,
+        snippet: body?.slice?.(0, 200),
+        errorType: 'http',
+      });
+      markMarketDataFailure();
+      const err = new Error(`HTTP ${status}`);
+      err.code = 'HTTP_ERROR';
+      err.statusCode = status;
+      err.responseSnippet = body?.slice?.(0, 200);
+      throw err;
+    }
+
+    const text = await res.text().catch(() => '');
+    logMarketDataDiagnostics({ type, url, statusCode: status, snippet: '', errorType: 'ok' });
+    markMarketDataSuccess();
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch (err) {
+      logMarketDataDiagnostics({
+        type,
+        url,
+        statusCode: status,
+        snippet: text.slice(0, 200),
+        errorType: 'parse',
+      });
+      markMarketDataFailure();
+      const parseErr = new Error('parse_error');
+      parseErr.code = 'PARSE_ERROR';
+      throw parseErr;
+    }
+  } catch (err) {
+    if (err?.name === 'AbortError' || err?.message?.includes?.('Network') || err?.message?.includes?.('fetch')) {
+      logMarketDataDiagnostics({
+        type,
+        url,
+        statusCode: null,
+        snippet: err?.message || '',
+        errorType: 'network',
+      });
+      markMarketDataFailure();
+    }
+    throw err;
+  }
 }
 
 /* ─────────────────────────── 5) TIME / PARSE / FORMATTING ─────────────────────────── */
@@ -929,31 +1043,31 @@ const barsCache = new Map();
 const barsCacheTTL = 30000; // 30 seconds
 
 /* ─────────────────────────────── 12) CRYPTO DATA API ─────────────────────────────── */
-const buildURLCrypto = (loc, what, symbolsCSV, params = {}) => {
-  const encoded = symbolsCSV.split(',').map((s) => encodeURIComponent(s)).join(',');
-  const sp = new URLSearchParams();
-  Object.entries(params || {}).forEach(([k, v]) => { if (v != null) sp.set(k, v); });
-  const qs = sp.toString();
-  return `${DATA_ROOT_CRYPTO}/${loc}/latest/${what}?symbols=${encoded}${qs ? '&' + qs : ''}`;
+const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
+  const normalized = symbols.map((s) => toDataSymbol(s)).join(',');
+  return buildAlpacaUrl({
+    baseUrl: DATA_ROOT_CRYPTO,
+    path: `${loc}/latest/${what}`,
+    params: { symbols: normalized, ...params },
+    label: `crypto_${what}`,
+  });
 };
 
 async function getCryptoQuotesBatch(dsyms = []) {
   if (!dsyms.length) return new Map();
+  const dataSymbols = dsyms.map((s) => toDataSymbol(s));
   for (const loc of DATA_LOCATIONS) {
     try {
-      const url = buildURLCrypto(loc, 'quotes', dsyms.join(','));
-      const r = await f(url, { headers: HEADERS });
-      if (!r.ok) {
-        const body = await r.text().catch(() => '');
-        logTradeAction('quote_http_error', 'QUOTE', { status: r.status, loc, body: body?.slice?.(0, 120) });
-        continue;
-      }
-      const j = await r.json().catch(() => null);
+      const url = buildURLCrypto(loc, 'quotes', dataSymbols);
+      const j = await fetchMarketData('QUOTE', url, { headers: HEADERS });
       const raw = j?.quotes || {};
       const out = new Map();
-      for (const dsym of dsyms) {
+      for (const dsym of dataSymbols) {
         const q = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
-        if (!q) continue;
+        if (!q) {
+          logTradeAction('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'QUOTE' });
+          continue;
+        }
         const bid = Number(q.bp ?? q.bid_price);
         const ask = Number(q.ap ?? q.ask_price);
         const bs = Number(q.bs ?? q.bid_size);
@@ -965,26 +1079,24 @@ async function getCryptoQuotesBatch(dsyms = []) {
       }
       if (out.size) return out;
     } catch (e) {
-      logTradeAction('quote_http_error', 'QUOTE', { status: 'exception', loc, body: e?.message || '' });
+      logTradeAction('quote_http_error', 'QUOTE', { status: e?.statusCode || e?.code || 'exception', loc, body: e?.responseSnippet || e?.message || '' });
+      for (const dsym of dataSymbols) {
+        logTradeAction('no_quote', dsym.replace('/', ''), { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
+      }
     }
   }
   return new Map();
 }
 async function getCryptoTradesBatch(dsyms = []) {
   if (!dsyms.length) return new Map();
+  const dataSymbols = dsyms.map((s) => toDataSymbol(s));
   for (const loc of DATA_LOCATIONS) {
     try {
-      const url = buildURLCrypto(loc, 'trades', dsyms.join(','));
-      const r = await f(url, { headers: HEADERS });
-      if (!r.ok) {
-        const body = await r.text().catch(() => '');
-        logTradeAction('trade_http_error', 'TRADE', { status: r.status, loc, body: body?.slice?.(0, 120) });
-        continue;
-      }
-      const j = await r.json().catch(() => null);
+      const url = buildURLCrypto(loc, 'trades', dataSymbols);
+      const j = await fetchMarketData('TRADE', url, { headers: HEADERS });
       const raw = j?.trades || {};
       const out = new Map();
-      for (const dsym of dsyms) {
+      for (const dsym of dataSymbols) {
         const t = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
         const p = Number(t?.p ?? t?.price);
         const tms = parseTsMs(t?.t);
@@ -992,7 +1104,10 @@ async function getCryptoTradesBatch(dsyms = []) {
       }
       if (out.size) return out;
     } catch (e) {
-      logTradeAction('trade_http_error', 'TRADE', { status: 'exception', loc, body: e?.message || '' });
+      logTradeAction('trade_http_error', 'TRADE', { status: e?.statusCode || e?.code || 'exception', loc, body: e?.responseSnippet || e?.message || '' });
+      for (const dsym of dataSymbols) {
+        logTradeAction('no_quote', dsym.replace('/', ''), { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'TRADE' });
+      }
     }
   }
   return new Map();
@@ -1006,15 +1121,13 @@ async function getCryptoBars1m(symbol, limit = 6) {
   }
   for (const loc of DATA_LOCATIONS) {
     try {
-      const sp = new URLSearchParams({ timeframe: '1Min', limit: String(limit), symbols: dsym });
-      const url = `${DATA_ROOT_CRYPTO}/${loc}/bars?${sp.toString()}`;
-      const r = await f(url, { headers: HEADERS });
-      if (!r.ok) {
-        const body = await r.text().catch(() => '');
-        logTradeAction('quote_http_error', 'BARS', { status: r.status, loc, body: body?.slice?.(0, 120) });
-        continue;
-      }
-      const j = await r.json().catch(() => null);
+      const url = buildAlpacaUrl({
+        baseUrl: DATA_ROOT_CRYPTO,
+        path: `${loc}/bars`,
+        params: { timeframe: '1Min', limit: String(limit), symbols: dsym },
+        label: 'crypto_bars',
+      });
+      const j = await fetchMarketData('BARS', url, { headers: HEADERS });
       const arr = j?.bars?.[dsym];
       if (Array.isArray(arr) && arr.length) {
         const bars = arr.map((b) => ({
@@ -1028,8 +1141,10 @@ async function getCryptoBars1m(symbol, limit = 6) {
         barsCache.set(dsym, { ts: now, bars: bars.slice() });
         return bars;
       }
+      logTradeAction('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'BARS' });
     } catch (e) {
-      logTradeAction('quote_http_error', 'BARS', { status: 'exception', loc, body: e?.message || '' });
+      logTradeAction('quote_http_error', 'BARS', { status: e?.statusCode || e?.code || 'exception', loc, body: e?.responseSnippet || e?.message || '' });
+      logTradeAction('no_quote', dsym.replace('/', ''), { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
     }
   }
   return [];
@@ -1055,15 +1170,13 @@ async function getCryptoBars1mBatch(symbols = [], limit = 6) {
 
   for (const loc of DATA_LOCATIONS) {
     try {
-      const sp = new URLSearchParams({ timeframe: '1Min', limit: String(limit), symbols: missing.join(',') });
-      const url = `${DATA_ROOT_CRYPTO}/${loc}/bars?${sp.toString()}`;
-      const r = await f(url, { headers: HEADERS });
-      if (!r.ok) {
-        const body = await r.text().catch(() => '');
-        logTradeAction('quote_http_error', 'BARS', { status: r.status, loc, body: body?.slice?.(0, 120) });
-        continue;
-      }
-      const j = await r.json().catch(() => null);
+      const url = buildAlpacaUrl({
+        baseUrl: DATA_ROOT_CRYPTO,
+        path: `${loc}/bars`,
+        params: { timeframe: '1Min', limit: String(limit), symbols: missing.join(',') },
+        label: 'crypto_bars_batch',
+      });
+      const j = await fetchMarketData('BARS', url, { headers: HEADERS });
       const raw = j?.bars || {};
       for (const dsym of missing) {
         const arr = raw[dsym];
@@ -1078,11 +1191,16 @@ async function getCryptoBars1mBatch(symbols = [], limit = 6) {
           })).filter((x) => Number.isFinite(x.close) && x.close > 0);
           barsCache.set(dsym, { ts: now, bars: bars.slice() });
           out.set(dsym.replace('/', ''), bars.slice(0, limit));
+        } else {
+          logTradeAction('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'BARS' });
         }
       }
       break;
     } catch (e) {
-      logTradeAction('quote_http_error', 'BARS', { status: 'exception', loc, body: e?.message || '' });
+      logTradeAction('quote_http_error', 'BARS', { status: e?.statusCode || e?.code || 'exception', loc, body: e?.responseSnippet || e?.message || '' });
+      for (const dsym of missing) {
+        logTradeAction('no_quote', dsym.replace('/', ''), { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
+      }
     }
   }
   return out;
@@ -1093,14 +1211,21 @@ async function stocksLatestQuotesBatch(symbols = []) {
   if (!symbols.length) return new Map();
   const csv = symbols.join(',');
   try {
-    const r = await f(`${DATA_ROOT_STOCKS_V2}/quotes/latest?symbols=${encodeURIComponent(csv)}`, { headers: HEADERS });
-    if (!r.ok) return new Map();
-    const j = await r.json().catch(() => null);
+    const url = buildAlpacaUrl({
+      baseUrl: DATA_ROOT_STOCKS_V2,
+      path: 'quotes/latest',
+      params: { symbols: csv },
+      label: 'stocks_latest_quotes',
+    });
+    const j = await fetchMarketData('QUOTE', url, { headers: HEADERS });
     const out = new Map();
     for (const sym of symbols) {
       const qraw = j?.quotes?.[sym];
       const q = Array.isArray(qraw) ? qraw[0] : qraw;
-      if (!q) continue;
+      if (!q) {
+        logTradeAction('no_quote', sym, { reason: 'no_data', requestType: 'QUOTE' });
+        continue;
+      }
       const bid = Number(q.bp ?? q.bid_price);
       const ask = Number(q.ap ?? q.ask_price);
       const bs = Number(q.bs ?? q.bid_size);
@@ -1109,23 +1234,32 @@ async function stocksLatestQuotesBatch(symbols = []) {
       if (bid > 0 && ask > 0) out.set(sym, { bid, ask, bs: Number.isFinite(bs) ? bs : null, as: Number.isFinite(as) ? as : null, tms });
     }
     return out;
-  } catch { return new Map(); }
+  } catch (e) {
+    logTradeAction('quote_http_error', 'QUOTE', { status: e?.statusCode || e?.code || 'exception', loc: 'stocks', body: e?.responseSnippet || e?.message || '' });
+    for (const sym of symbols) {
+      logTradeAction('no_quote', sym, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
+    }
+    return new Map();
+  }
 }
 
 // --- Daily bars helpers (stocks & crypto) for simple benchmark returns ---
 async function stocksDailyBars(symbols = [], limit = 10) {
   if (!symbols.length) return new Map();
   const csv = symbols.join(',');
-  const sp = new URLSearchParams({
-    timeframe: '1Day',
-    symbols: csv,
-    limit: String(limit),
-    adjustment: 'raw',
-  });
   try {
-    const r = await f(`${DATA_ROOT_STOCKS_V2}/bars?${sp.toString()}`, { headers: HEADERS });
-    if (!r.ok) return new Map();
-    const j = await r.json().catch(() => null);
+    const url = buildAlpacaUrl({
+      baseUrl: DATA_ROOT_STOCKS_V2,
+      path: 'bars',
+      params: {
+        timeframe: '1Day',
+        symbols: csv,
+        limit: String(limit),
+        adjustment: 'raw',
+      },
+      label: 'stocks_daily_bars',
+    });
+    const j = await fetchMarketData('BARS', url, { headers: HEADERS });
     const raw = j?.bars || {};
     const out = new Map();
     for (const sym of symbols) {
@@ -1142,7 +1276,13 @@ async function stocksDailyBars(symbols = [], limit = 10) {
       }
     }
     return out;
-  } catch { return new Map(); }
+  } catch (e) {
+    logTradeAction('quote_http_error', 'BARS', { status: e?.statusCode || e?.code || 'exception', loc: 'stocks', body: e?.responseSnippet || e?.message || '' });
+    for (const sym of symbols) {
+      logTradeAction('no_quote', sym, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
+    }
+    return new Map();
+  }
 }
 
 async function cryptoDailyBars(symbols = [], limit = 10) {
@@ -1152,11 +1292,13 @@ async function cryptoDailyBars(symbols = [], limit = 10) {
   for (const loc of DATA_LOCATIONS) {
     try {
       const ds = uniq.map(s => toDataSymbol(s)).join(',');
-      const sp = new URLSearchParams({ timeframe: '1Day', limit: String(limit), symbols: ds });
-      const url = `${DATA_ROOT_CRYPTO}/${loc}/bars?${sp.toString()}`;
-      const r = await f(url, { headers: HEADERS });
-      if (!r.ok) continue;
-      const j = await r.json().catch(() => null);
+      const url = buildAlpacaUrl({
+        baseUrl: DATA_ROOT_CRYPTO,
+        path: `${loc}/bars`,
+        params: { timeframe: '1Day', limit: String(limit), symbols: ds },
+        label: 'crypto_daily_bars',
+      });
+      const j = await fetchMarketData('BARS', url, { headers: HEADERS });
       const raw = j?.bars || {};
       for (const sym of uniq) {
         const dsym = toDataSymbol(sym);
@@ -1173,7 +1315,12 @@ async function cryptoDailyBars(symbols = [], limit = 10) {
         }
       }
       break; // success from this location
-    } catch {}
+    } catch (e) {
+      logTradeAction('quote_http_error', 'BARS', { status: e?.statusCode || e?.code || 'exception', loc, body: e?.responseSnippet || e?.message || '' });
+      for (const sym of uniq) {
+        logTradeAction('no_quote', sym, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
+      }
+    }
   }
   return out;
 }
@@ -2496,7 +2643,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   const TICK = Number.isFinite(rawTick) && rawTick > 0 ? rawTick : (isStock(symbol) ? 0.01 : 1e-5);
   const rawQtyInc = meta?._qty_inc ?? 0.000001;
   const QINC = Number.isFinite(rawQtyInc) && rawQtyInc > 0 ? rawQtyInc : 0.000001;
-  const qtyStepDecimals = Math.min(8, (QINC.toString().split('.')[1] || '').length || 6);
+  const qtyStepDecimals = Math.min(9, (QINC.toString().split('.')[1] || '').length || 6);
   const quantizeQty = (value) => {
     if (!(value > 0) || !(QINC > 0)) return 0;
     const scaled = Math.floor(value / QINC + 1e-9);
@@ -2509,6 +2656,10 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   }
   plannedQty = quantizeQty(plannedQty);
   if (!(plannedQty > 0)) return { filled: false };
+  if (plannedQty < MIN_TRADE_QTY) {
+    logTradeAction('skip_small_order', symbol, { reason: 'below_min_trade', qty: plannedQty, minQty: MIN_TRADE_QTY });
+    return { filled: false };
+  }
   qty = plannedQty;
 
   let lastOrderId = null, placedLimit = null, lastReplaceAt = 0;
@@ -3391,7 +3542,7 @@ export default function App() {
     const feeFrac = (SETTINGS.feeBpsMaker || 15) / 10000; // assume maker for entry
     const cushion = 0.0008; // 8 bps headroom
     const denom = Math.max(pxForSizing * (1 + feeFrac + cushion), 1e-9);
-    let qty = +(notional / denom).toFixed(6);
+    let qty = +(notional / denom).toFixed(9);
     if (!Number.isFinite(qty) || qty <= 0) {
       logTradeAction('skip_small_order', symbol);
       return false;
@@ -3594,6 +3745,12 @@ export default function App() {
     if (scanningRef.current) return;
     scanningRef.current = true;
     setIsLoading(true);
+    if (isMarketDataCooldown()) {
+      setIsLoading(false);
+      setRefreshing(false);
+      scanningRef.current = false;
+      return;
+    }
 
     const effectiveTracked = tracked && tracked.length ? tracked : CRYPTO_CORE_TRACKED;
     setData((prev) =>

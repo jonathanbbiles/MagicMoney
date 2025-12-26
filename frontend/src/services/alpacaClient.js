@@ -24,6 +24,104 @@ const log = (type, symbol, details) => {
   }
 };
 
+const MARKET_DATA_TIMEOUT_MS = 9000;
+const MARKET_DATA_RETRIES = 3;
+const MARKET_DATA_FAILURE_LIMIT = 5;
+const MARKET_DATA_COOLDOWN_MS = 60000;
+const marketDataState = {
+  consecutiveFailures: 0,
+  cooldownUntil: 0,
+  cooldownLoggedAt: 0,
+};
+
+const buildAlpacaUrl = ({ baseUrl, path, params, label }) => {
+  const base = String(baseUrl || '').replace(/\/+$/, '');
+  const cleanPath = String(path || '').replace(/^\/+/, '');
+  const url = new URL(`${base}/${cleanPath}`);
+  if (params) {
+    Object.entries(params).forEach(([key, value]) => {
+      if (value == null) return;
+      url.searchParams.set(key, String(value));
+    });
+  }
+  const finalUrl = url.toString();
+  console.log('alpaca_request_url', { label, url: finalUrl });
+  return finalUrl;
+};
+
+const isMarketDataCooldown = () => Date.now() < marketDataState.cooldownUntil;
+const markMarketDataFailure = () => {
+  marketDataState.consecutiveFailures += 1;
+  if (marketDataState.consecutiveFailures >= MARKET_DATA_FAILURE_LIMIT && !isMarketDataCooldown()) {
+    marketDataState.cooldownUntil = Date.now() + MARKET_DATA_COOLDOWN_MS;
+    marketDataState.cooldownLoggedAt = Date.now();
+    console.warn('DATA DOWN — pausing scans 60s');
+  }
+};
+const markMarketDataSuccess = () => {
+  marketDataState.consecutiveFailures = 0;
+};
+
+const logMarketDataDiagnostics = ({ type, url, statusCode, snippet, errorType }) => {
+  console.log('alpaca_marketdata', {
+    type,
+    url,
+    statusCode,
+    errorType,
+    snippet,
+  });
+  log('market_data', type, { url, statusCode, errorType, snippet });
+};
+
+const fetchMarketData = async (type, url) => {
+  if (isMarketDataCooldown()) {
+    logMarketDataDiagnostics({ type, url, statusCode: null, snippet: '', errorType: 'cooldown' });
+    const err = new Error('Market data cooldown active');
+    err.code = 'COOLDOWN';
+    throw err;
+  }
+
+  try {
+    const res = await fetchWithBudget(url, { headers: HEADERS }, MARKET_DATA_TIMEOUT_MS, MARKET_DATA_RETRIES);
+    const status = res?.status;
+    if (!res?.ok) {
+      const body = await res.text().catch(() => '');
+      logMarketDataDiagnostics({
+        type,
+        url,
+        statusCode: status,
+        errorType: 'http',
+        snippet: body?.slice?.(0, 200),
+      });
+      markMarketDataFailure();
+      const err = new Error(`HTTP ${status}`);
+      err.code = 'HTTP_ERROR';
+      err.statusCode = status;
+      err.responseSnippet = body?.slice?.(0, 200);
+      throw err;
+    }
+    const text = await res.text().catch(() => '');
+    logMarketDataDiagnostics({ type, url, statusCode: status, errorType: 'ok', snippet: '' });
+    markMarketDataSuccess();
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch (err) {
+      logMarketDataDiagnostics({ type, url, statusCode: status, errorType: 'parse', snippet: text.slice(0, 200) });
+      markMarketDataFailure();
+      const parseErr = new Error('parse_error');
+      parseErr.code = 'PARSE_ERROR';
+      throw parseErr;
+    }
+  } catch (err) {
+    if (err?.name === 'AbortError' || err?.message?.includes?.('Network') || err?.message?.includes?.('fetch')) {
+      logMarketDataDiagnostics({ type, url, statusCode: null, errorType: 'network', snippet: err?.message || '' });
+      markMarketDataFailure();
+    }
+    throw err;
+  }
+};
+
 const quoteCache = new Map();
 const unsupportedSymbols = new Map();
 const barsCache = new Map();
@@ -52,14 +150,14 @@ export const markUnsupported = (sym, mins = 120) => {
 
 export const clearQuoteCache = () => quoteCache.clear();
 
-const buildURLCrypto = (loc, what, symbolsCSV, params = {}) => {
-  const encoded = symbolsCSV.split(',').map((s) => encodeURIComponent(s)).join(',');
-  const sp = new URLSearchParams();
-  Object.entries(params || {}).forEach(([k, v]) => {
-    if (v != null) sp.set(k, v);
+const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
+  const normalized = symbols.map((s) => toDataSymbol(s)).join(',');
+  return buildAlpacaUrl({
+    baseUrl: DATA_ROOT_CRYPTO,
+    path: `${loc}/latest/${what}`,
+    params: { symbols: normalized, ...params },
+    label: `crypto_${what}`,
   });
-  const qs = sp.toString();
-  return `${DATA_ROOT_CRYPTO}/${loc}/latest/${what}?symbols=${encoded}${qs ? `&${qs}` : ''}`;
 };
 
 export const getPortfolioHistory = async ({ period = '1M', timeframe = '1D' } = {}) => {
@@ -156,21 +254,19 @@ export const getStockClockCached = async (ttlMs = 30000) => {
 export const getCryptoQuotesBatch = async (dsyms = []) => {
   if (!dsyms.length) return new Map();
   const settings = getSettings();
+  const dataSymbols = dsyms.map((s) => toDataSymbol(s));
   for (const loc of DATA_LOCATIONS) {
     try {
-      const url = buildURLCrypto(loc, 'quotes', dsyms.join(','));
-      const res = await fetchWithBudget(url, { headers: HEADERS });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        log('quote_http_error', 'QUOTE', { status: res.status, loc, body: body?.slice?.(0, 120) });
-        continue;
-      }
-      const payload = await res.json().catch(() => null);
+      const url = buildURLCrypto(loc, 'quotes', dataSymbols);
+      const payload = await fetchMarketData('QUOTE', url);
       const raw = payload?.quotes || {};
       const out = new Map();
-      for (const dsym of dsyms) {
+      for (const dsym of dataSymbols) {
         const q = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
-        if (!q) continue;
+        if (!q) {
+          log('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'QUOTE' });
+          continue;
+        }
         const bid = Number(q.bp ?? q.bid_price);
         const ask = Number(q.ap ?? q.ask_price);
         const bs = Number(q.bs ?? q.bid_size);
@@ -188,7 +284,10 @@ export const getCryptoQuotesBatch = async (dsyms = []) => {
       }
       if (out.size) return out;
     } catch (err) {
-      log('quote_http_error', 'QUOTE', { status: 'exception', loc, body: err?.message || '' });
+      log('quote_http_error', 'QUOTE', { status: err?.statusCode || err?.code || 'exception', loc, body: err?.responseSnippet || err?.message || '' });
+      for (const dsym of dataSymbols) {
+        log('no_quote', dsym.replace('/', ''), { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
+      }
     }
   }
   return new Map();
@@ -196,19 +295,14 @@ export const getCryptoQuotesBatch = async (dsyms = []) => {
 
 export const getCryptoTradesBatch = async (dsyms = []) => {
   if (!dsyms.length) return new Map();
+  const dataSymbols = dsyms.map((s) => toDataSymbol(s));
   for (const loc of DATA_LOCATIONS) {
     try {
-      const url = buildURLCrypto(loc, 'trades', dsyms.join(','));
-      const res = await fetchWithBudget(url, { headers: HEADERS });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        log('trade_http_error', 'TRADE', { status: res.status, loc, body: body?.slice?.(0, 120) });
-        continue;
-      }
-      const payload = await res.json().catch(() => null);
+      const url = buildURLCrypto(loc, 'trades', dataSymbols);
+      const payload = await fetchMarketData('TRADE', url);
       const raw = payload?.trades || {};
       const out = new Map();
-      for (const dsym of dsyms) {
+      for (const dsym of dataSymbols) {
         const t = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
         const price = Number(t?.p ?? t?.price);
         const tms = parseTsMs(t?.t);
@@ -216,7 +310,10 @@ export const getCryptoTradesBatch = async (dsyms = []) => {
       }
       if (out.size) return out;
     } catch (err) {
-      log('trade_http_error', 'TRADE', { status: 'exception', loc, body: err?.message || '' });
+      log('trade_http_error', 'TRADE', { status: err?.statusCode || err?.code || 'exception', loc, body: err?.responseSnippet || err?.message || '' });
+      for (const dsym of dataSymbols) {
+        log('no_quote', dsym.replace('/', ''), { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'TRADE' });
+      }
     }
   }
   return new Map();
@@ -232,15 +329,13 @@ export const getCryptoBars1m = async (symbol, limit = 6) => {
   const settings = getSettings();
   for (const loc of DATA_LOCATIONS) {
     try {
-      const sp = new URLSearchParams({ timeframe: '1Min', limit: String(limit), symbols: dsym });
-      const url = `${DATA_ROOT_CRYPTO}/${loc}/bars?${sp.toString()}`;
-      const res = await fetchWithBudget(url, { headers: HEADERS });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        log('quote_http_error', 'BARS', { status: res.status, loc, body: body?.slice?.(0, 120) });
-        continue;
-      }
-      const payload = await res.json().catch(() => null);
+      const url = buildAlpacaUrl({
+        baseUrl: DATA_ROOT_CRYPTO,
+        path: `${loc}/bars`,
+        params: { timeframe: '1Min', limit: String(limit), symbols: dsym },
+        label: 'crypto_bars',
+      });
+      const payload = await fetchMarketData('BARS', url);
       const arr = payload?.bars?.[dsym];
       if (Array.isArray(arr) && arr.length) {
         const bars = arr
@@ -256,8 +351,10 @@ export const getCryptoBars1m = async (symbol, limit = 6) => {
         barsCache.set(dsym, { ts: now, bars: bars.slice() });
         return bars.slice(0, limit);
       }
+      log('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'BARS' });
     } catch (err) {
-      log('quote_http_error', 'BARS', { status: 'exception', loc, body: err?.message || '' });
+      log('quote_http_error', 'BARS', { status: err?.statusCode || err?.code || 'exception', loc, body: err?.responseSnippet || err?.message || '' });
+      log('no_quote', dsym.replace('/', ''), { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
     }
   }
   return [];
@@ -283,15 +380,13 @@ export const getCryptoBars1mBatch = async (symbols = [], limit = 6) => {
 
   for (const loc of DATA_LOCATIONS) {
     try {
-      const sp = new URLSearchParams({ timeframe: '1Min', limit: String(limit), symbols: missing.join(',') });
-      const url = `${DATA_ROOT_CRYPTO}/${loc}/bars?${sp.toString()}`;
-      const res = await fetchWithBudget(url, { headers: HEADERS });
-      if (!res.ok) {
-        const body = await res.text().catch(() => '');
-        log('quote_http_error', 'BARS', { status: res.status, loc, body: body?.slice?.(0, 120) });
-        continue;
-      }
-      const payload = await res.json().catch(() => null);
+      const url = buildAlpacaUrl({
+        baseUrl: DATA_ROOT_CRYPTO,
+        path: `${loc}/bars`,
+        params: { timeframe: '1Min', limit: String(limit), symbols: missing.join(',') },
+        label: 'crypto_bars_batch',
+      });
+      const payload = await fetchMarketData('BARS', url);
       const raw = payload?.bars || {};
       for (const dsym of missing) {
         const arr = raw[dsym];
@@ -308,11 +403,16 @@ export const getCryptoBars1mBatch = async (symbols = [], limit = 6) => {
             .filter((x) => Number.isFinite(x.close) && x.close > 0);
           barsCache.set(dsym, { ts: now, bars: bars.slice() });
           out.set(dsym.replace('/', ''), bars.slice(0, limit));
+        } else {
+          log('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'BARS' });
         }
       }
       break;
     } catch (err) {
-      log('quote_http_error', 'BARS', { status: 'exception', loc, body: err?.message || '' });
+      log('quote_http_error', 'BARS', { status: err?.statusCode || err?.code || 'exception', loc, body: err?.responseSnippet || err?.message || '' });
+      for (const dsym of missing) {
+        log('no_quote', dsym.replace('/', ''), { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
+      }
     }
   }
   return out;
@@ -322,16 +422,21 @@ export const stocksLatestQuotesBatch = async (symbols = []) => {
   if (!symbols.length) return new Map();
   const csv = symbols.join(',');
   try {
-    const res = await fetchWithBudget(`${DATA_ROOT_STOCKS_V2}/quotes/latest?symbols=${encodeURIComponent(csv)}`, {
-      headers: HEADERS,
+    const url = buildAlpacaUrl({
+      baseUrl: DATA_ROOT_STOCKS_V2,
+      path: 'quotes/latest',
+      params: { symbols: csv },
+      label: 'stocks_latest_quotes',
     });
-    if (!res.ok) return new Map();
-    const body = await res.json().catch(() => null);
+    const body = await fetchMarketData('QUOTE', url);
     const out = new Map();
     for (const sym of symbols) {
       const qraw = body?.quotes?.[sym];
       const q = Array.isArray(qraw) ? qraw[0] : qraw;
-      if (!q) continue;
+      if (!q) {
+        log('no_quote', sym, { reason: 'no_data', requestType: 'QUOTE' });
+        continue;
+      }
       const bid = Number(q.bp ?? q.bid_price);
       const ask = Number(q.ap ?? q.ask_price);
       const bs = Number(q.bs ?? q.bid_size);
@@ -349,7 +454,10 @@ export const stocksLatestQuotesBatch = async (symbols = []) => {
     }
     return out;
   } catch (err) {
-    log('quote_http_error', 'STOCK_QUOTE', { message: err?.message });
+    log('quote_http_error', 'STOCK_QUOTE', { status: err?.statusCode || err?.code || 'exception', body: err?.responseSnippet || err?.message || '' });
+    for (const sym of symbols) {
+      log('no_quote', sym, { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
+    }
     return new Map();
   }
 };

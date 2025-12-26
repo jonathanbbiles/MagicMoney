@@ -32,7 +32,8 @@ export async function rateLimitedFetch(url, opts = {}, timeoutMs = 12000, retrie
       clearTimeout(timer);
       if (res.status === 429 || res.status >= 500) {
         if (i === retries) return res;
-        await sleep(400 * Math.pow(2, i) + Math.floor(Math.random() * 300));
+        const extra = res.status === 429 ? 1200 + Math.floor(Math.random() * 800) : 0;
+        await sleep(400 * Math.pow(2, i) + Math.floor(Math.random() * 300) + extra);
         continue;
       }
       return res;
