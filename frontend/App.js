@@ -24,7 +24,12 @@ const ALPACA_KEY = 'AKANN0IP04IH45Z6FG3L';
 const ALPACA_SECRET = 'qvaKRqP9Q3XMVMEYqVnq2BEgPGhQQQfWg1JT7bWV';
 // Force LIVE trading endpoint, ignoring EX/APCA overrides
 const ALPACA_BASE_URL = EX.APCA_API_BASE || 'https://api.alpaca.markets/v2';
-const BACKEND_BASE_URL = EX.BACKEND_BASE_URL || 'http://localhost:3000';
+const RENDER_BACKEND_URL = 'https://magicmoney.onrender.com';
+// Dev-only override for physical devices: set to your LAN IP (e.g., 'http://192.168.x.x:10000').
+const DEV_LAN_IP = '';
+const BACKEND_BASE_URL = __DEV__
+  ? (EX.BACKEND_BASE_URL || DEV_LAN_IP || 'http://localhost:3000')
+  : (EX.BACKEND_BASE_URL || RENDER_BACKEND_URL);
 
 const DATA_ROOT_CRYPTO = 'https://data.alpaca.markets/v1beta3/crypto';
 // IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
@@ -47,6 +52,7 @@ if (typeof ALPACA_BASE_URL === 'string' && /paper-api\.alpaca\.markets/i.test(AL
   throw new Error('Paper trading endpoint detected. LIVE ONLY is enforced. Fix ALPACA_BASE_URL.');
 }
 console.log('[Alpaca ENV]', { base: ALPACA_BASE_URL, mode: 'LIVE' });
+console.log('[Backend ENV]', { base: BACKEND_BASE_URL });
 
 getAccountSummaryRaw().then(() => {
   console.log('✅ Connected to Alpaca LIVE endpoint:', ALPACA_BASE_URL);
