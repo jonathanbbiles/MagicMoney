@@ -14,6 +14,7 @@ const {
   getAlpacaAuthStatus,
   getLastHttpError,
   getAlpacaConnectivityStatus,
+  runDustCleanup,
 } = require('./trade');
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
@@ -162,6 +163,8 @@ initializeInventoryFromPositions()
   .then((inventory) => {
 
     console.log(`Initialized inventory for ${inventory.size} symbols.`);
+
+    return runDustCleanup();
 
   })
 

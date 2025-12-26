@@ -87,6 +87,7 @@ const FORCE_EXIT_SECONDS = Number(process.env.FORCE_EXIT_SECONDS || 600);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 8);
+const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const QUOTE_CACHE_MAX_AGE_SECONDS = 60;
 
 const inventoryState = new Map();
@@ -164,12 +165,18 @@ function parseQuoteTimestamp(quote) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function setLastQuoteAt(symbol, tsMs) {
-  if (Number.isFinite(tsMs)) {
-    lastQuoteAt.set(symbol, tsMs);
-  } else {
-    lastQuoteAt.set(symbol, null);
-  }
+function recordLastQuoteAt(symbol, { tsMs, source, reason }) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const entry = {
+    tsMs: Number.isFinite(tsMs) ? tsMs : null,
+    source,
+    reason: reason || null,
+  };
+  lastQuoteAt.set(normalizedSymbol, entry);
+}
+
+function isDustQty(qty) {
+  return Number.isFinite(qty) && Math.abs(qty) <= MIN_POSITION_QTY;
 }
 
 function normalizeSymbol(rawSymbol) {
@@ -288,6 +295,12 @@ async function initializeInventoryFromPositions() {
     const avgPrice = Number(pos.avg_entry_price ?? pos.avgEntryPrice ?? 0);
 
     if (!Number.isFinite(qty) || !Number.isFinite(avgPrice) || qty <= 0 || avgPrice <= 0) {
+
+      continue;
+
+    }
+
+    if (isDustQty(qty)) {
 
       continue;
 
@@ -675,9 +688,11 @@ async function getLatestQuote(rawSymbol) {
   const now = Date.now();
   const cached = quoteCache.get(symbol);
   let staleCache = false;
+  const cachedTsMs = cached && Number.isFinite(cached.tsMs) ? cached.tsMs : null;
   if (cached && Number.isFinite(cached.tsMs)) {
     const ageSeconds = (now - cached.tsMs) / 1000;
     if (ageSeconds <= QUOTE_CACHE_MAX_AGE_SECONDS) {
+      recordLastQuoteAt(symbol, { tsMs: cached.tsMs, source: 'cache' });
       return {
         bid: cached.bid,
         ask: cached.ask,
@@ -712,6 +727,7 @@ async function getLatestQuote(rawSymbol) {
     } else {
       logSkip('no_quote', { symbol, reason: 'api_error' });
     }
+    recordLastQuoteAt(symbol, { tsMs: cachedTsMs, source: 'error', reason: 'api_error' });
     throw err;
   }
 
@@ -719,12 +735,17 @@ async function getLatestQuote(rawSymbol) {
   if (!quote) {
     const reason = staleCache ? 'stale_cache' : 'no_data';
     logSkip('no_quote', { symbol, reason });
+    recordLastQuoteAt(symbol, {
+      tsMs: staleCache ? cachedTsMs : null,
+      source: staleCache ? 'stale' : 'error',
+      reason,
+    });
     throw new Error(`Quote not available for ${symbol}`);
   }
 
   const tsMs = parseQuoteTimestamp(quote);
   if (!Number.isFinite(tsMs)) {
-    setLastQuoteAt(symbol, null);
+    recordLastQuoteAt(symbol, { tsMs: null, source: 'error', reason: 'parse_error' });
     logSkip('no_quote', { symbol, reason: 'parse_error' });
     throw new Error(`Quote timestamp missing for ${symbol}`);
   }
@@ -737,7 +758,7 @@ async function getLatestQuote(rawSymbol) {
     tsMs,
   };
   quoteCache.set(symbol, normalizedQuote);
-  setLastQuoteAt(symbol, tsMs);
+  recordLastQuoteAt(symbol, { tsMs, source: 'fresh' });
   return normalizedQuote;
 
 }
@@ -1549,11 +1570,15 @@ async function fetchOpenPositions() {
   }
   const positions = Array.isArray(res) ? res : [];
   return positions
-    .map((pos) => ({
-      symbol: normalizeSymbol(pos.symbol),
-      qty: Number(pos.qty ?? pos.quantity ?? 0),
-    }))
-    .filter((pos) => Number.isFinite(pos.qty) && pos.qty > 0);
+    .map((pos) => {
+      const qty = Number(pos.qty ?? pos.quantity ?? 0);
+      return {
+        symbol: normalizeSymbol(pos.symbol),
+        qty,
+        isDust: isDustQty(qty),
+      };
+    })
+    .filter((pos) => Number.isFinite(pos.qty) && pos.qty !== 0);
 }
 
 async function fetchOpenOrders() {
@@ -1574,7 +1599,8 @@ async function getConcurrencyGuardStatus() {
     fetchOpenPositions(),
     fetchOpenOrders(),
   ]);
-  const positionSymbols = new Set(openPositions.map((pos) => pos.symbol));
+  const nonDustPositions = openPositions.filter((pos) => !pos.isDust);
+  const positionSymbols = new Set(nonDustPositions.map((pos) => pos.symbol));
   const orderSymbols = new Set(openOrders.map((order) => order.symbol));
   const activeSymbols = new Set([...positionSymbols, ...orderSymbols]);
   const activeSlotsUsed = activeSymbols.size;
@@ -1595,20 +1621,70 @@ async function getConcurrencyGuardStatus() {
 function getLastQuoteSnapshot() {
   const now = Date.now();
   const snapshot = {};
-  for (const [symbol, tsMs] of lastQuoteAt.entries()) {
+  for (const [symbol, entry] of lastQuoteAt.entries()) {
+    const tsMs = entry?.tsMs;
     if (Number.isFinite(tsMs)) {
       snapshot[symbol] = {
-        timestamp: new Date(tsMs).toISOString(),
+        ts: new Date(tsMs).toISOString(),
         ageSeconds: (now - tsMs) / 1000,
+        source: entry.source,
+        reason: entry.reason ?? undefined,
       };
     } else {
       snapshot[symbol] = {
-        timestamp: null,
+        ts: null,
         ageSeconds: null,
+        source: entry?.source,
+        reason: entry?.reason ?? undefined,
       };
     }
   }
   return snapshot;
+}
+
+async function runDustCleanup() {
+  const dustCleanupEnabled = String(process.env.DUST_CLEANUP || '').toLowerCase() === 'true';
+  if (!dustCleanupEnabled) {
+    return;
+  }
+  const autoSellEnabled = String(process.env.AUTO_SELL_DUST || '').toLowerCase() === 'true';
+  let positions = [];
+  try {
+    positions = await fetchOpenPositions();
+  } catch (err) {
+    console.warn('dust_cleanup_fetch_failed', err?.message || err);
+    return;
+  }
+  const dustPositions = positions.filter((pos) => pos.isDust);
+  if (!dustPositions.length) {
+    console.log('dust_cleanup', { detected: 0 });
+    return;
+  }
+
+  for (const dust of dustPositions) {
+    console.log('dust_position_detected', { symbol: dust.symbol, qty: dust.qty });
+    if (!autoSellEnabled) {
+      continue;
+    }
+    if (!Number.isFinite(dust.qty) || dust.qty <= 0) {
+      console.log('dust_auto_sell_skipped', { symbol: dust.symbol, qty: dust.qty, reason: 'non_positive_qty' });
+      continue;
+    }
+    try {
+      const result = await submitMarketSell({
+        symbol: dust.symbol,
+        qty: dust.qty,
+        reason: 'dust_cleanup',
+      });
+      console.log('dust_auto_sell_submitted', { symbol: dust.symbol, qty: dust.qty, orderId: result?.id });
+    } catch (err) {
+      console.warn('dust_auto_sell_failed', {
+        symbol: dust.symbol,
+        qty: dust.qty,
+        error: err?.responseSnippet200 || err?.errorMessage || err?.message || err,
+      });
+    }
+  }
 }
 
 function getAlpacaAuthStatus() {
@@ -1706,5 +1782,6 @@ module.exports = {
   getAlpacaAuthStatus,
   getLastHttpError,
   getAlpacaConnectivityStatus,
+  runDustCleanup,
 
 };
