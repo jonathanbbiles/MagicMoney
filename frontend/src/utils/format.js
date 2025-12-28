@@ -7,29 +7,33 @@ export const fmtUSD = (n) =>
 
 export const fmtPct = (n) => (Number.isFinite(n) ? `${n.toFixed(2)}%` : '—');
 
-export const parseTsMs = (t) => {
-  if (t == null) return NaN;
-  if (typeof t === 'string') {
-    const ms = Date.parse(t);
-    if (Number.isFinite(ms)) return ms;
-    const n = +t;
-    if (Number.isFinite(n)) {
-      if (n > 1e15) return Math.floor(n / 1e6);
-      if (n > 1e12) return Math.floor(n / 1e3);
-      if (n > 1e10) return n;
-      if (n > 1e9) return n * 1000;
-    }
-    return NaN;
+export const normalizeQuoteTsMs = (rawTs) => {
+  if (rawTs == null) return null;
+  if (rawTs instanceof Date) {
+    const ts = rawTs.getTime();
+    return Number.isFinite(ts) ? ts : null;
   }
-  if (typeof t === 'number') {
-    if (t > 1e15) return Math.floor(t / 1e6);
-    if (t > 1e12) return Math.floor(t / 1e3);
-    if (t > 1e10) return t;
-    if (t > 1e9) return t * 1000;
-    return t;
+  if (typeof rawTs === 'string') {
+    const trimmed = rawTs.trim();
+    if (!trimmed) return null;
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) return normalizeEpochNumber(numeric);
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
   }
-  return NaN;
+  if (typeof rawTs === 'number') {
+    return normalizeEpochNumber(rawTs);
+  }
+  return null;
 };
+
+const normalizeEpochNumber = (rawTs) => {
+  if (!Number.isFinite(rawTs)) return null;
+  const abs = Math.abs(rawTs);
+  return abs < 2e10 ? abs * 1000 : abs;
+};
+
+export const parseTsMs = normalizeQuoteTsMs;
 
 export const isFresh = (tsMs, ttlMs) => Number.isFinite(tsMs) && Date.now() - tsMs <= ttlMs;
 

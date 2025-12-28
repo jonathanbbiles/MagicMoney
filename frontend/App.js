@@ -408,34 +408,33 @@ const fmtUSD = (n) =>
     : '—';
 const fmtPct = (n) => (Number.isFinite(n) ? `${n.toFixed(2)}%` : '—');
 
-// Robust parser for RFC3339 strings and epoch-like numbers (ns/µs/ms/s)
-const parseTsMs = (t) => {
-  if (t == null) return NaN;
-
-  // Strings: try Date.parse first, else numeric fallback
-  if (typeof t === 'string') {
-    const ms = Date.parse(t);
-    if (Number.isFinite(ms)) return ms;
-    const n = +t;
-    if (!Number.isFinite(n)) return NaN;
-    return parseEpochLike(n);
+const normalizeQuoteTsMs = (rawTs) => {
+  if (rawTs == null) return null;
+  if (rawTs instanceof Date) {
+    const ts = rawTs.getTime();
+    return Number.isFinite(ts) ? ts : null;
   }
-
-  if (typeof t === 'number') {
-    return parseEpochLike(t);
+  if (typeof rawTs === 'string') {
+    const trimmed = rawTs.trim();
+    if (!trimmed) return null;
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) return normalizeEpochNumber(numeric);
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
   }
-  return NaN;
+  if (typeof rawTs === 'number') {
+    return normalizeEpochNumber(rawTs);
+  }
+  return null;
 };
 
-function parseEpochLike(n) {
-  const abs = Math.abs(n);
-  // ns (~1e18), µs (~1e15), ms (~1e12), s (~1e9)
-  if (abs >= 1e18) return Math.floor(abs / 1e6);  // ns → ms
-  if (abs >= 1e15) return Math.floor(abs / 1e3);  // µs → ms
-  if (abs >= 1e12) return abs;                    // ms
-  if (abs >= 1e9)  return abs * 1000;             // s → ms
-  return abs;                                     // assume ms
-}
+const normalizeEpochNumber = (rawTs) => {
+  if (!Number.isFinite(rawTs)) return null;
+  const abs = Math.abs(rawTs);
+  return abs < 2e10 ? abs * 1000 : abs;
+};
+
+const parseTsMs = normalizeQuoteTsMs;
 const isFresh = (tsMs, ttlMs) => Number.isFinite(tsMs) && (Date.now() - tsMs <= ttlMs);
 
 const emaArr = (arr, span) => {
@@ -1500,7 +1499,7 @@ function fmtSkipDetail(reason, d = {}) {
     switch (reason) {
       case 'no_quote': {
         if (Number.isFinite(d.freshSec)) return ` (fresh≤${Math.round(d.freshSec)}s)`;
-        return '';
+        return ' (fresh=NA)';
       }
       case 'spread': {
         const sb = Number(d.spreadBps)?.toFixed?.(1);
