@@ -1,4 +1,5 @@
-const MAX_STALE_AGE_SECONDS = 7 * 24 * 3600;
+const MAX_QUOTE_AGE_SEC = Number(process.env.MAX_QUOTE_AGE_SEC || 120);
+const ABSURD_AGE_SEC = Number(process.env.ABSURD_AGE_SEC || 86400);
 const MAX_CLOCK_SKEW_SECONDS = 5;
 
 function normalizeQuoteTsMs(rawTs) {
@@ -43,13 +44,21 @@ function computeQuoteAgeSeconds({ nowMs, tsMs }) {
   return ageSec;
 }
 
+function normalizeQuoteAgeSeconds(ageSec) {
+  if (!Number.isFinite(ageSec)) return null;
+  if (ageSec > ABSURD_AGE_SEC) return null;
+  return ageSec;
+}
+
 function isStaleQuoteAge(ageSec) {
-  return Number.isFinite(ageSec) && ageSec > MAX_STALE_AGE_SECONDS;
+  return Number.isFinite(ageSec) && ageSec > MAX_QUOTE_AGE_SEC;
 }
 
 module.exports = {
-  MAX_STALE_AGE_SECONDS,
+  MAX_QUOTE_AGE_SEC,
+  ABSURD_AGE_SEC,
   normalizeQuoteTsMs,
   computeQuoteAgeSeconds,
+  normalizeQuoteAgeSeconds,
   isStaleQuoteAge,
 };
