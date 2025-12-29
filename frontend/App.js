@@ -1,5 +1,5 @@
 // app.js
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   View,
   Text,
@@ -14,6 +14,13 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
+
+// SAFETY PATCH NOTES:
+// - Moved import-time connectivity call into a mount-only effect.
+// - Added AbortControllers to prevent overlapping monitorOutcome loops.
+// - Buffered log UI updates to reduce render thrash.
+// - Centralized timer cleanup/guards to avoid runaway loops.
+// - Mirrored halt state for UI consistency without altering logic.
 
 /* ──────────────────────────────── 1) VERSION / CONFIG ──────────────────────────────── */
 const VERSION = 'v1';
@@ -54,11 +61,22 @@ if (typeof ALPACA_BASE_URL === 'string' && /paper-api\.alpaca\.markets/i.test(AL
 console.log('[Alpaca ENV]', { base: ALPACA_BASE_URL, mode: 'LIVE' });
 console.log('[Backend ENV]', { base: BACKEND_BASE_URL });
 
-getAccountSummaryRaw().then(() => {
-  console.log('✅ Connected to Alpaca LIVE endpoint:', ALPACA_BASE_URL);
-}).catch((e) => {
-  console.log('❌ Alpaca connection error:', e?.message || e);
-});
+function bootConnectivityCheck(setStatusFn) {
+  let active = true;
+  (async () => {
+    try {
+      await getAccountSummaryRaw();
+      if (!active) return;
+      console.log('✅ Connected to Alpaca LIVE endpoint:', ALPACA_BASE_URL);
+      setStatusFn?.({ ok: true, checkedAt: new Date().toISOString(), error: null });
+    } catch (e) {
+      if (!active) return;
+      console.log('❌ Alpaca connection error:', e?.message || e);
+      setStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: e?.message || String(e) });
+    }
+  })();
+  return () => { active = false; };
+}
 
 /* ───────────────────────────── 2) CORE CONSTANTS / STRATEGY ───────────────────────────── */
 // Fee constants retained for compatibility but no longer used for gating logic.
@@ -231,6 +249,10 @@ const SIMPLE_SETTINGS_ONLY = true;
 // Per-symbol overrides live here. Example: { SOLUSD: { spreadMaxBps: 130 } }
 let SETTINGS_OVERRIDES = {};
 
+function getEffectiveSettings(localSettings) {
+  return localSettings || SETTINGS;
+}
+
 // Effective setting helper: tries per-symbol override, falls back to global setting
 function eff(symbol, key) {
   const o = SETTINGS_OVERRIDES?.[symbol];
@@ -240,6 +262,37 @@ function eff(symbol, key) {
 
 /* ─────────────────────────────── 4) UTILITIES / HTTP ─────────────────────────────── */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleepWithSignal = (ms, signal) =>
+  new Promise((resolve) => {
+    if (!signal) {
+      sleep(ms).then(() => resolve(true));
+      return;
+    }
+    if (signal.aborted) {
+      resolve(false);
+      return;
+    }
+    let t = null;
+    const onAbort = () => {
+      if (t) clearTimeout(t);
+      resolve(false);
+    };
+    t = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+function safeJsonParse(raw, fallback = null, context = 'unknown') {
+  if (!raw) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    console.warn('JSON parse failed', { context, error: err?.message || err });
+    return fallback;
+  }
+}
 
 // --- Global request rate limiter (simple token bucket) ---
 let __TOKENS = 180; // ~180 req/min default budget
@@ -2270,6 +2323,11 @@ function pushMFE(sym, mfe, maxKeep = 120) {
 }
 let TRADING_HALTED = false;
 let HALT_REASON = '';
+function syncHaltState(setHaltState) {
+  if (typeof setHaltState === 'function') {
+    setHaltState({ halted: TRADING_HALTED, reason: HALT_REASON });
+  }
+}
 function shouldHaltTrading(changePct) {
   if (!Number.isFinite(changePct)) return false;
   if (SETTINGS.haltOnDailyLoss && changePct <= -Math.abs(SETTINGS.dailyMaxLossPct)) {
@@ -3142,11 +3200,20 @@ export default function App() {
   const [autoTrade, setAutoTrade] = useState(true);
   const [notification, setNotification] = useState(null);
   const [logHistory, setLogHistory] = useState([]);
+  const [connectivity, setConnectivity] = useState({ ok: null, checkedAt: null, error: null });
+  const [haltState, setHaltState] = useState({ halted: TRADING_HALTED, reason: HALT_REASON });
 
   const [overrides, setOverrides] = useState({});
   const [lastSkips, setLastSkips] = useState({});
   const lastSkipsRef = useRef({});
   const [overrideSym, setOverrideSym] = useState(null);
+  const overrideSymRef = useRef(overrideSym);
+  const logUiBufferRef = useRef([]);
+  const logFlushTimerRef = useRef(null);
+  const notificationTimerRef = useRef(null);
+  const scanTimerRef = useRef(null);
+  const dustSweepTimerRef = useRef(null);
+  const monitorControllersRef = useRef(new Map());
 
   const skipHistoryRef = useRef(new Map());
   const lastAutoTuneRef = useRef(new Map());
@@ -3167,13 +3234,15 @@ export default function App() {
   const [openMeta, setOpenMeta] = useState({ positions: 0, orders: 0, allowed: CRYPTO_CORE_TRACKED.length, universe: CRYPTO_CORE_TRACKED.length });
   const [scanStats, setScanStats] = useState({ ready: 0, attempted: 0, filled: 0, watch: 0, skipped: 0, reasons: {} });
 
-  const [settings, setSettings] = useState({ ...SETTINGS });
+  const [settings, setSettings] = useState({ ...getEffectiveSettings() });
+  const effectiveSettings = useMemo(() => getEffectiveSettings(settings), [settings]);
   useEffect(() => {
     (async () => {
       try {
         const raw = await AsyncStorage.getItem(SETTINGS_STORAGE_KEY);
         if (raw) {
-          const parsed = JSON.parse(raw);
+          const parsed = safeJsonParse(raw, null, 'settings');
+          if (!parsed) return;
           const migrated = migrateSettings(parsed);
           setSettings(migrated);
           SETTINGS = { ...migrated };
@@ -3188,7 +3257,7 @@ export default function App() {
   }, [settings]);
   useEffect(() => {
     SETTINGS = { ...settings };
-    logTradeAction('risk_changed', 'SETTINGS', { level: SETTINGS.riskLevel, spreadMax: SETTINGS.spreadMaxBps });
+    logTradeAction('risk_changed', 'SETTINGS', { level: effectiveSettings.riskLevel, spreadMax: effectiveSettings.spreadMaxBps });
   }, [settings]);
 
   useEffect(() => {
@@ -3216,17 +3285,55 @@ export default function App() {
   };
 
   useEffect(() => {
+    overrideSymRef.current = overrideSym;
+  }, [overrideSym]);
+
+  useEffect(() => {
+    const cancel = bootConnectivityCheck(setConnectivity);
+    return () => { if (typeof cancel === 'function') cancel(); };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      for (const controller of monitorControllersRef.current.values()) {
+        controller.abort();
+      }
+      monitorControllersRef.current.clear();
+      if (notificationTimerRef.current) clearTimeout(notificationTimerRef.current);
+      if (scanTimerRef.current) clearTimeout(scanTimerRef.current);
+      if (dustSweepTimerRef.current) clearTimeout(dustSweepTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
     registerLogSubscriber((entry) => {
-      const f = friendlyLog(entry);
-      setLogHistory((prev) => [
-        { ts: entry.timestamp, sev: f.sev, text: f.text, hint: null, raw: entry },
-        ...prev,
-      ].slice(0, LOG_UI_LIMIT));
-      if (entry?.type === 'entry_skipped' && entry?.symbol) {
-        lastSkipsRef.current[entry.symbol] = entry;
-        setLastSkips({ ...lastSkipsRef.current });
-        if (!overrideSym) setOverrideSym(entry.symbol);
-        {
+      logUiBufferRef.current.push(entry);
+    });
+    const seed = logBuffer
+      .slice(-LOG_UI_LIMIT)
+      .reverse()
+      .map((e) => {
+        const f = friendlyLog(e);
+        return { ts: e.timestamp, sev: f.sev, text: f.text, hint: null, raw: e };
+      });
+    if (seed.length) setLogHistory(seed);
+
+    logFlushTimerRef.current = setInterval(() => {
+      const buffer = logUiBufferRef.current;
+      if (!buffer.length) return;
+      logUiBufferRef.current = [];
+      const batch = buffer.slice().reverse().map((entry) => {
+        const f = friendlyLog(entry);
+        return { ts: entry.timestamp, sev: f.sev, text: f.text, hint: null, raw: entry };
+      });
+      setLogHistory((prev) => [...batch, ...prev].slice(0, LOG_UI_LIMIT));
+
+      let skipsChanged = false;
+      for (const entry of buffer) {
+        if (entry?.type === 'entry_skipped' && entry?.symbol) {
+          lastSkipsRef.current[entry.symbol] = entry;
+          skipsChanged = true;
+          if (!overrideSymRef.current) setOverrideSym(entry.symbol);
           const sym = entry.symbol;
           const arr = skipHistoryRef.current.get(sym) || [];
           arr.push({
@@ -3241,19 +3348,20 @@ export default function App() {
           skipHistoryRef.current.set(sym, arr);
         }
       }
-    });
-    const seed = logBuffer
-      .slice(-LOG_UI_LIMIT)
-      .reverse()
-      .map((e) => {
-        const f = friendlyLog(e);
-        return { ts: e.timestamp, sev: f.sev, text: f.text, hint: null, raw: e };
-      });
-    if (seed.length) setLogHistory(seed);
+      if (skipsChanged) setLastSkips({ ...lastSkipsRef.current });
+    }, 350);
+
+    return () => {
+      if (logFlushTimerRef.current) clearInterval(logFlushTimerRef.current);
+      logFlushTimerRef.current = null;
+      logUiBufferRef.current = [];
+      registerLogSubscriber(null);
+    };
   }, []);
   const showNotification = (msg) => {
     setNotification(msg);
-    setTimeout(() => setNotification(null), 5000);
+    if (notificationTimerRef.current) clearTimeout(notificationTimerRef.current);
+    notificationTimerRef.current = setTimeout(() => setNotification(null), 5000);
   };
 
   useEffect(() => {
@@ -3280,10 +3388,13 @@ export default function App() {
         TRADING_HALTED = true;
         logTradeAction('daily_halt', 'SYSTEM', { reason: HALT_REASON });
         showNotification(`⛔ Trading halted: ${HALT_REASON}`);
+        syncHaltState(setHaltState);
       } else {
         TRADING_HALTED = false;
+        syncHaltState(setHaltState);
       }
     } catch (e) {
+      console.warn('Account fetch failed', { error: e?.message || e });
       logTradeAction('quote_exception', 'ACCOUNT', { error: e.message });
     } finally { setIsUpdatingAcct(false); }
   };
@@ -3294,8 +3405,8 @@ export default function App() {
     try {
       const m = await getCryptoQuotesBatch(['BTC/USD','ETH/USD']);
       const bt = m.get('BTC/USD'), et = m.get('ETH/USD');
-      const freshB = !!bt && isFresh(bt.tms, SETTINGS.liveFreshMsCrypto);
-      const freshE = !!et && isFresh(et.tms, SETTINGS.liveFreshMsCrypto);
+      const freshB = !!bt && isFresh(bt.tms, effectiveSettings.liveFreshMsCrypto);
+      const freshE = !!et && isFresh(et.tms, effectiveSettings.liveFreshMsCrypto);
       report.sections.crypto = { ok: !!(freshB || freshE), detail: { 'BTC/USD': !!freshB, 'ETH/USD': !!freshE } };
       logTradeAction(freshB || freshE ? 'health_ok' : 'health_warn', 'SYSTEM', { section: 'crypto', note: freshB || freshE ? '' : 'no fresh quotes' });
     } catch (e) {
@@ -3306,16 +3417,18 @@ export default function App() {
     setHealth(report);
   }
 
-  async function monitorOutcome(symbol, entryPx, v0) {
+  async function monitorOutcome(symbol, entryPx, v0, signal) {
     const HORIZ_MIN = 3, STEP_MS = 10000;
     let t0 = Date.now(), best = 0;
     while (Date.now() - t0 < HORIZ_MIN * 60 * 1000) {
+      if (signal?.aborted) return;
       let price = null;
       const m = await getCryptoTradesBatch([toDataSymbol(symbol)]);
       const one = m.get(toDataSymbol(symbol));
       price = Number.isFinite(one?.price) ? one.price : null;
       if (Number.isFinite(price)) best = Math.max(best, price - entryPx);
-      await sleep(STEP_MS);
+      const waited = await sleepWithSignal(STEP_MS, signal);
+      if (!waited) return;
     }
     if (v0 > 0 && best > 0) {
       const g_hat = (v0 * v0) / (2 * best);
@@ -3323,7 +3436,7 @@ export default function App() {
       s.drag_g = ewma(s.drag_g, g_hat, 0.2);
       pushMFE(symbol, best);
       const hr = new Date().getUTCHours();
-      const need = (requiredProfitBpsForSymbol(symbol, SETTINGS.riskLevel) / 10000) * entryPx;
+      const need = (requiredProfitBpsForSymbol(symbol, effectiveSettings.riskLevel) / 10000) * entryPx;
       const hb = s.hitByHour[hr] || (s.hitByHour[hr] = { h: 0, t: 0 });
       hb.t += 1;
       if (best >= need) hb.h += 1;
@@ -3332,7 +3445,7 @@ export default function App() {
 
   async function computeEntrySignal(asset, d, riskLvl, preQuoteMap = null, preBarsMap = null) {
     let bars1 = [];
-    if (SETTINGS.enforceMomentum) {
+    if (effectiveSettings.enforceMomentum) {
       if (preBarsMap && preBarsMap.has(asset.symbol)) {
         bars1 = preBarsMap.get(asset.symbol) || [];
       } else {
@@ -3340,7 +3453,7 @@ export default function App() {
       }
     }
     const closes = Array.isArray(bars1) ? bars1.map((b) => b.close) : [];
-    const { sigma, sigmaBps } = ewmaSigmaFromCloses(closes.slice(-16), SETTINGS.volHalfLifeMin);
+    const { sigma, sigmaBps } = ewmaSigmaFromCloses(closes.slice(-16), effectiveSettings.volHalfLifeMin);
     const symEntry = (symStats[asset.symbol] ||= {});
     if (!Array.isArray(symEntry.mfeHist)) symEntry.mfeHist = [];
     if (!Array.isArray(symEntry.hitByHour)) symEntry.hitByHour = Array.from({ length: 24 }, () => ({ h: 0, t: 0 }));
@@ -3393,7 +3506,7 @@ export default function App() {
     }
 
     const feeBps = roundTripFeeBpsEstimate(asset.symbol);
-    if (SETTINGS.requireSpreadOverFees && spreadBps < feeBps + eff(asset.symbol, 'spreadOverFeesMinBps')) {
+    if (effectiveSettings.requireSpreadOverFees && spreadBps < feeBps + eff(asset.symbol, 'spreadOverFeesMinBps')) {
       return { entryReady: false, why: 'spread_fee_gate', meta: { spreadBps, feeBps } };
     }
 
@@ -3402,18 +3515,18 @@ export default function App() {
     const v0 = closes.length >= 2 ? closes.at(-1) - closes.at(-2) : 0;
     const breakout = closes.length >= 6 ? closes.at(-1) >= Math.max(...closes.slice(-6, -1)) * 1.001 : true;
     let _momentumPenalty = false;
-    if (SETTINGS.enforceMomentum && !(v0 >= 0 || slopeUp || breakout)) {
+    if (effectiveSettings.enforceMomentum && !(v0 >= 0 || slopeUp || breakout)) {
       // Momentum penalty: reduce pUp later instead of hard veto
       _momentumPenalty = true;
     }
 
     symEntry.spreadEwmaBps = ewma(symEntry.spreadEwmaBps, spreadBps, 0.2);
-    const slipEw = symEntry.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[riskLvl] ?? 1);
+    const slipEw = symEntry.slipEwmaBps ?? (effectiveSettings.slipBpsByRisk?.[riskLvl] ?? 1);
 
     const stopBaseBps = eff(asset.symbol, 'stopLossBps');
     const effStopBps = Math.max(
       stopBaseBps,
-      Math.round((SETTINGS.stopVolMult || 2.5) * (sigmaBpsEff || 0))
+      Math.round((effectiveSettings.stopVolMult || 2.5) * (sigmaBpsEff || 0))
     );
 
     const needDyn = Math.max(
@@ -3421,7 +3534,7 @@ export default function App() {
       exitFloorBps(asset.symbol) + 0.5 + slipEw,
       eff(asset.symbol, 'netMinProfitBps')
     );
-    const needBpsVol = Math.max(needDyn, Math.round((SETTINGS.tpVolScale || 1.0) * (sigmaBpsEff || 0)));
+    const needBpsVol = Math.max(needDyn, Math.round((effectiveSettings.tpVolScale || 1.0) * (sigmaBpsEff || 0)));
 
     const aPrice = q.bid * (effStopBps / 10000);
     const bPrice = q.bid * (needBpsVol / 10000);
@@ -3436,14 +3549,14 @@ export default function App() {
       pUp = clamp(0.5 + 0.5 * (pUp - 0.5) * 0.6, 0.05, 0.95); // shrink toward 0.5
     }
 
-    const sellBps = SETTINGS.takerExitOnTouch ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker;
+    const sellBps = effectiveSettings.takerExitOnTouch ? effectiveSettings.feeBpsTaker : effectiveSettings.feeBpsMaker;
     const EVps = expectedValuePerShare({
       pUp,
       aPrice,
       bPrice,
       entryPx: q.bid,
       sellFeeBps: sellBps,
-      buyFeeBps: SETTINGS.feeBpsMaker,
+      buyFeeBps: effectiveSettings.feeBpsMaker,
       slippageBps: slipEw,
     });
 
@@ -3458,16 +3571,16 @@ export default function App() {
     }
 
     // ── EV guard (fail-open if disabled) ─────────────────────────────────────────
-    if (SETTINGS.evGuardEnabled) {
+    if (effectiveSettings.evGuardEnabled) {
       // Compute EV in bps relative to entry
-      const evBps = expectedValueBps({ symbol: asset.symbol, q, tpBps: needBpsCapped, buyBpsOverride: SETTINGS.feeBpsMaker });
+      const evBps = expectedValueBps({ symbol: asset.symbol, q, tpBps: needBpsCapped, buyBpsOverride: effectiveSettings.feeBpsMaker });
       const evUsd = (evBps / 10000) * q.bid; // per 1 unit; order sizing handled later
 
-      if (SETTINGS.evShowDebug) {
+      if (effectiveSettings.evShowDebug) {
         logTradeAction('quote_ok', asset.symbol, { evBps: Number(evBps?.toFixed?.(2)), tpBps: Number(needBpsCapped?.toFixed?.(1)) });
       }
 
-      if (!(evBps >= (SETTINGS.evMinBps ?? -1) || evUsd >= (SETTINGS.evMinUSD ?? -0.02))) {
+      if (!(evBps >= (effectiveSettings.evMinBps ?? -1) || evUsd >= (effectiveSettings.evMinUSD ?? -0.02))) {
         return { entryReady: false, why: 'edge_negative_ev', meta: { evBps, evUsd, tpBps: needBpsCapped } };
       }
     }
@@ -3511,13 +3624,13 @@ export default function App() {
     const held = await getPositionInfo(symbol);
     const avail = Number(held?.available ?? 0);
     const mv    = Number(held?.marketValue ?? 0);
-    const trulyHeld = avail > 0 || mv >= SETTINGS.dustFlattenMaxUsd;
+    const trulyHeld = avail > 0 || mv >= effectiveSettings.dustFlattenMaxUsd;
     if (trulyHeld) {
       logTradeAction('entry_skipped', symbol, { entryReady: false, reason: 'held' });
       return false;
     }
 
-    const sig = sigPre || (await computeEntrySignal({ symbol, cc: ccSymbol }, d, SETTINGS.riskLevel, preQuoteMap, null));
+    const sig = sigPre || (await computeEntrySignal({ symbol, cc: ccSymbol }, d, effectiveSettings.riskLevel, preQuoteMap, null));
     if (!sig.entryReady) return false;
 
     // Fetch fresh, pending-aware BP to avoid 403s
@@ -3543,21 +3656,21 @@ export default function App() {
     if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig?.quote?.bid;
 
     let kellyNotional = null;
-    if (SETTINGS.kellyEnabled && sig && Number.isFinite(sig.pUp) && Number.isFinite(sig.EVps)) {
+    if (effectiveSettings.kellyEnabled && sig && Number.isFinite(sig.pUp) && Number.isFinite(sig.EVps)) {
       const entryForKelly = Number.isFinite(entryPx) && entryPx > 0 ? entryPx : sig?.quote?.ask;
       const stopBps = eff(symbol, 'stopLossBps');
       const aPrice = Math.max(0, (entryForKelly || 0) * (stopBps / 10000));
       const bPrice = Math.max(0, (sig.tp ?? 0) - (entryForKelly || 0));
-      const sellFee = (SETTINGS.takerExitOnTouch ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker);
+      const sellFee = (effectiveSettings.takerExitOnTouch ? effectiveSettings.feeBpsTaker : effectiveSettings.feeBpsMaker);
       const U = Math.max(1e-9, bPrice - ((sellFee * (entryForKelly || 0)) / 10000));
-      const D = Math.max(1e-9, aPrice + ((SETTINGS.feeBpsMaker * (entryForKelly || 0)) / 10000));
+      const D = Math.max(1e-9, aPrice + ((effectiveSettings.feeBpsMaker * (entryForKelly || 0)) / 10000));
       const fKelly = ((sig.pUp * U) - ((1 - sig.pUp) * D)) / Math.max(1e-9, U * D);
-      const f = clamp((SETTINGS.kellyFraction || 0.5) * Math.max(0, fKelly), 0, SETTINGS.maxPosPctEquity / 100);
+      const f = clamp((effectiveSettings.kellyFraction || 0.5) * Math.max(0, fKelly), 0, effectiveSettings.maxPosPctEquity / 100);
       kellyNotional = f * equity;
     }
 
     // Cap per position
-    const desired  = Math.min(buyingPower, (SETTINGS.maxPosPctEquity / 100) * equity);
+    const desired  = Math.min(buyingPower, (effectiveSettings.maxPosPctEquity / 100) * equity);
     const notionalBase = capNotional(symbol, desired, equity);
     const notional = Number.isFinite(kellyNotional) && kellyNotional > 0
       ? Math.min(notionalBase, kellyNotional)
@@ -3574,7 +3687,7 @@ export default function App() {
 
     // Size using ask (or join) + fees + a tiny cushion
     const pxForSizing = (sig?.quote?.ask ?? sig?.quote?.bid);
-    const feeFrac = (SETTINGS.feeBpsMaker || 15) / 10000; // assume maker for entry
+    const feeFrac = (effectiveSettings.feeBpsMaker || 15) / 10000; // assume maker for entry
     const cushion = 0.0008; // 8 bps headroom
     const denom = Math.max(pxForSizing * (1 + feeFrac + cushion), 1e-9);
     let qty = +(notional / denom).toFixed(9);
@@ -3590,20 +3703,20 @@ export default function App() {
     const actualEntry = result.entry ?? entryPx;
     const actualQty = result.qty ?? qty;
 
-    const buyBpsApplied = result.liquidity === 'taker' ? SETTINGS.feeBpsTaker : SETTINGS.feeBpsMaker;
+    const buyBpsApplied = result.liquidity === 'taker' ? effectiveSettings.feeBpsTaker : effectiveSettings.feeBpsMaker;
 
     const barsR = await getCryptoBars1m(symbol, 12);
     const closesR = Array.isArray(barsR) ? barsR.map((b) => b.close) : [];
-    const { sigma: sigmaRun } = ewmaSigmaFromCloses(closesR.slice(-12), SETTINGS.volHalfLifeMin);
-    const runwayUSD = robustRunwayUSD(symbol, actualEntry, sigmaRun, SETTINGS.pTouchHorizonMin, symStats);
+    const { sigma: sigmaRun } = ewmaSigmaFromCloses(closesR.slice(-12), effectiveSettings.volHalfLifeMin);
+    const runwayUSD = robustRunwayUSD(symbol, actualEntry, sigmaRun, effectiveSettings.pTouchHorizonMin, symStats);
 
     const approxMid = sig && sig.quote ? 0.5 * (sig.quote.bid + sig.quote.ask) : actualEntry;
     const slipBpsVal = Number.isFinite(approxMid) && approxMid > 0 ? ((actualEntry - (sig?.quote?.bid ?? entryPx)) / approxMid) * 10000 : 0;
     const s = (refs.tradeStateRef.current[symbol] ||= { hitByHour: Array.from({ length: 24 }, () => ({ h: 0, t: 0 })), mfeHist: [] });
     s.slipEwmaBps = ewma(s.slipEwmaBps, Math.max(0, slipBpsVal), 0.2);
 
-    const slipEw = s.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[SETTINGS.riskLevel] ?? 1);
-    const needBps0 = requiredProfitBpsForSymbol(symbol, SETTINGS.riskLevel);
+    const slipEw = s.slipEwmaBps ?? (effectiveSettings.slipBpsByRisk?.[effectiveSettings.riskLevel] ?? 1);
+    const needBps0 = requiredProfitBpsForSymbol(symbol, effectiveSettings.riskLevel);
     const needBpsAdj = Math.max(needBps0, exitFloorBps(symbol) + 0.5 + slipEw, eff(symbol, 'netMinProfitBps'));
     const tpBase = Math.max(sig?.tp ?? 0, actualEntry * (1 + needBpsAdj / 10000));
     const feeFloor = minExitPriceFeeAwareDynamic({ symbol, entryPx: actualEntry, qty: actualQty, buyBpsOverride: buyBpsApplied });
@@ -3617,7 +3730,17 @@ export default function App() {
     };
     await ensureLimitTP(symbol, tpCapped, { tradeStateRef, touchMemoRef });
 
-    monitorOutcome(symbol, actualEntry, sig?.v0 ?? 0).catch(() => {});
+    const prevController = monitorControllersRef.current.get(symbol);
+    if (prevController) prevController.abort();
+    const controller = new AbortController();
+    monitorControllersRef.current.set(symbol, controller);
+    monitorOutcome(symbol, actualEntry, sig?.v0 ?? 0, controller.signal)
+      .catch(() => {})
+      .finally(() => {
+        if (monitorControllersRef.current.get(symbol) === controller) {
+          monitorControllersRef.current.delete(symbol);
+        }
+      });
     return true;
   };
 
@@ -3637,7 +3760,7 @@ export default function App() {
           const basePos = posBySym.get(symbol) || p;
           const avail = Number(basePos.qty_available ?? basePos.available ?? basePos.qty ?? 0);
           const mv    = Number(basePos.market_value ?? basePos.marketValue ?? 0);
-          if (!(avail > 0 || mv >= SETTINGS.dustFlattenMaxUsd)) {
+          if (!(avail > 0 || mv >= effectiveSettings.dustFlattenMaxUsd)) {
             // Not truly held → don’t maintain TP/stop; also clear stale trade state
             delete tradeStateRef.current[symbol];
             riskTrailStateRef.current.delete(symbol);
@@ -3651,15 +3774,15 @@ export default function App() {
           };
           tradeStateRef.current[symbol] = s;
 
-          const slipEw = symStats[symbol]?.slipEwmaBps ?? (SETTINGS.slipBpsByRisk?.[SETTINGS.riskLevel] ?? 1);
-          const needAdj = Math.max(requiredProfitBpsForSymbol(symbol, SETTINGS.riskLevel), exitFloorBps(symbol) + 0.5 + slipEw, eff(symbol, 'netMinProfitBps'));
+          const slipEw = symStats[symbol]?.slipEwmaBps ?? (effectiveSettings.slipBpsByRisk?.[effectiveSettings.riskLevel] ?? 1);
+          const needAdj = Math.max(requiredProfitBpsForSymbol(symbol, effectiveSettings.riskLevel), exitFloorBps(symbol) + 0.5 + slipEw, eff(symbol, 'netMinProfitBps'));
           const entryBase = Number(s.entry || basePos.avg_entry_price || basePos.mark || 0);
           const barsMaint = await getCryptoBars1m(symbol, 12);
           const closesMaint = Array.isArray(barsMaint) ? barsMaint.map((b) => b.close) : [];
-          const { sigma: sigmaMaint } = ewmaSigmaFromCloses(closesMaint.slice(-12), SETTINGS.volHalfLifeMin);
+          const { sigma: sigmaMaint } = ewmaSigmaFromCloses(closesMaint.slice(-12), effectiveSettings.volHalfLifeMin);
           const tpBase = entryBase * (1 + needAdj / 10000);
           const feeFloor = minExitPriceFeeAwareDynamic({ symbol, entryPx: entryBase, qty: avail, buyBpsOverride: s.buyBpsApplied });
-          const runwayUSD = robustRunwayUSD(symbol, entryBase, sigmaMaint, SETTINGS.pTouchHorizonMin, symStats);
+          const runwayUSD = robustRunwayUSD(symbol, entryBase, sigmaMaint, effectiveSettings.pTouchHorizonMin, symStats);
           const tp = Math.max(Math.min(tpBase, entryBase + (runwayUSD || 0)), feeFloor);
           s.tp = tp; s.feeFloor = feeFloor; s.runway = runwayUSD;
 
@@ -3689,7 +3812,7 @@ export default function App() {
           if (STABLES.has(sym) || BLACKLIST.has(sym)) continue;
           const mv = Number(p.market_value ?? p.marketValue ?? 0);
           const avail = Number(p.qty_available ?? p.available ?? p.qty ?? 0);
-          if (mv > 0 && mv < SETTINGS.dustFlattenMaxUsd && avail > 0 && !openSellBySym.has(sym)) {
+          if (mv > 0 && mv < effectiveSettings.dustFlattenMaxUsd && avail > 0 && !openSellBySym.has(sym)) {
             const mkt = { symbol: sym, qty: avail, side: 'sell', type: 'market', time_in_force: 'gtc' };
             try {
               const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(mkt) });
@@ -3702,10 +3825,17 @@ export default function App() {
           }
         }
       } catch {}
-      if (!stopped) setTimeout(sweep, SETTINGS.dustSweepMinutes * 60 * 1000);
+      if (!stopped) {
+        if (dustSweepTimerRef.current) clearTimeout(dustSweepTimerRef.current);
+        dustSweepTimerRef.current = setTimeout(sweep, effectiveSettings.dustSweepMinutes * 60 * 1000);
+      }
     };
     sweep();
-    return () => { stopped = true; };
+    return () => {
+      stopped = true;
+      if (dustSweepTimerRef.current) clearTimeout(dustSweepTimerRef.current);
+      dustSweepTimerRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -3809,13 +3939,13 @@ export default function App() {
       }).length;
 
       let cryptosAll = effectiveTracked;
-      const cryptoPages = Math.max(1, Math.ceil(Math.max(0, cryptosAll.length) / SETTINGS.stockPageSize));
+      const cryptoPages = Math.max(1, Math.ceil(Math.max(0, cryptosAll.length) / effectiveSettings.stockPageSize));
       const cIdx = cryptoPageRef.current % cryptoPages;
-      const cStart = cIdx * SETTINGS.stockPageSize;
-      const cryptoSlice = cryptosAll.slice(cStart, Math.min(cStart + SETTINGS.stockPageSize, cryptosAll.length));
+      const cStart = cIdx * effectiveSettings.stockPageSize;
+      const cryptoSlice = cryptosAll.slice(cStart, Math.min(cStart + effectiveSettings.stockPageSize, cryptosAll.length));
       cryptoPageRef.current += 1;
 
-      const barsMap = SETTINGS.enforceMomentum ? await getCryptoBars1mBatch(cryptoSlice.map(t => t.symbol), 6) : null;
+      const barsMap = effectiveSettings.enforceMomentum ? await getCryptoBars1mBatch(cryptoSlice.map(t => t.symbol), 6) : null;
 
       setOpenMeta({ positions: openCount, orders: (allOpenOrders || []).length, allowed: cryptosAll.length, universe: cryptosAll.length });
       logTradeAction('scan_start', 'STATIC', { batch: cryptoSlice.length });
@@ -3846,7 +3976,7 @@ export default function App() {
           const isHolding = !!(posNow && Number(posNow.qty) > 0);
           tradeStateRef.current[asset.symbol] = { ...prevState, wasHolding: isHolding };
 
-          const sig = await computeEntrySignal(asset, d, SETTINGS.riskLevel, batchMap, barsMap);
+          const sig = await computeEntrySignal(asset, d, effectiveSettings.riskLevel, batchMap, barsMap);
           token.entryReady = sig.entryReady;
 
           if (sig?.quote && sig.quote.bid > 0 && sig.quote.ask > 0) {
@@ -3919,11 +4049,18 @@ export default function App() {
           await loadData();
         }
       } finally {
-        if (!cancelled) setTimeout(tick, Math.max(1000, SETTINGS.scanMs));
+        if (!cancelled) {
+          if (scanTimerRef.current) clearTimeout(scanTimerRef.current);
+          scanTimerRef.current = setTimeout(tick, Math.max(1000, effectiveSettings.scanMs));
+        }
       }
     };
     tick();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (scanTimerRef.current) clearTimeout(scanTimerRef.current);
+      scanTimerRef.current = null;
+    };
   }, [settings.scanMs, tracked?.length]);
 
   const onRefresh = () => {
@@ -3932,7 +4069,7 @@ export default function App() {
   };
   const bp = acctSummary.buyingPower, chPct = acctSummary.dailyChangePct;
 
-  const okWindowMs = Math.max(SETTINGS.scanMs * 3, 6000);
+  const okWindowMs = Math.max(effectiveSettings.scanMs * 3, 6000);
   const statusColor = isLoading ? '#7fd180' : !lastScanAt ? '#9aa0a6' : Date.now() - lastScanAt < okWindowMs ? '#7fd180' : '#f7b801';
 
   const bump = (key, delta, opts = {}) => {
@@ -3952,10 +4089,10 @@ export default function App() {
         let nextVal = clamp((Number(cur) || 0) + delta, bounds.min ?? -1e9, bounds.max ?? 1e9);
 
         // Safety rails for auto‑tune
-        const feesSum = (SETTINGS.feeBpsMaker + SETTINGS.feeBpsTaker);
+        const feesSum = (effectiveSettings.feeBpsMaker + effectiveSettings.feeBpsTaker);
         if (key === 'dynamicMinProfitBps' && nextVal < (feesSum + 5)) nextVal = feesSum + 5;
         if (key === 'spreadOverFeesMinBps' && nextVal < 0) nextVal = 0;
-        if (key === 'netMinProfitBps' && nextVal < SETTINGS.autoTuneMinNetMinBps) nextVal = SETTINGS.autoTuneMinNetMinBps;
+        if (key === 'netMinProfitBps' && nextVal < effectiveSettings.autoTuneMinNetMinBps) nextVal = effectiveSettings.autoTuneMinNetMinBps;
 
         const oo = { ...(o || {}) };
         const row = { ...(oo[sym] || {}) };
