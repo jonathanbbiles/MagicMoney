@@ -407,6 +407,10 @@ const fmtUSD = (n) =>
     ? `$ ${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
     : '—';
 const fmtPct = (n) => (Number.isFinite(n) ? `${n.toFixed(2)}%` : '—');
+const MAX_QUOTE_AGE_SEC = 120;
+const ABSURD_AGE_SEC = 86400;
+const MAX_LOGGED_QUOTE_AGE_SEC = 9999;
+const MAX_CLOCK_SKEW_SECONDS = 5;
 
 const normalizeQuoteTsMs = (rawTs) => {
   if (rawTs == null) return null;
@@ -436,6 +440,16 @@ const normalizeEpochNumber = (rawTs) => {
 
 const parseTsMs = normalizeQuoteTsMs;
 const isFresh = (tsMs, ttlMs) => Number.isFinite(tsMs) && (Date.now() - tsMs <= ttlMs);
+const computeQuoteAgeSeconds = ({ nowMs, tsMs }) => {
+  if (!Number.isFinite(nowMs) || !Number.isFinite(tsMs)) return null;
+  let ageSec = (nowMs - tsMs) / 1000;
+  if (!Number.isFinite(ageSec)) return null;
+  if (ageSec < -MAX_CLOCK_SKEW_SECONDS) ageSec = 0;
+  if (ageSec > ABSURD_AGE_SEC) return null;
+  return ageSec;
+};
+const formatLoggedAgeSeconds = (ageSec) =>
+  Number.isFinite(ageSec) ? Math.min(Math.round(ageSec), MAX_LOGGED_QUOTE_AGE_SEC) : null;
 
 const emaArr = (arr, span) => {
   if (!arr?.length) return [];
@@ -465,7 +479,7 @@ const SYM_MAP = {
   'SOL/USD':'SOLUSD','SOL-USD':'SOLUSD','SOLUSD':'SOLUSD',
   'AAVE/USD':'AAVEUSD','AAVE-USD':'AAVEUSD','AAVEUSD':'AAVEUSD',
 };
-function normSymbol(s) {
+function toTradeSymbol(s) {
   if (!s) return null;
   const t = String(s).trim().toUpperCase();
   if (SYM_MAP[t]) return SYM_MAP[t];
@@ -477,13 +491,14 @@ function normSymbol(s) {
 
 function toDataSymbol(sym) {
   if (!sym) return sym;
-  if (sym.includes('/')) return sym;
-  if (sym.endsWith('USD')) {
-    const base = sym.slice(0, -3);
-    if (!base || base.toUpperCase().endsWith('USD')) return `${sym}/USD`;
+  const normalized = toTradeSymbol(sym);
+  if (normalized.includes('/')) return normalized;
+  if (normalized.endsWith('USD')) {
+    const base = normalized.slice(0, -3);
+    if (!base || base.toUpperCase().endsWith('USD')) return `${normalized}/USD`;
     return `${base}/USD`;
   }
-  return sym;
+  return normalized;
 }
 function isCrypto(sym) { return /USD$/.test(sym); }
 function isStock(sym) { return !isCrypto(sym); }
@@ -783,7 +798,7 @@ function buildEventsFromActivities(acts = []) {
   const evs = [];
   for (const a of acts) {
     const t = String(a.activity_type || a.activityType || '').toUpperCase();
-    const sym = normSymbol(a.symbol || a.symbol_id || null);
+    const sym = toTradeSymbol(a.symbol || a.symbol_id || null);
     const side = String(a.side || '').toLowerCase();
     const qty = Number(a.qty ?? a.cum_qty ?? a.quantity ?? 0);
     const price = Number(a.price ?? a.fill_price ?? a.avg_price ?? 0);
@@ -1498,8 +1513,14 @@ function fmtSkipDetail(reason, d = {}) {
   try {
     switch (reason) {
       case 'no_quote': {
-        if (Number.isFinite(d.freshSec)) return ` (fresh≤${Math.round(d.freshSec)}s)`;
         return ' (fresh=NA)';
+      }
+      case 'stale_quote': {
+        if (Number.isFinite(d.ageSec)) return ` (age=${Math.min(MAX_LOGGED_QUOTE_AGE_SEC, Math.round(d.ageSec))}s)`;
+        if (Number.isFinite(d.lastSeenAgeSec)) {
+          return ` (last_seen_age=${Math.min(MAX_LOGGED_QUOTE_AGE_SEC, Math.round(d.lastSeenAgeSec))}s)`;
+        }
+        return ' (age=NA)';
       }
       case 'spread': {
         const sb = Number(d.spreadBps)?.toFixed?.(1);
@@ -3328,13 +3349,22 @@ export default function App() {
 
     const q = await getQuoteSmart(asset.symbol, preQuoteMap);
     if (!q || !(q.bid > 0 && q.ask > 0)) {
-      let freshSec = null;
+      let lastSeenAgeSec = null;
       try {
         const tm = await getCryptoTradesBatch([toDataSymbol(asset.symbol)]);
         const t = tm.get(toDataSymbol(asset.symbol));
-        if (t?.tms) freshSec = (Date.now() - t.tms) / 1000;
+        if (t?.tms) {
+          lastSeenAgeSec = computeQuoteAgeSeconds({ nowMs: Date.now(), tsMs: t.tms });
+        }
       } catch {}
-      return { entryReady: false, why: 'no_quote', meta: { freshSec } };
+      if (Number.isFinite(lastSeenAgeSec)) {
+        return {
+          entryReady: false,
+          why: 'stale_quote',
+          meta: { lastSeenAgeSec: formatLoggedAgeSeconds(lastSeenAgeSec) },
+        };
+      }
+      return { entryReady: false, why: 'no_quote', meta: { freshSec: null } };
     }
 
     const mm = microMetrics(q);
@@ -3961,6 +3991,7 @@ export default function App() {
     }
     if (why === 'nomomo') return `momentum filter`;
     if (why === 'no_quote') return `no fresh quote`;
+    if (why === 'stale_quote') return `stale quote`;
     return why;
   }
 

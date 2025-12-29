@@ -196,6 +196,7 @@ async function httpJson({
       continue;
     }
 
+    result.error.attempts = attempt + 1;
     return result;
   }
 
