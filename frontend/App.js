@@ -1113,10 +1113,10 @@ const SUPPORTED_CRYPTO_CACHE_KEY = 'supported_crypto_pairs_v1';
 const SUPPORTED_CRYPTO_CACHE_TS_KEY = 'supported_crypto_pairs_last_refresh_v1';
 const SUPPORTED_CRYPTO_REFRESH_MS = 24 * 60 * 60 * 1000;
 const quoteCache = new Map();
+const lastQuoteBatchMissing = new Map();
 const unsupportedSymbols = new Map();
 const unsupportedLocalSymbols = new Set();
 const unsupportedLogTimestamps = new Map();
-const universeDropLogTimestamps = new Map();
 const isUnsupported = (sym) => {
   const normalized = toInternalSymbol(sym);
   const u = unsupportedSymbols.get(normalized);
@@ -1140,7 +1140,7 @@ const logUnsupportedOnce = (sym, meta = {}) => {
   const last = unsupportedLogTimestamps.get(normalized) || 0;
   if (now - last < 3600 * 1000) return;
   unsupportedLogTimestamps.set(normalized, now);
-  logTradeAction('entry_skipped', normalized, { entryReady: false, reason: 'unsupported_pair', ...meta });
+  console.warn('unsupported_symbol', { symbol: normalized, ...meta });
 };
 const markUnsupportedLocal = (sym, mins = 120) => {
   const normalized = toInternalSymbol(sym);
@@ -1148,15 +1148,6 @@ const markUnsupportedLocal = (sym, mins = 120) => {
   unsupportedLocalSymbols.add(normalized);
   markUnsupported(normalized, mins);
   logUnsupportedOnce(normalized);
-};
-const logUniverseDropOnce = (sym) => {
-  const normalized = toInternalSymbol(sym);
-  if (!normalized) return;
-  const now = Date.now();
-  const last = universeDropLogTimestamps.get(normalized) || 0;
-  if (now - last < 3600 * 1000) return;
-  universeDropLogTimestamps.set(normalized, now);
-  console.log(`UNIVERSE DROP unsupported: ${normalized}`);
 };
 const isUnsupportedAssetError = (err) => {
   if (err?.statusCode === 404) return true;
@@ -1759,7 +1750,11 @@ const FRIENDLY = {
   taker_force_flip: { sev: 'warn', msg: (d) => `TAKER force flip @~${d?.limit ?? ''}` },
   tp_limit_error: { sev: 'error', msg: (d) => `TP set error: ${d.error}` },
   scan_start: { sev: 'info', msg: (d) => `Scan start (batch ${d.batch})` },
-  scan_summary: { sev: 'info', msg: (d) => `Scan: ready ${d.readyCount} / attempts ${d.attemptCount} / fills ${d.successCount}` },
+  scan_summary: {
+    sev: 'info',
+    msg: (d) =>
+      `Scan: ready ${d.readyCount} / attempts_sent ${d.attemptsSent} / attempts_failed ${d.attemptsFailed} / open ${d.ordersOpen} / fills ${d.fillsCount}`,
+  },
   scan_error: { sev: 'error', msg: (d) => `Scan error: ${d.error}` },
   skip_wide_spread: { sev: 'warn', msg: (d) => `Skip: spread ${d.spreadBps} bps > max` },
   skip_small_order: { sev: 'warn', msg: () => `Skip: below min notional or funding` },
@@ -1916,16 +1911,25 @@ async function getQuotesBatch(symbols) {
     const internalSymbols = Array.from(new Set(cryptos)).filter((sym) => !isUnsupportedLocal(sym));
     for (let i = 0; i < internalSymbols.length; i += 6) {
       const slice = internalSymbols.slice(i, i + 6);
+      const missing = [];
       let qmap = await getCryptoQuotesBatch(slice);
       for (const symbol of slice) {
         const q = qmap.get(symbol);
-        if (!q) continue;
+        if (!q) {
+          missing.push(symbol);
+          quoteCache.delete(symbol);
+          continue;
+        }
 
         // Freshness by exchange timestamp
         const fresh = isFresh(q.tms, SETTINGS.liveFreshMsCrypto);
 
         // If not fresh, do NOT include in batch output or cache
-        if (!fresh) continue;
+        if (!fresh) {
+          missing.push(symbol);
+          quoteCache.delete(symbol);
+          continue;
+        }
 
         out.set(symbol, {
           bid: q.bid,
@@ -1940,7 +1944,15 @@ async function getQuotesBatch(symbols) {
           ts: now,
           q: { bid: q.bid, ask: q.ask, bs: q.bs ?? null, as: q.as ?? null, tms: q.tms }
         });
+        lastQuoteBatchMissing.delete(symbol);
       }
+      if (missing.length) {
+        for (const symbol of missing) {
+          lastQuoteBatchMissing.set(symbol, now);
+        }
+      }
+      const gotCount = slice.length - missing.length;
+      console.log(`QUOTE_BATCH got=${gotCount} missing=${missing.length} missingSymbols=${JSON.stringify(missing)}`);
     }
   }
 
@@ -2105,16 +2117,26 @@ function requiredProfitBpsForSymbol(symbol, riskLevel) {
 /* ───────────────────────────── 19) ACCOUNT / ORDERS ───────────────────────────── */
 const logOrderPayload = (context, order) => {
   if (!order) return;
+  const symbol = toInternalSymbol(order.symbol);
   const payload = {
-    symbol: toInternalSymbol(order.symbol),
+    symbol,
     qty: order.qty ?? null,
     notional: order.notional ?? null,
     side: order.side,
     type: order.type,
     time_in_force: order.time_in_force,
     limit_price: order.limit_price,
+    postOnly: order.post_only ?? order.postOnly ?? null,
   };
-  console.log('order_send', { context, ...payload });
+  const notionalText = payload.notional ?? '';
+  const qtyText = payload.qty ?? '';
+  const limitText = payload.limit_price ?? '';
+  const tifText = payload.time_in_force ?? '';
+  const postOnlyText = payload.postOnly ?? '';
+  console.log(
+    `ORDER_SUBMIT ${symbol} side=${payload.side} notional=${notionalText} qty=${qtyText} type=${payload.type} limit=${limitText} tif=${tifText} postOnly=${postOnlyText}`
+  );
+  return payload;
 };
 
 const logOrderResponse = (context, order, res, data) => {
@@ -2128,20 +2150,40 @@ const logOrderResponse = (context, order, res, data) => {
     limit_price: order?.limit_price,
   };
   if (res?.ok && data?.id) {
-    console.log('order_success', {
-      context,
-      id: data.id,
-      status: data.status || data.order_status || 'accepted',
-      ...payload,
-    });
+    console.log(
+      `ORDER_RESULT ${payload.symbol} id=${data.id} status=${data.status || data.order_status || 'accepted'} filled_qty=${data.filled_qty ?? 0} filled_avg_price=${data.filled_avg_price ?? ''} submitted_at=${data.submitted_at ?? ''}`
+    );
   } else {
-    console.warn('order_failed', {
-      context,
-      status: res?.status ?? null,
-      code: data?.code ?? data?.error_code ?? null,
-      message: data?.message || data?.error || data?.raw || 'unknown_error',
-      ...payload,
-    });
+    const message = data?.message || data?.error || data?.raw || 'unknown_error';
+    console.warn(
+      `ORDER_ERROR ${payload.symbol} http=${res?.status ?? 'NA'} code=${data?.code ?? data?.error_code ?? ''} message=${message} body=${typeof data === 'string' ? data : JSON.stringify(data || {})}`
+    );
+  }
+  return payload;
+};
+
+const RECENT_ORDER_TTL_MS = 10 * 60 * 1000;
+const recentOrders = new Map();
+
+const recordRecentOrder = ({ id, symbol, status, submittedAt }) => {
+  if (!id) return;
+  const now = Date.now();
+  recentOrders.set(id, {
+    id,
+    symbol: toInternalSymbol(symbol),
+    status: status || null,
+    submittedAt: submittedAt || new Date(now).toISOString(),
+    lastSeenAt: now,
+  });
+};
+
+const pruneRecentOrders = () => {
+  const cutoff = Date.now() - RECENT_ORDER_TTL_MS;
+  for (const [id, order] of recentOrders.entries()) {
+    const ts = order?.lastSeenAt || Date.parse(order?.submittedAt || 0) || 0;
+    if (ts < cutoff) {
+      recentOrders.delete(id);
+    }
   }
 };
 
@@ -2174,14 +2216,15 @@ const getAllPositions = async () => {
     return Array.isArray(arr) ? arr : [];
   } catch { return []; }
 };
-const getOpenOrders = async () => {
+const getOrdersByStatus = async (status = 'open') => {
   try {
-    const r = await f(`${BACKEND_BASE_URL}/orders?status=open&nested=true&limit=100`, { headers: BACKEND_HEADERS });
+    const r = await f(`${BACKEND_BASE_URL}/orders?status=${encodeURIComponent(status)}&nested=true&limit=100`, { headers: BACKEND_HEADERS });
     if (!r.ok) return [];
     const arr = await r.json();
     return Array.isArray(arr) ? arr : [];
   } catch { return []; }
 };
+const getOpenOrders = async () => getOrdersByStatus('open');
 let __openOrdersCache = { ts: 0, items: [] };
 async function getOpenOrdersCached(ttlMs = 2000) {
   const now = Date.now();
@@ -2189,6 +2232,50 @@ async function getOpenOrdersCached(ttlMs = 2000) {
   const items = await getOpenOrders();
   __openOrdersCache = { ts: now, items };
   return items.slice();
+}
+
+const logOrderState = (order) => {
+  if (!order?.id) return;
+  const status = String(order.status || order.order_status || '').toLowerCase();
+  const filledQty = Number(order.filled_qty ?? order.filledQty ?? 0);
+  const qty = Number(order.qty ?? order.quantity ?? 0);
+  const remaining = Number.isFinite(qty) ? Math.max(0, qty - filledQty) : null;
+  const reason =
+    status === 'rejected' || status === 'canceled' || status === 'expired'
+      ? (order.reject_reason || order.rejectReason || order.cancel_reason || order.canceled_reason || order.reason || '')
+      : '';
+  const reasonText = reason ? ` reason=${reason}` : '';
+  console.log(`ORDER_STATE id=${order.id} status=${status || 'unknown'} filled_qty=${filledQty} remaining=${remaining}${reasonText}`);
+};
+
+async function pollRecentOrderStates() {
+  pruneRecentOrders();
+  if (!recentOrders.size) return { ordersOpen: 0 };
+  const openOrders = await getOrdersByStatus('open');
+  const openMap = new Map((openOrders || []).map((o) => [o.id, o]));
+  let ordersOpen = 0;
+
+  let allMap = null;
+  const recentIds = Array.from(recentOrders.keys());
+  if (recentIds.length) {
+    const allOrders = await getOrdersByStatus('all');
+    allMap = new Map((allOrders || []).map((o) => [o.id, o]));
+  }
+
+  for (const [id, order] of recentOrders.entries()) {
+    const openOrder = openMap.get(id);
+    if (openOrder) {
+      ordersOpen += 1;
+      logOrderState(openOrder);
+      order.lastSeenAt = Date.now();
+      continue;
+    }
+    if (allMap && allMap.has(id)) {
+      logOrderState(allMap.get(id));
+      order.lastSeenAt = Date.now();
+    }
+  }
+  return { ordersOpen };
 }
 
 let __positionsCache = { ts: 0, items: [] };
@@ -2882,6 +2969,10 @@ async function fetchAssetMeta(symbol) {
 async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usableBP = null) {
   const normalizedSymbol = toInternalSymbol(symbol);
   let attempted = false;
+  let attemptsSent = 0;
+  let attemptsFailed = 0;
+  let ordersOpen = 0;
+  let fillsCount = 0;
   await cancelOpenOrdersForSymbol(normalizedSymbol, 'buy');
   const meta = await fetchAssetMeta(normalizedSymbol);
   const rawTick = meta?._price_inc ?? (isStock(symbol) ? 0.01 : 1e-5);
@@ -2900,10 +2991,10 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     plannedQty = Math.floor(plannedQty);
   }
   plannedQty = quantizeQty(plannedQty);
-  if (!(plannedQty > 0)) return { filled: false, attempted };
+  if (!(plannedQty > 0)) return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
   if (plannedQty < MIN_TRADE_QTY) {
     logTradeAction('skip_small_order', normalizedSymbol, { reason: 'below_min_trade', qty: plannedQty, minQty: MIN_TRADE_QTY });
-    return { filled: false, attempted };
+    return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
   }
   qty = plannedQty;
 
@@ -2956,19 +3047,21 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       // Max qty allowed at this limit including buy fees
       const maxQty = Math.floor(((usableBP / (join * (1 + feeFracMaker))) / QINC) + 1e-9) * QINC;
       qty = quantizeQty(Math.min(qty, maxQty));
-      if (!(qty > 0)) return { filled: false, attempted };
+      if (!(qty > 0)) return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
     }
 
     const notionalPx = Number.isFinite(bidNow) && bidNow > 0
       ? bidNow
       : (Number.isFinite(askNow) && askNow > 0 ? askNow : join);
     if (meta && meta._min_notional > 0 && Number.isFinite(notionalPx) && notionalPx > 0) {
-      if (qty * notionalPx < meta._min_notional) return { filled: false, attempted };
+      if (qty * notionalPx < meta._min_notional) return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
     }
 
     if (isStock(symbol) && meta && meta._fractionable === false) {
       const px = notionalPx;
-      if (!(qty > 0) || !(px > 0) || qty * px < 5) return { filled: false, attempted };
+      if (!(qty > 0) || !(px > 0) || qty * px < 5) {
+        return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
+      }
     }
 
     const nowTs = Date.now();
@@ -2985,10 +3078,23 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       };
       try {
         logOrderPayload('buy_limit', order);
-        attempted = true;
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_limit', order, res, data);
+        if (res.ok && data.id) {
+          attempted = true;
+          attemptsSent += 1;
+          const filledQty = Number(data.filled_qty ?? 0);
+          const status = String(data.status || data.order_status || '').toLowerCase();
+          recordRecentOrder({ id: data.id, symbol: normalizedSymbol, status, submittedAt: data.submitted_at });
+          if (filledQty > 0 || status === 'filled') {
+            fillsCount += 1;
+          } else {
+            ordersOpen += 1;
+          }
+        } else {
+          attemptsFailed += 1;
+        }
         if (res.ok && data.id) {
           lastOrderId = data.id; placedLimit = join; lastReplaceAt = nowTs;
           logTradeAction('buy_camped', normalizedSymbol, { limit: order.limit_price });
@@ -2996,6 +3102,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         }
       } catch (e) {
         logTradeAction('quote_exception', normalizedSymbol, { error: e.message });
+        attemptsFailed += 1;
       }
     }
 
@@ -3010,7 +3117,8 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       });
       __positionsCache = { ts: 0, items: [] };
       __openOrdersCache = { ts: 0, items: [] };
-      return { filled: true, entry: pos.basis ?? placedLimit, qty: pos.qty, liquidity: 'maker', attempted };
+      if (fillsCount === 0) fillsCount = 1;
+      return { filled: true, entry: pos.basis ?? placedLimit, qty: pos.qty, liquidity: 'maker', attempted, attemptsSent, attemptsFailed, ordersOpen: 0, fillsCount };
     }
     await sleep(1200);
   }
@@ -3034,35 +3142,62 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         const pxRef = q.ask;
         const maxQty = Math.floor(((usableBP / (pxRef * (1 + feeFracTaker))) / QINC) + 1e-9) * QINC;
         mQty = quantizeQty(Math.min(mQty, maxQty));
-        if (!(mQty > 0)) return { filled: false, attempted };
+        if (!(mQty > 0)) return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
       }
-      if (!(mQty > 0)) return { filled: false, attempted };
+      if (!(mQty > 0)) return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
       if (meta && meta._min_notional > 0) {
         const pxRef = Number.isFinite(q.bid) && q.bid > 0 ? q.bid : q.ask;
-        if (Number.isFinite(pxRef) && pxRef > 0 && mQty * pxRef < meta._min_notional) return { filled: false, attempted };
+        if (Number.isFinite(pxRef) && pxRef > 0 && mQty * pxRef < meta._min_notional) {
+          return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
+        }
       }
       const tif = isStock(symbol) ? 'day' : 'gtc';
       const order = { symbol: normalizedSymbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif };
       try {
         logOrderPayload('buy_market', order);
-        attempted = true;
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_market', order, res, data);
         if (res.ok && data.id) {
+          attempted = true;
+          attemptsSent += 1;
+          const filledQty = Number(data.filled_qty ?? 0);
+          const status = String(data.status || data.order_status || '').toLowerCase();
+          recordRecentOrder({ id: data.id, symbol: normalizedSymbol, status, submittedAt: data.submitted_at });
+          if (filledQty > 0 || status === 'filled') {
+            fillsCount += 1;
+          } else {
+            ordersOpen += 1;
+          }
+        } else {
+          attemptsFailed += 1;
+        }
+        if (res.ok && data.id) {
           logTradeAction('buy_success', normalizedSymbol, { qty: mQty, limit: 'mkt' });
           __positionsCache = { ts: 0, items: [] };
           __openOrdersCache = { ts: 0, items: [] };
-          return { filled: true, entry: q.ask, qty: mQty, liquidity: 'taker', attempted };
+          if (fillsCount === 0) fillsCount = 1;
+          return {
+            filled: true,
+            entry: q.ask,
+            qty: mQty,
+            liquidity: 'taker',
+            attempted,
+            attemptsSent,
+            attemptsFailed,
+            ordersOpen: 0,
+            fillsCount,
+          };
         } else {
           logTradeAction('quote_exception', normalizedSymbol, { error: `BUY mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 80) || ''}` });
         }
       } catch (e) {
         logTradeAction('quote_exception', normalizedSymbol, { error: e.message });
+        attemptsFailed += 1;
       }
     }
   }
-  return { filled: false, attempted };
+  return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
 }
 
 async function marketSell(symbol, qty) {
@@ -3405,7 +3540,16 @@ export default function App() {
 
   const [lastScanAt, setLastScanAt] = useState(null);
   const [openMeta, setOpenMeta] = useState({ positions: 0, orders: 0, allowed: CRYPTO_CORE_TRACKED.length, universe: CRYPTO_CORE_TRACKED.length });
-  const [scanStats, setScanStats] = useState({ ready: 0, attempted: 0, filled: 0, watch: 0, skipped: 0, reasons: {} });
+  const [scanStats, setScanStats] = useState({
+    ready: 0,
+    attemptsSent: 0,
+    attemptsFailed: 0,
+    ordersOpen: 0,
+    fillsCount: 0,
+    watch: 0,
+    skipped: 0,
+    reasons: {},
+  });
 
   const [settings, setSettings] = useState({ ...getEffectiveSettings() });
   const effectiveSettings = useMemo(() => getEffectiveSettings(settings), [settings]);
@@ -3633,9 +3777,14 @@ export default function App() {
     }
   }
 
-  const logGateFail = (symbol, gate, detailText = '') => {
-    const details = detailText ? ` (${detailText})` : '';
-    console.log(`${symbol} — GateFail — ${gate}${details}`);
+  const logGateFail = (symbol, gate, detailText = '', details = null) => {
+    const detailsPayload = details && typeof details === 'object' ? details : null;
+    if (detailsPayload) {
+      console.log(`${symbol} — GateFail — ${gate}`, detailsPayload);
+      return;
+    }
+    const detailSuffix = detailText ? ` (${detailText})` : '';
+    console.log(`${symbol} — GateFail — ${gate}${detailSuffix}`);
   };
 
   const logReadyAttempt = ({ symbol, orderUsd, price, spreadBps }) => {
@@ -3666,16 +3815,20 @@ export default function App() {
 
     const q = await getQuoteSmart(asset.symbol, preQuoteMap);
     if (!q || !(q.bid > 0 && q.ask > 0)) {
+      const normalized = toInternalSymbol(asset.symbol);
+      const missingAt = lastQuoteBatchMissing.get(normalized);
+      if (missingAt && (Date.now() - missingAt) < 60000) {
+        return { entryReady: false, why: 'no_quote', meta: { freshSec: null } };
+      }
       let lastSeenAgeSec = null;
       try {
-        const symbol = toInternalSymbol(asset.symbol);
-        const tm = await getCryptoTradesBatch([symbol]);
-        const t = tm.get(symbol);
+        const tm = await getCryptoTradesBatch([normalized]);
+        const t = tm.get(normalized);
         if (Number.isFinite(t?.tms)) {
           let rawAgeSec = (Date.now() - t.tms) / 1000;
           if (rawAgeSec < -MAX_CLOCK_SKEW_SECONDS) rawAgeSec = 0;
           if (rawAgeSec > ABSURD_AGE_SEC) {
-            logBadQuoteTimestamp({ symbol, rawFields: { tms: t.tms } });
+            logBadQuoteTimestamp({ symbol: normalized, rawFields: { tms: t.tms } });
             rawAgeSec = null;
           }
           lastSeenAgeSec = Number.isFinite(rawAgeSec) ? rawAgeSec : null;
@@ -3847,20 +4000,32 @@ export default function App() {
     if (TRADING_HALTED) {
       logTradeAction('daily_halt', normalizedSymbol, { reason: HALT_REASON || 'Rule' });
       logGateFail(normalizedSymbol, 'trading_halted', `reason=${HALT_REASON || 'Rule'}`);
-      return { attempted: false, filled: false };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
     }
-    if (STABLES.has(normalizedSymbol)) return { attempted: false, filled: false };
+    if (STABLES.has(normalizedSymbol)) {
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
+    }
 
     await cleanupStaleBuyOrders(30);
+
+    let openOrdersCount = 0;
+    try {
+      const openOrders = await getOpenOrdersCached();
+      openOrdersCount = Array.isArray(openOrders) ? openOrders.length : 0;
+    } catch {}
+    const cap = concurrencyCapBySpread(globalSpreadAvgRef.current);
 
     try {
       const allPos = await getAllPositionsCached();
       const nonStableOpen = (allPos || []).filter((p) => Number(p.qty) > 0 && Number(p.market_value || p.marketValue || 0) > 1).length;
-      const cap = concurrencyCapBySpread(globalSpreadAvgRef.current);
       if (nonStableOpen >= cap) {
         logTradeAction('concurrency_guard', normalizedSymbol, { cap, avg: globalSpreadAvgRef.current, hitRate: (function(){let h=0,t=0;for(const s of Object.values(symStats)){for(const b of (s.hitByHour||[])){h+=b.h||0;t+=b.t||0;}}return t>0?(h/t):null;})() });
-        logGateFail(normalizedSymbol, 'max_positions', `open=${nonStableOpen}, cap=${cap}`);
-        return { attempted: false, filled: false };
+        logGateFail(normalizedSymbol, 'max_positions', '', {
+          open_positions_count: nonStableOpen,
+          max_positions: cap,
+          open_orders_count: openOrdersCount,
+        });
+        return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
       }
     } catch {}
 
@@ -3871,11 +4036,13 @@ export default function App() {
     if (trulyHeld) {
       logTradeAction('entry_skipped', normalizedSymbol, { entryReady: false, reason: 'held' });
       logGateFail(normalizedSymbol, 'held');
-      return { attempted: false, filled: false };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
     }
 
     const sig = sigPre || (await computeEntrySignal({ symbol: normalizedSymbol, cc: ccSymbol }, d, effectiveSettings.riskLevel, preQuoteMap, null, batchId));
-    if (!sig.entryReady) return { attempted: false, filled: false };
+    if (!sig.entryReady) {
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
+    }
 
     // Fetch fresh, pending-aware BP to avoid 403s
     const bpInfo = await getUsableBuyingPower({ forCrypto: isCrypto(normalizedSymbol) });
@@ -3893,8 +4060,13 @@ export default function App() {
     const buyingPower = bpInfo.usable; // this is the only number we size from
     if (!Number.isFinite(buyingPower) || buyingPower <= 0) {
       logTradeAction('entry_skipped', normalizedSymbol, { entryReady: true, reason: 'skip_small_order', note: 'no usable BP' });
-      logGateFail(normalizedSymbol, 'buying_power', `needed>0, avail=${Number.isFinite(buyingPower) ? buyingPower.toFixed(2) : buyingPower}`);
-      return { attempted: false, filled: false };
+      logGateFail(normalizedSymbol, 'buying_power', '', {
+        buying_power: Number.isFinite(buyingPower) ? Number(buyingPower.toFixed(2)) : buyingPower,
+        min_notional: 5,
+        open_orders_count: openOrdersCount,
+        max_positions: cap,
+      });
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
     }
 
     let entryPx = Number.isFinite(sig?.quote?.bid) && sig.quote.bid > 0 ? sig.quote.bid : sig?.quote?.ask;
@@ -3925,8 +4097,14 @@ export default function App() {
 
     if (!Number.isFinite(notional) || notional < 5) {
       logTradeAction('skip_small_order', normalizedSymbol);
-      logGateFail(normalizedSymbol, 'min_notional', `orderUsd=${Number(notional).toFixed(2)}, min=5`);
-      return { attempted: false, filled: false };
+      logGateFail(normalizedSymbol, 'min_notional', '', {
+        buying_power: Number.isFinite(buyingPower) ? Number(buyingPower.toFixed(2)) : buyingPower,
+        min_notional: 5,
+        open_orders_count: openOrdersCount,
+        max_positions: cap,
+        order_notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
+      });
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
     }
 
     if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig.quote.bid;
@@ -3939,9 +4117,25 @@ export default function App() {
     let qty = +(notional / denom).toFixed(9);
     if (!Number.isFinite(qty) || qty <= 0) {
       logTradeAction('skip_small_order', normalizedSymbol);
-      logGateFail(normalizedSymbol, 'min_notional', `orderUsd=${Number(notional).toFixed(2)}, min=5`);
-      return { attempted: false, filled: false };
+      logGateFail(normalizedSymbol, 'min_notional', '', {
+        buying_power: Number.isFinite(buyingPower) ? Number(buyingPower.toFixed(2)) : buyingPower,
+        min_notional: 5,
+        open_orders_count: openOrdersCount,
+        max_positions: cap,
+        order_notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
+        order_qty: qty,
+      });
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
     }
+
+    console.log(`${normalizedSymbol} — GateCheck`, {
+      buying_power: Number.isFinite(buyingPower) ? Number(buyingPower.toFixed(2)) : buyingPower,
+      min_notional: 5,
+      open_orders_count: openOrdersCount,
+      max_positions: cap,
+      order_notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
+      order_qty: qty,
+    });
 
     // console.log('USABLE BP', symbol, buyingPower);
     logReadyAttempt({
@@ -3951,7 +4145,16 @@ export default function App() {
       spreadBps: sig?.spreadBps,
     });
     const result = await placeMakerThenMaybeTakerBuy(normalizedSymbol, qty, preQuoteMap, buyingPower);
-    if (!result.filled) return { attempted: result.attempted, filled: false };
+    if (!result.filled) {
+      return {
+        attempted: result.attempted,
+        filled: false,
+        attemptsSent: result.attemptsSent ?? 0,
+        attemptsFailed: result.attemptsFailed ?? 0,
+        ordersOpen: result.ordersOpen ?? 0,
+        fillsCount: result.fillsCount ?? 0,
+      };
+    }
 
     const actualEntry = result.entry ?? entryPx;
     const actualQty = result.qty ?? qty;
@@ -3994,7 +4197,14 @@ export default function App() {
           monitorControllersRef.current.delete(normalizedSymbol);
         }
       });
-    return { attempted: true, filled: true };
+    return {
+      attempted: true,
+      filled: true,
+      attemptsSent: result.attemptsSent ?? 0,
+      attemptsFailed: result.attemptsFailed ?? 0,
+      ordersOpen: result.ordersOpen ?? 0,
+      fillsCount: result.fillsCount ?? 0,
+    };
   };
 
   useEffect(() => {
@@ -4191,13 +4401,25 @@ export default function App() {
         return Number.isFinite(mv) && mv > 1 && Number.isFinite(qty) && qty > 0;
       }).length;
 
-      const supportedSet = supportedCryptoSetRef.current;
-      const isSupportedSymbol = (sym) => !isUnsupportedLocal(sym) && isSupportedCryptoSymbol(sym, supportedSet);
+      let supportedSet = supportedCryptoSetRef.current;
+      if (!supportedSet || supportedSet.size === 0) {
+        supportedSet = await fetchSupportedCryptoPairs({ force: false });
+        supportedCryptoSetRef.current = supportedSet;
+      }
+      const isSupportedSymbol = (sym) => {
+        const normalized = normalizeCryptoSymbol(sym);
+        if (!normalized) return false;
+        return !isUnsupportedLocal(sym) && isSupportedCryptoSymbol(normalized, supportedSet);
+      };
+      const dropped = [];
       const supportedTracked = effectiveTracked.filter((t) => {
         const ok = isSupportedSymbol(t.symbol);
-        if (!ok) logUniverseDropOnce(t.symbol);
+        if (!ok) dropped.push(toInternalSymbol(t.symbol));
         return ok;
       });
+      if (dropped.length) {
+        console.log(`UNIVERSE_DROPPED count=${dropped.length} symbols=${JSON.stringify(dropped.slice(0, 20))}`);
+      }
 
       let cryptosAll = supportedTracked;
       const cryptoPages = Math.max(1, Math.ceil(Math.max(0, cryptosAll.length) / effectiveSettings.stockPageSize));
@@ -4228,7 +4450,13 @@ export default function App() {
         }
       }
 
-      let readyCount = 0, attemptCount = 0, successCount = 0, watchCount = 0, skippedCount = 0;
+      let readyCount = 0;
+      let attemptsSent = 0;
+      let attemptsFailed = 0;
+      let ordersOpen = 0;
+      let fillsCount = 0;
+      let watchCount = 0;
+      let skippedCount = 0;
       const reasonCounts = {};
       const spreadSamples = [];
       const scanBatchId = `scan_${Date.now()}_${cIdx}`;
@@ -4258,8 +4486,10 @@ export default function App() {
             readyCount++;
             if (autoTrade) {
               const result = await placeOrder(asset.symbol, asset.cc, d, sig, batchMap, { tradeStateRef, touchMemoRef }, scanBatchId);
-              if (result?.attempted) attemptCount++;
-              if (result?.filled) successCount++;
+              attemptsSent += result?.attemptsSent || 0;
+              attemptsFailed += result?.attemptsFailed || 0;
+              ordersOpen += result?.ordersOpen || 0;
+              fillsCount += result?.fillsCount || 0;
             } else {
               logTradeAction('entry_skipped', asset.symbol, { entryReady: true, reason: 'auto_off' });
             }
@@ -4281,8 +4511,21 @@ export default function App() {
       const avg = spreadSamples.length ? spreadSamples.reduce((a, b) => a + b, 0) / spreadSamples.length : globalSpreadAvgRef.current;
       globalSpreadAvgRef.current = avg;
 
-      setScanStats({ ready: readyCount, attempted: attemptCount, filled: successCount, watch: watchCount, skipped: skippedCount, reasons: reasonCounts });
-      logTradeAction('scan_summary', 'STATIC', { readyCount, attemptCount, successCount });
+      setScanStats({
+        ready: readyCount,
+        attemptsSent,
+        attemptsFailed,
+        ordersOpen,
+        fillsCount,
+        watch: watchCount,
+        skipped: skippedCount,
+        reasons: reasonCounts,
+      });
+      logTradeAction('scan_summary', 'STATIC', { readyCount, attemptsSent, attemptsFailed, ordersOpen, fillsCount });
+      const followUp = await pollRecentOrderStates();
+      if (Number.isFinite(followUp?.ordersOpen)) {
+        setScanStats((prev) => ({ ...prev, ordersOpen: followUp.ordersOpen }));
+      }
     } catch (e) {
       logTradeAction('scan_error', 'ALL', { error: e?.message || String(e) });
     } finally {
@@ -4794,12 +5037,20 @@ export default function App() {
               <Text style={styles.scanValue}>{scanStats.ready}</Text>
             </View>
             <View style={styles.scanItem}>
-              <Text style={styles.scanLabel}>Attempted</Text>
-              <Text style={styles.scanValue}>{scanStats.attempted}</Text>
+              <Text style={styles.scanLabel}>Sent</Text>
+              <Text style={styles.scanValue}>{scanStats.attemptsSent}</Text>
             </View>
             <View style={styles.scanItem}>
-              <Text style={styles.scanLabel}>Filled</Text>
-              <Text style={styles.scanValue}>{scanStats.filled}</Text>
+              <Text style={styles.scanLabel}>Failed</Text>
+              <Text style={styles.scanValue}>{scanStats.attemptsFailed}</Text>
+            </View>
+            <View style={styles.scanItem}>
+              <Text style={styles.scanLabel}>Open</Text>
+              <Text style={styles.scanValue}>{scanStats.ordersOpen}</Text>
+            </View>
+            <View style={styles.scanItem}>
+              <Text style={styles.scanLabel}>Fills</Text>
+              <Text style={styles.scanValue}>{scanStats.fillsCount}</Text>
             </View>
             <View style={styles.scanItem}>
               <Text style={styles.scanLabel}>Watch</Text>
