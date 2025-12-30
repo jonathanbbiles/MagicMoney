@@ -26,6 +26,15 @@ function getRequestId(headers) {
   );
 }
 
+function getRateLimitHeaders(headers) {
+  if (!headers) return null;
+  return {
+    limit: headers.get?.('x-ratelimit-limit') || null,
+    remaining: headers.get?.('x-ratelimit-remaining') || null,
+    reset: headers.get?.('x-ratelimit-reset') || null,
+  };
+}
+
 function getLimiterForUrl(url) {
   const host = new URL(url).hostname;
   if (host.includes('data.alpaca.markets')) {
@@ -54,8 +63,8 @@ function getBackoffDelayMs(attempt, error) {
   const base = baseDelays[Math.min(attempt, baseDelays.length - 1)];
   const jitter = Math.floor(Math.random() * 120);
   if (Number.isFinite(error?.statusCode) && error.statusCode === 429) {
-    const extra = 1000 + Math.floor(Math.random() * 1200);
-    return base + jitter + extra;
+    const rateLimitDelays = [250, 500, 1000, 2000, 5000];
+    return rateLimitDelays[Math.min(attempt, rateLimitDelays.length - 1)];
   }
   return base + jitter;
 }
@@ -76,6 +85,7 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
     const text = await response.text();
     const snippet = text ? text.slice(0, 200) : '';
     const requestId = getRequestId(response.headers);
+    const rateLimit = getRateLimitHeaders(response.headers);
 
     if (!response.ok) {
       return {
@@ -89,11 +99,13 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
           isTimeout: false,
           isNetworkError: false,
           requestId,
+          rateLimit,
           urlHost,
           urlPath,
         },
         responseSnippet200: snippet,
         requestId,
+        rateLimit,
         urlHost,
         urlPath,
         statusCode: response.status,
@@ -135,11 +147,13 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
           isNetworkError: false,
           parse_error: true,
           requestId,
+          rateLimit,
           urlHost,
           urlPath,
         },
         responseSnippet200: snippet,
         requestId,
+        rateLimit,
         urlHost,
         urlPath,
         statusCode: response.status,
