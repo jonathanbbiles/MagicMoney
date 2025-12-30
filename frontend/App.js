@@ -18,6 +18,13 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
+import {
+  isCrypto,
+  isStock,
+  normalizeCryptoSymbol,
+  toAlpacaCryptoSymbol,
+  toInternalSymbol,
+} from './src/utils/symbols';
 
 // SAFETY PATCH NOTES:
 // - Moved import-time connectivity call into a mount-only effect.
@@ -466,8 +473,10 @@ const fmtUSD = (n) =>
 const fmtPct = (n) => (Number.isFinite(n) ? `${n.toFixed(2)}%` : '—');
 const MAX_QUOTE_AGE_SEC = 120;
 const ABSURD_AGE_SEC = 86400;
-const MAX_LOGGED_QUOTE_AGE_SEC = 9999;
 const MAX_CLOCK_SKEW_SECONDS = 5;
+const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(EX.DEBUG_QUOTE_TS || '').toLowerCase());
+const quoteTsDebugLogged = new Set();
+const quoteBadTsLogged = new Set();
 
 const normalizeQuoteTsMs = (rawTs) => {
   if (rawTs == null) return null;
@@ -505,8 +514,40 @@ const computeQuoteAgeSeconds = ({ nowMs, tsMs }) => {
   if (ageSec > ABSURD_AGE_SEC) return null;
   return ageSec;
 };
-const formatLoggedAgeSeconds = (ageSec) =>
-  Number.isFinite(ageSec) ? Math.min(Math.round(ageSec), MAX_LOGGED_QUOTE_AGE_SEC) : null;
+const formatLoggedAgeSeconds = (ageSec) => (Number.isFinite(ageSec) ? Math.round(ageSec) : null);
+
+const logQuoteTimestampDebug = ({ symbol, rawFields, source }) => {
+  if (!DEBUG_QUOTE_TS) return;
+  const key = `${symbol}:${source || 'unknown'}`;
+  if (quoteTsDebugLogged.has(key)) return;
+  quoteTsDebugLogged.add(key);
+  console.warn('quote_ts_debug', {
+    symbol,
+    source: source || null,
+    rawTs: rawFields,
+  });
+};
+
+const logBadQuoteTimestamp = ({ symbol, rawFields }) => {
+  if (!symbol) return;
+  const key = symbol;
+  if (quoteBadTsLogged.has(key)) return;
+  quoteBadTsLogged.add(key);
+  console.warn(`QUOTE BAD_TS — ${symbol} — raw=${JSON.stringify(rawFields)}`);
+};
+
+const parseQuoteTimestampMs = ({ symbol, rawFields, source }) => {
+  const rawTs = rawFields?.t ?? rawFields?.timestamp ?? rawFields?.time ?? rawFields?.ts;
+  if (symbol) {
+    logQuoteTimestampDebug({ symbol, rawFields, source });
+  }
+  const tsMs = normalizeQuoteTsMs(rawTs);
+  if (!Number.isFinite(tsMs)) {
+    logBadQuoteTimestamp({ symbol, rawFields });
+    return null;
+  }
+  return tsMs;
+};
 
 const emaArr = (arr, span) => {
   if (!arr?.length) return [];
@@ -524,50 +565,6 @@ const isFractionalQty = (q) => Math.abs(q - Math.round(q)) > 1e-6;
 const isoDaysAgo = (n) => new Date(Date.now() - n * 864e5).toISOString();
 
 /* ──────────────────────────── 6) SYMBOL HELPERS ──────────────────────────── */
-// Canonicalize symbols to the app's internal form (e.g., "BCHUSD").
-// Accepts formats like "BCH/USD", "BCH-USD", and already-canonical "BCHUSD".
-const SYM_MAP = {
-  'BCH/USD':'BCHUSD','BCH-USD':'BCHUSD','BCHUSD':'BCHUSD',
-  'UNI/USD':'UNIUSD','UNI-USD':'UNIUSD','UNIUSD':'UNIUSD',
-  'LTC/USD':'LTCUSD','LTC-USD':'LTCUSD','LTCUSD':'LTCUSD',
-  'XRP/USD':'XRPUSD','XRP-USD':'XRPUSD','XRPUSD':'XRPUSD',
-  'BTC/USD':'BTCUSD','BTC-USD':'BTCUSD','BTCUSD':'BTCUSD',
-  'ETH/USD':'ETHUSD','ETH-USD':'ETHUSD','ETHUSD':'ETHUSD',
-  'SOL/USD':'SOLUSD','SOL-USD':'SOLUSD','SOLUSD':'SOLUSD',
-  'AAVE/USD':'AAVEUSD','AAVE-USD':'AAVEUSD','AAVEUSD':'AAVEUSD',
-};
-function toTradeSymbol(s) {
-  if (!s) return null;
-  const t = String(s).trim().toUpperCase();
-  if (SYM_MAP[t]) return SYM_MAP[t];
-  if (t.endsWith('/USD')) return t.replace('/USD', 'USD');
-  if (t.endsWith('-USD')) return t.replace('-USD', 'USD');
-  if (/^[A-Z]{2,10}USD$/.test(t)) return t;
-  return t;
-}
-
-function toDataSymbol(sym) {
-  if (!sym) return sym;
-  const normalized = toTradeSymbol(sym);
-  if (normalized.includes('/')) return normalized;
-  if (normalized.endsWith('USD')) {
-    const base = normalized.slice(0, -3);
-    if (!base || base.toUpperCase().endsWith('USD')) return `${normalized}/USD`;
-    return `${base}/USD`;
-  }
-  return normalized;
-}
-function isCrypto(sym) { return /USD$/.test(sym); }
-function isStock(sym) { return !isCrypto(sym); }
-
-function normalizeCryptoSymbol(sym) {
-  if (!sym) return sym;
-  const t = String(sym).trim().toUpperCase();
-  if (t.includes('/')) return t;
-  if (t.endsWith('USD') && /^[A-Z0-9]{2,12}USD$/.test(t)) return `${t.slice(0, -3)}/USD`;
-  return t;
-}
-
 function synthQuoteFromTrade(price, bps = SETTINGS.syntheticTradeSpreadBps) {
   if (!(price > 0)) return null;
   const half = price * (bps / 20000);
@@ -863,7 +860,7 @@ function buildEventsFromActivities(acts = []) {
   const evs = [];
   for (const a of acts) {
     const t = String(a.activity_type || a.activityType || '').toUpperCase();
-    const sym = toTradeSymbol(a.symbol || a.symbol_id || null);
+    const sym = toInternalSymbol(a.symbol || a.symbol_id || null);
     const side = String(a.side || '').toLowerCase();
     const qty = Number(a.qty ?? a.cum_qty ?? a.quantity ?? 0);
     const price = Number(a.price ?? a.fill_price ?? a.avg_price ?? 0);
@@ -944,12 +941,12 @@ function fifoPnlFromEvents(events = []) {
 async function markToMarketBookPrices(book) {
   const syms = Array.from(book.keys());
   if (!syms.length) return { unrealizedUsd: 0, pricesAt: {} };
-  const ds = syms.map((s) => toDataSymbol(s));
-  const qmap = await getCryptoQuotesBatch(ds);
+  const internalSyms = syms.map((s) => toInternalSymbol(s));
+  const qmap = await getCryptoQuotesBatch(internalSyms);
   let unreal = 0;
   const pricesAt = {};
   for (const s of syms) {
-    const q = qmap.get(toDataSymbol(s));
+    const q = qmap.get(toInternalSymbol(s));
     const mid = q && Number.isFinite(q.bid) && Number.isFinite(q.ask) ? 0.5 * (q.bid + q.ask) : (q?.bid || q?.ask || 0);
     if (mid > 0) pricesAt[s] = mid;
     const lots = book.get(s) || [];
@@ -1119,27 +1116,47 @@ const quoteCache = new Map();
 const unsupportedSymbols = new Map();
 const unsupportedLocalSymbols = new Set();
 const unsupportedLogTimestamps = new Map();
+const universeDropLogTimestamps = new Map();
 const isUnsupported = (sym) => {
-  const u = unsupportedSymbols.get(sym);
+  const normalized = toInternalSymbol(sym);
+  const u = unsupportedSymbols.get(normalized);
   if (!u) return false;
-  if (Date.now() > u) { unsupportedSymbols.delete(sym); return false; }
+  if (Date.now() > u) { unsupportedSymbols.delete(normalized); return false; }
   return true;
 };
-function markUnsupported(sym, mins = 120) { unsupportedSymbols.set(sym, Date.now() + mins * 60000); }
-const isUnsupportedLocal = (sym) => isUnsupported(sym) || unsupportedLocalSymbols.has(sym);
+function markUnsupported(sym, mins = 120) {
+  const normalized = toInternalSymbol(sym);
+  if (!normalized) return;
+  unsupportedSymbols.set(normalized, Date.now() + mins * 60000);
+}
+const isUnsupportedLocal = (sym) => {
+  const normalized = toInternalSymbol(sym);
+  return isUnsupported(normalized) || unsupportedLocalSymbols.has(normalized);
+};
 const logUnsupportedOnce = (sym, meta = {}) => {
-  if (!sym) return;
+  const normalized = toInternalSymbol(sym);
+  if (!normalized) return;
   const now = Date.now();
-  const last = unsupportedLogTimestamps.get(sym) || 0;
+  const last = unsupportedLogTimestamps.get(normalized) || 0;
   if (now - last < 3600 * 1000) return;
-  unsupportedLogTimestamps.set(sym, now);
-  logTradeAction('entry_skipped', sym, { entryReady: false, reason: 'unsupported_pair', ...meta });
+  unsupportedLogTimestamps.set(normalized, now);
+  logTradeAction('entry_skipped', normalized, { entryReady: false, reason: 'unsupported_pair', ...meta });
 };
 const markUnsupportedLocal = (sym, mins = 120) => {
-  if (!sym) return;
-  unsupportedLocalSymbols.add(sym);
-  markUnsupported(sym, mins);
-  logUnsupportedOnce(sym);
+  const normalized = toInternalSymbol(sym);
+  if (!normalized) return;
+  unsupportedLocalSymbols.add(normalized);
+  markUnsupported(normalized, mins);
+  logUnsupportedOnce(normalized);
+};
+const logUniverseDropOnce = (sym) => {
+  const normalized = toInternalSymbol(sym);
+  if (!normalized) return;
+  const now = Date.now();
+  const last = universeDropLogTimestamps.get(normalized) || 0;
+  if (now - last < 3600 * 1000) return;
+  universeDropLogTimestamps.set(normalized, now);
+  console.log(`UNIVERSE DROP unsupported: ${normalized}`);
 };
 const isUnsupportedAssetError = (err) => {
   if (err?.statusCode === 404) return true;
@@ -1205,7 +1222,7 @@ const barsCacheTTL = 30000; // 30 seconds
 
 /* ─────────────────────────────── 12) CRYPTO DATA API ─────────────────────────────── */
 const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
-  const normalized = symbols.map((s) => toDataSymbol(s)).join(',');
+  const normalized = symbols.map((s) => toAlpacaCryptoSymbol(s)).join(',');
   return buildAlpacaUrl({
     baseUrl: DATA_ROOT_CRYPTO,
     path: `${loc}/latest/${what}`,
@@ -1214,74 +1231,78 @@ const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
   });
 };
 
-async function getCryptoQuotesBatch(dsyms = []) {
-  if (!dsyms.length) return new Map();
-  const dataSymbols = dsyms.map((s) => toDataSymbol(s));
+async function getCryptoQuotesBatch(symbols = []) {
+  const internalSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
+  if (!internalSymbols.length) return new Map();
+  const dataSymbols = internalSymbols.map((s) => toAlpacaCryptoSymbol(s));
   for (const loc of DATA_LOCATIONS) {
     try {
       const url = buildURLCrypto(loc, 'quotes', dataSymbols);
       const j = await fetchMarketData('QUOTE', url, { headers: HEADERS });
       const raw = j?.quotes || {};
       const out = new Map();
-      for (const dsym of dataSymbols) {
-        const q = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
+      for (const symbol of internalSymbols) {
+        const dataSymbol = toAlpacaCryptoSymbol(symbol);
+        const q = Array.isArray(raw[dataSymbol]) ? raw[dataSymbol][0] : raw[dataSymbol];
         if (!q) {
-          logTradeAction('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'QUOTE' });
+          logTradeAction('no_quote', symbol, { reason: 'no_data', requestType: 'QUOTE' });
           continue;
         }
         const bid = Number(q.bp ?? q.bid_price);
         const ask = Number(q.ap ?? q.ask_price);
         const bs = Number(q.bs ?? q.bid_size);
         const as = Number(q.as ?? q.ask_size);
-        const tms = parseTsMs(q.t);
-        if (bid > 0 && ask > 0) {
-          out.set(dsym, { bid, ask, bs: Number.isFinite(bs) ? bs : null, as: Number.isFinite(as) ? as : null, tms, t: q.t ?? null });
+        const tms = parseQuoteTimestampMs({ symbol, rawFields: q, source: 'crypto_quote' });
+        if (bid > 0 && ask > 0 && Number.isFinite(tms)) {
+          out.set(symbol, { bid, ask, bs: Number.isFinite(bs) ? bs : null, as: Number.isFinite(as) ? as : null, tms });
         }
       }
       if (out.size) return out;
     } catch (e) {
       logTradeAction('quote_http_error', 'QUOTE', { status: e?.statusCode || e?.code || 'exception', loc, body: e?.responseSnippet || e?.message || '' });
       const isUnsupportedErr = isUnsupportedAssetError(e);
-      for (const dsym of dataSymbols) {
-        const sym = toTradeSymbol(dsym);
+      for (const symbol of internalSymbols) {
         if (isUnsupportedErr) {
-          markUnsupportedLocal(sym, 240);
+          markUnsupportedLocal(symbol, 240);
           continue;
         }
-        logTradeAction('no_quote', sym, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
+        logTradeAction('no_quote', symbol, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
       }
     }
   }
   return new Map();
 }
-async function getCryptoTradesBatch(dsyms = []) {
-  if (!dsyms.length) return new Map();
-  const dataSymbols = dsyms.map((s) => toDataSymbol(s));
+async function getCryptoTradesBatch(symbols = []) {
+  const internalSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
+  if (!internalSymbols.length) return new Map();
+  const dataSymbols = internalSymbols.map((s) => toAlpacaCryptoSymbol(s));
   for (const loc of DATA_LOCATIONS) {
     try {
       const url = buildURLCrypto(loc, 'trades', dataSymbols);
       const j = await fetchMarketData('TRADE', url, { headers: HEADERS });
       const raw = j?.trades || {};
       const out = new Map();
-      for (const dsym of dataSymbols) {
-        const t = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
+      for (const symbol of internalSymbols) {
+        const dataSymbol = toAlpacaCryptoSymbol(symbol);
+        const t = Array.isArray(raw[dataSymbol]) ? raw[dataSymbol][0] : raw[dataSymbol];
         const p = Number(t?.p ?? t?.price);
-        const tms = parseTsMs(t?.t);
-        if (Number.isFinite(p) && p > 0) out.set(dsym, { price: p, tms });
+        const tms = parseQuoteTimestampMs({ symbol, rawFields: t, source: 'crypto_trade' });
+        if (Number.isFinite(p) && p > 0 && Number.isFinite(tms)) out.set(symbol, { price: p, tms });
       }
       if (out.size) return out;
     } catch (e) {
       logTradeAction('trade_http_error', 'TRADE', { status: e?.statusCode || e?.code || 'exception', loc, body: e?.responseSnippet || e?.message || '' });
-      for (const dsym of dataSymbols) {
-        logTradeAction('no_quote', dsym.replace('/', ''), { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'TRADE' });
+      for (const symbol of internalSymbols) {
+        logTradeAction('no_quote', symbol, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'TRADE' });
       }
     }
   }
   return new Map();
 }
 async function getCryptoBars1m(symbol, limit = 6) {
-  const dsym = toDataSymbol(symbol);
-  const cached = barsCache.get(dsym);
+  const internalSymbol = toInternalSymbol(symbol);
+  const dataSymbol = toAlpacaCryptoSymbol(internalSymbol);
+  const cached = barsCache.get(internalSymbol);
   const now = Date.now();
   if (cached && (now - cached.ts) < barsCacheTTL) {
     return cached.bars.slice(0, limit);
@@ -1291,11 +1312,11 @@ async function getCryptoBars1m(symbol, limit = 6) {
       const url = buildAlpacaUrl({
         baseUrl: DATA_ROOT_CRYPTO,
         path: `${loc}/bars`,
-        params: { timeframe: '1Min', limit: String(limit), symbols: dsym },
+        params: { timeframe: '1Min', limit: String(limit), symbols: dataSymbol },
         label: 'crypto_bars',
       });
       const j = await fetchMarketData('BARS', url, { headers: HEADERS });
-      const arr = j?.bars?.[dsym];
+      const arr = j?.bars?.[dataSymbol];
       if (Array.isArray(arr) && arr.length) {
         const bars = arr.map((b) => ({
           open: Number(b.o ?? b.open),
@@ -1305,32 +1326,32 @@ async function getCryptoBars1m(symbol, limit = 6) {
           vol: Number(b.v ?? b.volume ?? 0),
           tms: parseTsMs(b.t),
         })).filter((x) => Number.isFinite(x.close) && x.close > 0);
-        barsCache.set(dsym, { ts: now, bars: bars.slice() });
+        barsCache.set(internalSymbol, { ts: now, bars: bars.slice() });
         return bars;
       }
-      logTradeAction('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'BARS' });
+      logTradeAction('no_quote', internalSymbol, { reason: 'no_data', requestType: 'BARS' });
     } catch (e) {
       logTradeAction('quote_http_error', 'BARS', { status: e?.statusCode || e?.code || 'exception', loc, body: e?.responseSnippet || e?.message || '' });
-      logTradeAction('no_quote', dsym.replace('/', ''), { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
+      logTradeAction('no_quote', internalSymbol, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
     }
   }
   return [];
 }
 
 async function getCryptoBars1mBatch(symbols = [], limit = 6) {
-  const uniqSyms = Array.from(new Set(symbols.filter(Boolean)));
+  const uniqSyms = Array.from(new Set(symbols.map((s) => toInternalSymbol(s)).filter(Boolean)));
   if (!uniqSyms.length) return new Map();
-  const dsymList = uniqSyms.map((s) => toDataSymbol(s));
+  const dsymList = uniqSyms.map((s) => toAlpacaCryptoSymbol(s));
   const out = new Map();
   const now = Date.now();
 
   const missing = [];
-  for (const dsym of dsymList) {
-    const cached = barsCache.get(dsym);
+  for (const symbol of uniqSyms) {
+    const cached = barsCache.get(symbol);
     if (cached && (now - cached.ts) < barsCacheTTL) {
-      out.set(dsym.replace('/', ''), cached.bars.slice(0, limit));
+      out.set(symbol, cached.bars.slice(0, limit));
     } else {
-      missing.push(dsym);
+      missing.push(symbol);
     }
   }
   if (!missing.length) return out;
@@ -1340,13 +1361,14 @@ async function getCryptoBars1mBatch(symbols = [], limit = 6) {
       const url = buildAlpacaUrl({
         baseUrl: DATA_ROOT_CRYPTO,
         path: `${loc}/bars`,
-        params: { timeframe: '1Min', limit: String(limit), symbols: missing.join(',') },
+        params: { timeframe: '1Min', limit: String(limit), symbols: missing.map((s) => toAlpacaCryptoSymbol(s)).join(',') },
         label: 'crypto_bars_batch',
       });
       const j = await fetchMarketData('BARS', url, { headers: HEADERS });
       const raw = j?.bars || {};
-      for (const dsym of missing) {
-        const arr = raw[dsym];
+      for (const symbol of missing) {
+        const dataSymbol = toAlpacaCryptoSymbol(symbol);
+        const arr = raw[dataSymbol];
         if (Array.isArray(arr) && arr.length) {
           const bars = arr.map((b) => ({
             open: Number(b.o ?? b.open),
@@ -1356,17 +1378,17 @@ async function getCryptoBars1mBatch(symbols = [], limit = 6) {
             vol: Number(b.v ?? b.volume ?? 0),
             tms: parseTsMs(b.t),
           })).filter((x) => Number.isFinite(x.close) && x.close > 0);
-          barsCache.set(dsym, { ts: now, bars: bars.slice() });
-          out.set(dsym.replace('/', ''), bars.slice(0, limit));
+          barsCache.set(symbol, { ts: now, bars: bars.slice() });
+          out.set(symbol, bars.slice(0, limit));
         } else {
-          logTradeAction('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'BARS' });
+          logTradeAction('no_quote', symbol, { reason: 'no_data', requestType: 'BARS' });
         }
       }
       break;
     } catch (e) {
       logTradeAction('quote_http_error', 'BARS', { status: e?.statusCode || e?.code || 'exception', loc, body: e?.responseSnippet || e?.message || '' });
-      for (const dsym of missing) {
-        logTradeAction('no_quote', dsym.replace('/', ''), { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
+      for (const symbol of missing) {
+        logTradeAction('no_quote', symbol, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
       }
     }
   }
@@ -1453,12 +1475,12 @@ async function stocksDailyBars(symbols = [], limit = 10) {
 }
 
 async function cryptoDailyBars(symbols = [], limit = 10) {
-  const uniq = Array.from(new Set(symbols.filter(Boolean)));
+  const uniq = Array.from(new Set(symbols.map((s) => toInternalSymbol(s)).filter(Boolean)));
   if (!uniq.length) return new Map();
   const out = new Map();
   for (const loc of DATA_LOCATIONS) {
     try {
-      const ds = uniq.map(s => toDataSymbol(s)).join(',');
+      const ds = uniq.map((s) => toAlpacaCryptoSymbol(s)).join(',');
       const url = buildAlpacaUrl({
         baseUrl: DATA_ROOT_CRYPTO,
         path: `${loc}/bars`,
@@ -1468,8 +1490,8 @@ async function cryptoDailyBars(symbols = [], limit = 10) {
       const j = await fetchMarketData('BARS', url, { headers: HEADERS });
       const raw = j?.bars || {};
       for (const sym of uniq) {
-        const dsym = toDataSymbol(sym);
-        const arr = raw[dsym];
+        const dataSymbol = toAlpacaCryptoSymbol(sym);
+        const arr = raw[dataSymbol];
         if (Array.isArray(arr) && arr.length) {
           out.set(sym, arr.map(b => ({
             tms: parseTsMs(b.t),
@@ -1663,9 +1685,9 @@ function fmtSkipDetail(reason, d = {}) {
         return ' (fresh=NA)';
       }
       case 'stale_quote': {
-        if (Number.isFinite(d.ageSec)) return ` (age=${Math.min(MAX_LOGGED_QUOTE_AGE_SEC, Math.round(d.ageSec))}s)`;
+        if (Number.isFinite(d.ageSec)) return ` (age=${formatLoggedAgeSeconds(d.ageSec)}s)`;
         if (Number.isFinite(d.lastSeenAgeSec)) {
-          return ` (last_seen_age=${Math.min(MAX_LOGGED_QUOTE_AGE_SEC, Math.round(d.lastSeenAgeSec))}s)`;
+          return ` (last_seen_age=${formatLoggedAgeSeconds(d.lastSeenAgeSec)}s)`;
         }
         return ' (age=NA)';
       }
@@ -1884,36 +1906,28 @@ function pushPriceHist(sym, mid, max = 6) {
 }
 
 async function getQuotesBatch(symbols) {
-  const cryptos = symbols.filter((s) => isCrypto(s));
-  const stocks = symbols.filter((s) => isStock(s));
+  const normalizedSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
+  const cryptos = normalizedSymbols.filter((s) => isCrypto(s));
+  const stocks = normalizedSymbols.filter((s) => isStock(s));
   const out = new Map();
   const now = Date.now();
 
   if (cryptos.length) {
-    const dsyms = Array.from(new Set(cryptos.map((s) => toDataSymbol(s)))).filter((dsym) => !isUnsupportedLocal(dsym.replace('/', '')));
-    for (let i = 0; i < dsyms.length; i += 6) {
-      const slice = dsyms.slice(i, i + 6);
+    const internalSymbols = Array.from(new Set(cryptos)).filter((sym) => !isUnsupportedLocal(sym));
+    for (let i = 0; i < internalSymbols.length; i += 6) {
+      const slice = internalSymbols.slice(i, i + 6);
       let qmap = await getCryptoQuotesBatch(slice);
-      for (const dsym of slice) {
-        const q = qmap.get(dsym);
+      for (const symbol of slice) {
+        const q = qmap.get(symbol);
         if (!q) continue;
 
         // Freshness by exchange timestamp
         const fresh = isFresh(q.tms, SETTINGS.liveFreshMsCrypto);
 
-        // TEMP DEBUG (remove later)
-        try {
-          const ageMs = Date.now() - (q.tms || 0);
-          if (Number.isFinite(ageMs)) {
-            console.log('QUOTE_TMS', dsym, q.t, q.tms, `${Math.round(ageMs)}ms_old`, fresh ? 'FRESH' : 'STALE');
-          }
-        } catch {}
-
         // If not fresh, do NOT include in batch output or cache
         if (!fresh) continue;
 
-        const sym = dsym.replace('/', '');
-        out.set(sym, {
+        out.set(symbol, {
           bid: q.bid,
           ask: q.ask,
           bs: q.bs ?? null,
@@ -1922,7 +1936,7 @@ async function getQuotesBatch(symbols) {
         });
 
         // Cache only fresh quotes and include tms in cached object
-        quoteCache.set(sym, {
+        quoteCache.set(symbol, {
           ts: now,
           q: { bid: q.bid, ask: q.ask, bs: q.bs ?? null, as: q.as ?? null, tms: q.tms }
         });
@@ -1939,43 +1953,42 @@ async function getQuotesBatch(symbols) {
 /* ─────────────────────────────── 17) SMART QUOTE ─────────────────────────────── */
 async function getQuoteSmart(symbol, preloadedMap = null) {
   try {
+    const normalizedSymbol = toInternalSymbol(symbol);
     // This build is crypto-first. Do not hit crypto data API with equities.
-    if (isStock(symbol)) { markUnsupported(symbol, 60); return null; }
-    if (isUnsupportedLocal(symbol)) return null;
+    if (isStock(normalizedSymbol)) { markUnsupported(normalizedSymbol, 60); return null; }
+    if (isUnsupportedLocal(normalizedSymbol)) return null;
 
     // Always use cached real quotes if within TTL
     {
-      const c = quoteCache.get(symbol);
+      const c = quoteCache.get(normalizedSymbol);
       const withinTtl = c && (Date.now() - c.ts < SETTINGS.quoteTtlMs);
       const freshExch = c && isFresh(c.q?.tms, SETTINGS.liveFreshMsCrypto);
       if (withinTtl && freshExch) return c.q;
     }
 
     // Use preloaded map if available and fresh
-    if (preloadedMap && preloadedMap.has(symbol)) {
-      const q = preloadedMap.get(symbol);
+    if (preloadedMap && preloadedMap.has(normalizedSymbol)) {
+      const q = preloadedMap.get(normalizedSymbol);
       if (q && isFresh(q.tms, SETTINGS.liveFreshMsCrypto)) return q;
     }
 
-    const dsym = toDataSymbol(symbol);
-
     // Try to fetch a real quote
-    const m = await getCryptoQuotesBatch([dsym]);
-    const q0 = m.get(dsym);
+    const m = await getCryptoQuotesBatch([normalizedSymbol]);
+    const q0 = m.get(normalizedSymbol);
     if (q0 && isFresh(q0.tms, SETTINGS.liveFreshMsCrypto)) {
       const qObj = { bid: q0.bid, ask: q0.ask, bs: q0.bs, as: q0.as, tms: q0.tms };
-      quoteCache.set(symbol, { ts: Date.now(), q: qObj });
+      quoteCache.set(normalizedSymbol, { ts: Date.now(), q: qObj });
       return qObj;
     }
 
     // Fallback: synthesize a quote from last trade if allowed
     if (!SETTINGS.liveRequireQuote) {
-      const tm = await getCryptoTradesBatch([dsym]);
-      const t = tm.get(dsym);
+      const tm = await getCryptoTradesBatch([normalizedSymbol]);
+      const t = tm.get(normalizedSymbol);
       if (t && isFresh(t.tms, SETTINGS.liveFreshTradeMsCrypto)) {
         const synth = synthQuoteFromTrade(t.price, SETTINGS.syntheticTradeSpreadBps);
         if (synth) {
-          quoteCache.set(symbol, { ts: Date.now(), q: synth });
+          quoteCache.set(normalizedSymbol, { ts: Date.now(), q: synth });
           return synth;
         }
       }
@@ -2090,6 +2103,48 @@ function requiredProfitBpsForSymbol(symbol, riskLevel) {
 }
 
 /* ───────────────────────────── 19) ACCOUNT / ORDERS ───────────────────────────── */
+const logOrderPayload = (context, order) => {
+  if (!order) return;
+  const payload = {
+    symbol: toInternalSymbol(order.symbol),
+    qty: order.qty ?? null,
+    notional: order.notional ?? null,
+    side: order.side,
+    type: order.type,
+    time_in_force: order.time_in_force,
+    limit_price: order.limit_price,
+  };
+  console.log('order_send', { context, ...payload });
+};
+
+const logOrderResponse = (context, order, res, data) => {
+  const payload = {
+    symbol: toInternalSymbol(order?.symbol),
+    qty: order?.qty ?? null,
+    notional: order?.notional ?? null,
+    side: order?.side,
+    type: order?.type,
+    time_in_force: order?.time_in_force,
+    limit_price: order?.limit_price,
+  };
+  if (res?.ok && data?.id) {
+    console.log('order_success', {
+      context,
+      id: data.id,
+      status: data.status || data.order_status || 'accepted',
+      ...payload,
+    });
+  } else {
+    console.warn('order_failed', {
+      context,
+      status: res?.status ?? null,
+      code: data?.code ?? data?.error_code ?? null,
+      message: data?.message || data?.error || data?.raw || 'unknown_error',
+      ...payload,
+    });
+  }
+};
+
 const getPositionInfo = async (symbol) => {
   try {
     const res = await f(`${ALPACA_BASE_URL}/positions/${symbol}`, { headers: HEADERS });
@@ -2825,8 +2880,10 @@ async function fetchAssetMeta(symbol) {
   } catch { return null; }
 }
 async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usableBP = null) {
-  await cancelOpenOrdersForSymbol(symbol, 'buy');
-  const meta = await fetchAssetMeta(symbol);
+  const normalizedSymbol = toInternalSymbol(symbol);
+  let attempted = false;
+  await cancelOpenOrdersForSymbol(normalizedSymbol, 'buy');
+  const meta = await fetchAssetMeta(normalizedSymbol);
   const rawTick = meta?._price_inc ?? (isStock(symbol) ? 0.01 : 1e-5);
   const TICK = Number.isFinite(rawTick) && rawTick > 0 ? rawTick : (isStock(symbol) ? 0.01 : 1e-5);
   const rawQtyInc = meta?._qty_inc ?? 0.000001;
@@ -2843,10 +2900,10 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     plannedQty = Math.floor(plannedQty);
   }
   plannedQty = quantizeQty(plannedQty);
-  if (!(plannedQty > 0)) return { filled: false };
+  if (!(plannedQty > 0)) return { filled: false, attempted };
   if (plannedQty < MIN_TRADE_QTY) {
-    logTradeAction('skip_small_order', symbol, { reason: 'below_min_trade', qty: plannedQty, minQty: MIN_TRADE_QTY });
-    return { filled: false };
+    logTradeAction('skip_small_order', normalizedSymbol, { reason: 'below_min_trade', qty: plannedQty, minQty: MIN_TRADE_QTY });
+    return { filled: false, attempted };
   }
   qty = plannedQty;
 
@@ -2860,10 +2917,10 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   const formatLimit = (px) => Number(px).toFixed(tickDecimals);
 
   while ((Date.now() - t0) / 1000 < CAMP_SEC) {
-    const q = await getQuoteSmart(symbol, preQuoteMap);
+    const q = await getQuoteSmart(normalizedSymbol, preQuoteMap);
     if (!q) { await sleep(500); continue; }
 
-    const barsFill = await getCryptoBars1m(symbol, 2);
+    const barsFill = await getCryptoBars1m(normalizedSymbol, 2);
     const lastVol = Array.isArray(barsFill) && barsFill.length ? (barsFill[barsFill.length - 1].vol || 0) : 0;
     const qFillEst = makerFillProb({ bsUnits: q.bs || 0, lastBarVolUnits: lastVol, campSec: SETTINGS.makerCampSec });
     const symSlot = (symStats[symbol] ||= {});
@@ -2871,7 +2928,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     const qFillEff = symSlot.qMakerFillEwma;
 
     if (qFillEff < (SETTINGS.makerMinFillProb || 0.15) && SETTINGS.enableTakerFlip) {
-      logTradeAction('taker_force_flip', symbol, { reason: 'low_q_fill', q: Number(qFillEff ?? 0).toFixed(2) });
+      logTradeAction('taker_force_flip', normalizedSymbol, { reason: 'low_q_fill', q: Number(qFillEff ?? 0).toFixed(2) });
       break;
     }
     const bidNow = q.bid, askNow = q.ask;
@@ -2899,19 +2956,19 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       // Max qty allowed at this limit including buy fees
       const maxQty = Math.floor(((usableBP / (join * (1 + feeFracMaker))) / QINC) + 1e-9) * QINC;
       qty = quantizeQty(Math.min(qty, maxQty));
-      if (!(qty > 0)) return { filled: false };
+      if (!(qty > 0)) return { filled: false, attempted };
     }
 
     const notionalPx = Number.isFinite(bidNow) && bidNow > 0
       ? bidNow
       : (Number.isFinite(askNow) && askNow > 0 ? askNow : join);
     if (meta && meta._min_notional > 0 && Number.isFinite(notionalPx) && notionalPx > 0) {
-      if (qty * notionalPx < meta._min_notional) return { filled: false };
+      if (qty * notionalPx < meta._min_notional) return { filled: false, attempted };
     }
 
     if (isStock(symbol) && meta && meta._fractionable === false) {
       const px = notionalPx;
-      if (!(qty > 0) || !(px > 0) || qty * px < 5) return { filled: false };
+      if (!(qty > 0) || !(px > 0) || qty * px < 5) return { filled: false, attempted };
     }
 
     const nowTs = Date.now();
@@ -2923,34 +2980,37 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         __openOrdersCache = { ts: 0, items: [] };
       }
       const order = {
-        symbol, qty, side: 'buy', type: 'limit', time_in_force: 'gtc',
+        symbol: normalizedSymbol, qty, side: 'buy', type: 'limit', time_in_force: 'gtc',
         limit_price: formatLimit(join),
       };
       try {
+        logOrderPayload('buy_limit', order);
+        attempted = true;
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
+        logOrderResponse('buy_limit', order, res, data);
         if (res.ok && data.id) {
           lastOrderId = data.id; placedLimit = join; lastReplaceAt = nowTs;
-          logTradeAction('buy_camped', symbol, { limit: order.limit_price });
+          logTradeAction('buy_camped', normalizedSymbol, { limit: order.limit_price });
           __openOrdersCache = { ts: 0, items: [] };
         }
       } catch (e) {
-        logTradeAction('quote_exception', symbol, { error: e.message });
+        logTradeAction('quote_exception', normalizedSymbol, { error: e.message });
       }
     }
 
-    const pos = await getPositionInfo(symbol);
+    const pos = await getPositionInfo(normalizedSymbol);
     if (pos && pos.qty > 0) {
       if (lastOrderId) {
         try { await f(`${BACKEND_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: BACKEND_HEADERS }); } catch {}
         __openOrdersCache = { ts: 0, items: [] };
       }
-      logTradeAction('buy_success', symbol, {
+      logTradeAction('buy_success', normalizedSymbol, {
         qty: pos.qty, limit: placedLimit != null ? formatLimit(placedLimit) : placedLimit,
       });
       __positionsCache = { ts: 0, items: [] };
       __openOrdersCache = { ts: 0, items: [] };
-      return { filled: true, entry: pos.basis ?? placedLimit, qty: pos.qty, liquidity: 'maker' };
+      return { filled: true, entry: pos.basis ?? placedLimit, qty: pos.qty, liquidity: 'maker', attempted };
     }
     await sleep(1200);
   }
@@ -2958,11 +3018,11 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   if (lastOrderId) {
     try { await f(`${BACKEND_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: BACKEND_HEADERS }); } catch {}
     __openOrdersCache = { ts: 0, items: [] };
-    logTradeAction('buy_unfilled_canceled', symbol, {});
+    logTradeAction('buy_unfilled_canceled', normalizedSymbol, {});
   }
 
   if (SETTINGS.enableTakerFlip) {
-    const q = await getQuoteSmart(symbol, preQuoteMap);
+    const q = await getQuoteSmart(normalizedSymbol, preQuoteMap);
     if (q && q.ask > 0) {
       let mQty = qty;
       if (isStock(symbol) && meta && meta._fractionable === false) {
@@ -2974,62 +3034,68 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         const pxRef = q.ask;
         const maxQty = Math.floor(((usableBP / (pxRef * (1 + feeFracTaker))) / QINC) + 1e-9) * QINC;
         mQty = quantizeQty(Math.min(mQty, maxQty));
-        if (!(mQty > 0)) return { filled: false };
+        if (!(mQty > 0)) return { filled: false, attempted };
       }
-      if (!(mQty > 0)) return { filled: false };
+      if (!(mQty > 0)) return { filled: false, attempted };
       if (meta && meta._min_notional > 0) {
         const pxRef = Number.isFinite(q.bid) && q.bid > 0 ? q.bid : q.ask;
-        if (Number.isFinite(pxRef) && pxRef > 0 && mQty * pxRef < meta._min_notional) return { filled: false };
+        if (Number.isFinite(pxRef) && pxRef > 0 && mQty * pxRef < meta._min_notional) return { filled: false, attempted };
       }
       const tif = isStock(symbol) ? 'day' : 'gtc';
-      const order = { symbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif };
+      const order = { symbol: normalizedSymbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif };
       try {
+        logOrderPayload('buy_market', order);
+        attempted = true;
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
+        logOrderResponse('buy_market', order, res, data);
         if (res.ok && data.id) {
-          logTradeAction('buy_success', symbol, { qty: mQty, limit: 'mkt' });
+          logTradeAction('buy_success', normalizedSymbol, { qty: mQty, limit: 'mkt' });
           __positionsCache = { ts: 0, items: [] };
           __openOrdersCache = { ts: 0, items: [] };
-          return { filled: true, entry: q.ask, qty: mQty, liquidity: 'taker' };
+          return { filled: true, entry: q.ask, qty: mQty, liquidity: 'taker', attempted };
         } else {
-          logTradeAction('quote_exception', symbol, { error: `BUY mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 80) || ''}` });
+          logTradeAction('quote_exception', normalizedSymbol, { error: `BUY mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 80) || ''}` });
         }
       } catch (e) {
-        logTradeAction('quote_exception', symbol, { error: e.message });
+        logTradeAction('quote_exception', normalizedSymbol, { error: e.message });
       }
     }
   }
-  return { filled: false };
+  return { filled: false, attempted };
 }
 
 async function marketSell(symbol, qty) {
-  try { await cancelOpenOrdersForSymbol(symbol, 'sell'); } catch {}
+  const normalizedSymbol = toInternalSymbol(symbol);
+  try { await cancelOpenOrdersForSymbol(normalizedSymbol, 'sell'); } catch {}
   // Re-check availability right before selling to avoid 403s
   let latest = null;
-  try { latest = await getPositionInfo(symbol); } catch {}
+  try { latest = await getPositionInfo(normalizedSymbol); } catch {}
   const usableQty = Number(latest?.available ?? qty ?? 0);
   if (!(usableQty > 0)) {
-    logTradeAction('tp_limit_error', symbol, { error: 'SELL mkt skipped — no available qty' });
+    logTradeAction('tp_limit_error', normalizedSymbol, { error: 'SELL mkt skipped — no available qty' });
     return null;
   }
   const tif = isStock(symbol) ? 'day' : 'gtc';
-  const mkt = { symbol, qty: usableQty, side: 'sell', type: 'market', time_in_force: tif };
+  const mkt = { symbol: normalizedSymbol, qty: usableQty, side: 'sell', type: 'market', time_in_force: tif };
   if (DRY_RUN_STOPS) {
-    logTradeAction('risk_stop', symbol, { dryRun: true, qty: usableQty, order: mkt });
+    logTradeAction('risk_stop', normalizedSymbol, { dryRun: true, qty: usableQty, order: mkt });
     return { dryRun: true, order: mkt };
   }
   try {
+    logOrderPayload('sell_market', mkt);
     const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(mkt) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
+    logOrderResponse('sell_market', mkt, res, data);
     if (res.ok && data.id) {
       __positionsCache = { ts: 0, items: [] };
       __openOrdersCache = { ts: 0, items: [] };
       return data;
     }
-    logTradeAction('tp_limit_error', symbol, { error: `SELL mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 120) || ''}` });
+    logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 120) || ''}` });
     return null;
   } catch (e) {
-    logTradeAction('tp_limit_error', symbol, { error: `SELL mkt exception ${e.message}` });
+    logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt exception ${e.message}` });
     return null;
   }
 }
@@ -3251,9 +3317,11 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
 
   try {
     const decimals = isStock(symbol) ? 2 : 5;
-    const order = { symbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit.toFixed(decimals) };
+    const order = { symbol: toInternalSymbol(symbol), qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit.toFixed(decimals) };
+    logOrderPayload('sell_limit', order);
     const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
+    logOrderResponse('sell_limit', order, res, data);
     if (res.ok && data.id) {
       tradeStateRef.current[symbol] = { ...(state || {}), lastLimitPostTs: now };
       if (existing) { await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null); }
@@ -3525,8 +3593,8 @@ export default function App() {
     const report = { checkedAt: new Date().toISOString(), sections: {} };
 
     try {
-      const m = await getCryptoQuotesBatch(['BTC/USD','ETH/USD']);
-      const bt = m.get('BTC/USD'), et = m.get('ETH/USD');
+      const m = await getCryptoQuotesBatch(['BTCUSD', 'ETHUSD']);
+      const bt = m.get('BTCUSD'), et = m.get('ETHUSD');
       const freshB = !!bt && isFresh(bt.tms, effectiveSettings.liveFreshMsCrypto);
       const freshE = !!et && isFresh(et.tms, effectiveSettings.liveFreshMsCrypto);
       report.sections.crypto = { ok: !!(freshB || freshE), detail: { 'BTC/USD': !!freshB, 'ETH/USD': !!freshE } };
@@ -3545,8 +3613,8 @@ export default function App() {
     while (Date.now() - t0 < HORIZ_MIN * 60 * 1000) {
       if (signal?.aborted) return;
       let price = null;
-      const m = await getCryptoTradesBatch([toDataSymbol(symbol)]);
-      const one = m.get(toDataSymbol(symbol));
+      const m = await getCryptoTradesBatch([toInternalSymbol(symbol)]);
+      const one = m.get(toInternalSymbol(symbol));
       price = Number.isFinite(one?.price) ? one.price : null;
       if (Number.isFinite(price)) best = Math.max(best, price - entryPx);
       const waited = await sleepWithSignal(STEP_MS, signal);
@@ -3564,6 +3632,20 @@ export default function App() {
       if (best >= need) hb.h += 1;
     }
   }
+
+  const logGateFail = (symbol, gate, detailText = '') => {
+    const details = detailText ? ` (${detailText})` : '';
+    console.log(`${symbol} — GateFail — ${gate}${details}`);
+  };
+
+  const logReadyAttempt = ({ symbol, orderUsd, price, spreadBps }) => {
+    const spreadText = Number.isFinite(spreadBps) ? `${spreadBps.toFixed(1)}bps` : 'n/a';
+    const orderText = Number.isFinite(orderUsd) ? orderUsd.toFixed(2) : orderUsd;
+    const priceText = Number.isFinite(price) ? price.toFixed(8) : price;
+    console.log(
+      `${symbol} — READY — willAttemptBuy orderUsd=${orderText}, price=${priceText}, spread=${spreadText}`
+    );
+  };
 
   async function computeEntrySignal(asset, d, riskLvl, preQuoteMap = null, preBarsMap = null, batchId = null) {
     let bars1 = [];
@@ -3586,10 +3668,17 @@ export default function App() {
     if (!q || !(q.bid > 0 && q.ask > 0)) {
       let lastSeenAgeSec = null;
       try {
-        const tm = await getCryptoTradesBatch([toDataSymbol(asset.symbol)]);
-        const t = tm.get(toDataSymbol(asset.symbol));
-        if (t?.tms) {
-          lastSeenAgeSec = computeQuoteAgeSeconds({ nowMs: Date.now(), tsMs: t.tms });
+        const symbol = toInternalSymbol(asset.symbol);
+        const tm = await getCryptoTradesBatch([symbol]);
+        const t = tm.get(symbol);
+        if (Number.isFinite(t?.tms)) {
+          let rawAgeSec = (Date.now() - t.tms) / 1000;
+          if (rawAgeSec < -MAX_CLOCK_SKEW_SECONDS) rawAgeSec = 0;
+          if (rawAgeSec > ABSURD_AGE_SEC) {
+            logBadQuoteTimestamp({ symbol, rawFields: { tms: t.tms } });
+            rawAgeSec = null;
+          }
+          lastSeenAgeSec = Number.isFinite(rawAgeSec) ? rawAgeSec : null;
         }
       } catch {}
       if (Number.isFinite(lastSeenAgeSec)) {
@@ -3605,6 +3694,7 @@ export default function App() {
     const mm = microMetrics(q);
 
     if (q.bs != null && Number.isFinite(q.bs) && (q.bs * q.bid) < MIN_BID_NOTIONAL_LOOSE_USD) {
+      logGateFail(asset.symbol, 'illiquid', `bidNotional=${(q.bs * q.bid).toFixed(2)}, min=${MIN_BID_NOTIONAL_LOOSE_USD}`);
       return {
         entryReady: false,
         why: 'illiquid',
@@ -3616,19 +3706,36 @@ export default function App() {
     }
 
     const mid = 0.5 * (q.bid + q.ask);
-    if (BLACKLIST.has(asset.symbol)) return { entryReady: false, why: 'blacklist', meta: {} };
-    if (mid < eff(asset.symbol, 'minPriceUsd')) return { entryReady: false, why: 'tiny_price', meta: { mid } };
+    if (BLACKLIST.has(asset.symbol)) {
+      logGateFail(asset.symbol, 'blacklist');
+      return { entryReady: false, why: 'blacklist', meta: {} };
+    }
+    if (mid < eff(asset.symbol, 'minPriceUsd')) {
+      logGateFail(asset.symbol, 'tiny_price', `mid=${mid.toFixed(6)}, min=${eff(asset.symbol, 'minPriceUsd')}`);
+      return { entryReady: false, why: 'tiny_price', meta: { mid } };
+    }
 
     const spreadBps = ((q.ask - q.bid) / mid) * 10000;
     logTradeAction('quote_ok', asset.symbol, { spreadBps: +spreadBps.toFixed(1), batchId });
 
     if (spreadBps > d.spreadMax + SPREAD_EPS_BPS) {
       logTradeAction('skip_wide_spread', asset.symbol, { spreadBps: +spreadBps.toFixed(1) });
+      logGateFail(
+        asset.symbol,
+        'spread_too_wide',
+        `spread=${spreadBps.toFixed(1)}bps, max=${d.spreadMax}bps`
+      );
       return { entryReady: false, why: 'spread', meta: { spreadBps, max: d.spreadMax } };
     }
 
     const feeBps = roundTripFeeBpsEstimate(asset.symbol);
     if (effectiveSettings.requireSpreadOverFees && spreadBps < feeBps + eff(asset.symbol, 'spreadOverFeesMinBps')) {
+      const minBps = feeBps + eff(asset.symbol, 'spreadOverFeesMinBps');
+      logGateFail(
+        asset.symbol,
+        'spread_fee_gate',
+        `spread=${spreadBps.toFixed(1)}bps, min=${minBps.toFixed(1)}bps`
+      );
       return { entryReady: false, why: 'spread_fee_gate', meta: { spreadBps, feeBps } };
     }
 
@@ -3689,6 +3796,11 @@ export default function App() {
     );
     const tpBase = q.bid * (1 + needBpsCapped / 10000);
     if (!(tpBase > q.bid * 1.00005)) {
+      logGateFail(
+        asset.symbol,
+        'edge_negative',
+        `tpBps=${needBpsCapped.toFixed(1)}, bid=${q.bid}`
+      );
       return { entryReady: false, why: 'edge_negative', meta: { tpBps: needBpsCapped, bid: q.bid, tp: tpBase } };
     }
 
@@ -3703,6 +3815,11 @@ export default function App() {
       }
 
       if (!(evBps >= (effectiveSettings.evMinBps ?? -1) || evUsd >= (effectiveSettings.evMinUSD ?? -0.02))) {
+        logGateFail(
+          asset.symbol,
+          'edge_negative_ev',
+          `evBps=${Number(evBps?.toFixed?.(2))}, evUsd=${Number(evUsd?.toFixed?.(4))}`
+        );
         return { entryReady: false, why: 'edge_negative_ev', meta: { evBps, evUsd, tpBps: needBpsCapped } };
       }
     }
@@ -3726,11 +3843,13 @@ export default function App() {
   }
 
   const placeOrder = async (symbol, ccSymbol = symbol, d, sigPre = null, preQuoteMap = null, refs, batchId = null) => {
+    const normalizedSymbol = toInternalSymbol(symbol);
     if (TRADING_HALTED) {
-      logTradeAction('daily_halt', symbol, { reason: HALT_REASON || 'Rule' });
-      return false;
+      logTradeAction('daily_halt', normalizedSymbol, { reason: HALT_REASON || 'Rule' });
+      logGateFail(normalizedSymbol, 'trading_halted', `reason=${HALT_REASON || 'Rule'}`);
+      return { attempted: false, filled: false };
     }
-    if (STABLES.has(symbol)) return false;
+    if (STABLES.has(normalizedSymbol)) return { attempted: false, filled: false };
 
     await cleanupStaleBuyOrders(30);
 
@@ -3739,25 +3858,27 @@ export default function App() {
       const nonStableOpen = (allPos || []).filter((p) => Number(p.qty) > 0 && Number(p.market_value || p.marketValue || 0) > 1).length;
       const cap = concurrencyCapBySpread(globalSpreadAvgRef.current);
       if (nonStableOpen >= cap) {
-        logTradeAction('concurrency_guard', symbol, { cap, avg: globalSpreadAvgRef.current, hitRate: (function(){let h=0,t=0;for(const s of Object.values(symStats)){for(const b of (s.hitByHour||[])){h+=b.h||0;t+=b.t||0;}}return t>0?(h/t):null;})() });
-        return false;
+        logTradeAction('concurrency_guard', normalizedSymbol, { cap, avg: globalSpreadAvgRef.current, hitRate: (function(){let h=0,t=0;for(const s of Object.values(symStats)){for(const b of (s.hitByHour||[])){h+=b.h||0;t+=b.t||0;}}return t>0?(h/t):null;})() });
+        logGateFail(normalizedSymbol, 'max_positions', `open=${nonStableOpen}, cap=${cap}`);
+        return { attempted: false, filled: false };
       }
     } catch {}
 
-    const held = await getPositionInfo(symbol);
+    const held = await getPositionInfo(normalizedSymbol);
     const avail = Number(held?.available ?? 0);
     const mv    = Number(held?.marketValue ?? 0);
     const trulyHeld = avail > 0 || mv >= effectiveSettings.dustFlattenMaxUsd;
     if (trulyHeld) {
-      logTradeAction('entry_skipped', symbol, { entryReady: false, reason: 'held' });
-      return false;
+      logTradeAction('entry_skipped', normalizedSymbol, { entryReady: false, reason: 'held' });
+      logGateFail(normalizedSymbol, 'held');
+      return { attempted: false, filled: false };
     }
 
-    const sig = sigPre || (await computeEntrySignal({ symbol, cc: ccSymbol }, d, effectiveSettings.riskLevel, preQuoteMap, null, batchId));
-    if (!sig.entryReady) return false;
+    const sig = sigPre || (await computeEntrySignal({ symbol: normalizedSymbol, cc: ccSymbol }, d, effectiveSettings.riskLevel, preQuoteMap, null, batchId));
+    if (!sig.entryReady) return { attempted: false, filled: false };
 
     // Fetch fresh, pending-aware BP to avoid 403s
-    const bpInfo = await getUsableBuyingPower({ forCrypto: isCrypto(symbol) });
+    const bpInfo = await getUsableBuyingPower({ forCrypto: isCrypto(normalizedSymbol) });
     let equity   = Number.isFinite(acctSummary.portfolioValue) ? acctSummary.portfolioValue : (bpInfo.snapshot?.equity ?? NaN);
     if (bpInfo.snapshot) {
       const a = bpInfo.snapshot;
@@ -3771,8 +3892,9 @@ export default function App() {
 
     const buyingPower = bpInfo.usable; // this is the only number we size from
     if (!Number.isFinite(buyingPower) || buyingPower <= 0) {
-      logTradeAction('entry_skipped', symbol, { entryReady: true, reason: 'skip_small_order', note: 'no usable BP' });
-      return false;
+      logTradeAction('entry_skipped', normalizedSymbol, { entryReady: true, reason: 'skip_small_order', note: 'no usable BP' });
+      logGateFail(normalizedSymbol, 'buying_power', `needed>0, avail=${Number.isFinite(buyingPower) ? buyingPower.toFixed(2) : buyingPower}`);
+      return { attempted: false, filled: false };
     }
 
     let entryPx = Number.isFinite(sig?.quote?.bid) && sig.quote.bid > 0 ? sig.quote.bid : sig?.quote?.ask;
@@ -3794,16 +3916,17 @@ export default function App() {
 
     // Cap per position
     const desired  = Math.min(buyingPower, (effectiveSettings.maxPosPctEquity / 100) * equity);
-    const notionalBase = capNotional(symbol, desired, equity);
+    const notionalBase = capNotional(normalizedSymbol, desired, equity);
     const notional = Number.isFinite(kellyNotional) && kellyNotional > 0
       ? Math.min(notionalBase, kellyNotional)
       : notionalBase;
 
-    logTradeAction('quote_ok', symbol, { spreadBps: (sig?.spreadBps ?? 0), bp_base: bpInfo.base, bp_pending: bpInfo.pending, bp_usable: buyingPower, batchId: sig?.batchId ?? batchId });
+    logTradeAction('quote_ok', normalizedSymbol, { spreadBps: (sig?.spreadBps ?? 0), bp_base: bpInfo.base, bp_pending: bpInfo.pending, bp_usable: buyingPower, batchId: sig?.batchId ?? batchId });
 
     if (!Number.isFinite(notional) || notional < 5) {
-      logTradeAction('skip_small_order', symbol);
-      return false;
+      logTradeAction('skip_small_order', normalizedSymbol);
+      logGateFail(normalizedSymbol, 'min_notional', `orderUsd=${Number(notional).toFixed(2)}, min=5`);
+      return { attempted: false, filled: false };
     }
 
     if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig.quote.bid;
@@ -3815,13 +3938,20 @@ export default function App() {
     const denom = Math.max(pxForSizing * (1 + feeFrac + cushion), 1e-9);
     let qty = +(notional / denom).toFixed(9);
     if (!Number.isFinite(qty) || qty <= 0) {
-      logTradeAction('skip_small_order', symbol);
-      return false;
+      logTradeAction('skip_small_order', normalizedSymbol);
+      logGateFail(normalizedSymbol, 'min_notional', `orderUsd=${Number(notional).toFixed(2)}, min=5`);
+      return { attempted: false, filled: false };
     }
 
     // console.log('USABLE BP', symbol, buyingPower);
-    const result = await placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap, buyingPower);
-    if (!result.filled) return false;
+    logReadyAttempt({
+      symbol: normalizedSymbol,
+      orderUsd: notional,
+      price: entryPx,
+      spreadBps: sig?.spreadBps,
+    });
+    const result = await placeMakerThenMaybeTakerBuy(normalizedSymbol, qty, preQuoteMap, buyingPower);
+    if (!result.filled) return { attempted: result.attempted, filled: false };
 
     const actualEntry = result.entry ?? entryPx;
     const actualQty = result.qty ?? qty;
@@ -3845,26 +3975,26 @@ export default function App() {
     const feeFloor = minExitPriceFeeAwareDynamic({ symbol, entryPx: actualEntry, qty: actualQty, buyBpsOverride: buyBpsApplied });
     const tpCapped = Math.max(Math.min(tpBase, actualEntry + (runwayUSD || 0)), feeFloor);
 
-    refs.tradeStateRef.current[symbol] = {
+    refs.tradeStateRef.current[normalizedSymbol] = {
       entry: actualEntry, qty: actualQty, tp: tpCapped, feeFloor,
       runway: runwayUSD ?? sig?.runway ?? 0, entryTs: Date.now(), lastLimitPostTs: 0,
       wasHolding: true, stopPx: null, hardStopPx: null, trailArmed: false, trailPeak: null,
       buyBpsApplied, // track actual buy fee (maker/taker)
     };
-    await ensureLimitTP(symbol, tpCapped, { tradeStateRef, touchMemoRef });
+    await ensureLimitTP(normalizedSymbol, tpCapped, { tradeStateRef, touchMemoRef });
 
-    const prevController = monitorControllersRef.current.get(symbol);
+    const prevController = monitorControllersRef.current.get(normalizedSymbol);
     if (prevController) prevController.abort();
     const controller = new AbortController();
-    monitorControllersRef.current.set(symbol, controller);
-    monitorOutcome(symbol, actualEntry, sig?.v0 ?? 0, controller.signal)
+    monitorControllersRef.current.set(normalizedSymbol, controller);
+    monitorOutcome(normalizedSymbol, actualEntry, sig?.v0 ?? 0, controller.signal)
       .catch(() => {})
       .finally(() => {
-        if (monitorControllersRef.current.get(symbol) === controller) {
-          monitorControllersRef.current.delete(symbol);
+        if (monitorControllersRef.current.get(normalizedSymbol) === controller) {
+          monitorControllersRef.current.delete(normalizedSymbol);
         }
       });
-    return true;
+    return { attempted: true, filled: true };
   };
 
   useEffect(() => {
@@ -4061,21 +4191,31 @@ export default function App() {
         return Number.isFinite(mv) && mv > 1 && Number.isFinite(qty) && qty > 0;
       }).length;
 
-      let cryptosAll = effectiveTracked;
+      const supportedSet = supportedCryptoSetRef.current;
+      const isSupportedSymbol = (sym) => !isUnsupportedLocal(sym) && isSupportedCryptoSymbol(sym, supportedSet);
+      const supportedTracked = effectiveTracked.filter((t) => {
+        const ok = isSupportedSymbol(t.symbol);
+        if (!ok) logUniverseDropOnce(t.symbol);
+        return ok;
+      });
+
+      let cryptosAll = supportedTracked;
       const cryptoPages = Math.max(1, Math.ceil(Math.max(0, cryptosAll.length) / effectiveSettings.stockPageSize));
       const cIdx = cryptoPageRef.current % cryptoPages;
       const cStart = cIdx * effectiveSettings.stockPageSize;
       const cryptoSlice = cryptosAll.slice(cStart, Math.min(cStart + effectiveSettings.stockPageSize, cryptosAll.length));
       cryptoPageRef.current += 1;
 
-      const supportedSet = supportedCryptoSetRef.current;
-      const isSupportedSymbol = (sym) => !isUnsupportedLocal(sym) && isSupportedCryptoSymbol(sym, supportedSet);
-      const cryptoSymbolsForQuotes = cryptoSlice.filter((t) => isSupportedSymbol(t.symbol)).map((t) => t.symbol);
+      const cryptoSymbolsForQuotes = cryptoSlice.map((t) => t.symbol);
 
       const barsMap = effectiveSettings.enforceMomentum ? await getCryptoBars1mBatch(cryptoSymbolsForQuotes, 6) : null;
 
       setOpenMeta({ positions: openCount, orders: (allOpenOrders || []).length, allowed: cryptosAll.length, universe: cryptosAll.length });
       logTradeAction('scan_start', 'STATIC', { batch: cryptoSlice.length });
+      const sampleSymbol = cryptoSymbolsForQuotes[0];
+      if (sampleSymbol) {
+        console.log(`SYMBOL MAP: ${sampleSymbol} -> ${toAlpacaCryptoSymbol(sampleSymbol)}`);
+      }
 
       const mixedSymbols = [...cryptoSymbolsForQuotes];
       const batchMap = await getQuotesBatch(mixedSymbols);
@@ -4096,15 +4236,6 @@ export default function App() {
         const d = { spreadMax: eff(asset.symbol, 'spreadMaxBps') };
         const token = { ...asset, price: null, entryReady: false, error: null, time: new Date().toLocaleTimeString(), spreadBps: null, tpBps: null };
         try {
-          if (!isSupportedSymbol(asset.symbol)) {
-            logUnsupportedOnce(asset.symbol);
-            token.error = 'unsupported_pair';
-            watchCount++;
-            skippedCount++;
-            reasonCounts.unsupported_pair = (reasonCounts.unsupported_pair || 0) + 1;
-            results.push(token);
-            continue;
-          }
           const qDisplay = batchMap.get(asset.symbol);
           if (qDisplay && qDisplay.bid > 0 && qDisplay.ask > 0) token.price = 0.5 * (qDisplay.bid + qDisplay.ask);
 
@@ -4125,10 +4256,10 @@ export default function App() {
             token.spreadBps = sig.spreadBps ?? null;
             token.tpBps = sig.tpBps ?? null;
             readyCount++;
-            attemptCount++;
             if (autoTrade) {
-              const ok = await placeOrder(asset.symbol, asset.cc, d, sig, batchMap, { tradeStateRef, touchMemoRef }, scanBatchId);
-              if (ok) successCount++;
+              const result = await placeOrder(asset.symbol, asset.cc, d, sig, batchMap, { tradeStateRef, touchMemoRef }, scanBatchId);
+              if (result?.attempted) attemptCount++;
+              if (result?.filled) successCount++;
             } else {
               logTradeAction('entry_skipped', asset.symbol, { entryReady: true, reason: 'auto_off' });
             }
