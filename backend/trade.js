@@ -205,7 +205,7 @@ function buildAlpacaUrl({ baseUrl, path, params, label }) {
 }
 
 function toTradeSymbol(rawSymbol) {
-  return canonicalAsset(rawSymbol);
+  return canonicalPair(rawSymbol);
 }
 
 function toDataSymbol(rawSymbol) {
@@ -348,48 +348,34 @@ function logHttpError({ symbol, label, url, error }) {
   }
 }
 
-function logOrderPayload({ label, payload }) {
+function logOrderPayload({ payload }) {
   if (!payload) return;
-  const safePayload = {
-    symbol: normalizeSymbol(payload.symbol),
-    qty: payload.qty ?? null,
-    notional: payload.notional ?? null,
-    side: payload.side,
-    type: payload.type,
-    time_in_force: payload.time_in_force,
-    limit_price: payload.limit_price,
-  };
-  console.log('alpaca_order_payload', { label, ...safePayload });
+  const symbol = normalizeSymbol(payload.symbol);
+  const notional = payload.notional ?? 'NA';
+  const qty = payload.qty ?? 'NA';
+  const limit = payload.limit_price ?? 'NA';
+  console.log(
+    `ORDER_SUBMIT symbol=${symbol} side=${payload.side} type=${payload.type} tif=${payload.time_in_force} notional=${notional} qty=${qty} limit=${limit}`
+  );
 }
 
-function logOrderResponse({ label, payload, response, error }) {
-  const safePayload = payload
-    ? {
-        symbol: normalizeSymbol(payload.symbol),
-        qty: payload.qty ?? null,
-        notional: payload.notional ?? null,
-        side: payload.side,
-        type: payload.type,
-        time_in_force: payload.time_in_force,
-        limit_price: payload.limit_price,
-      }
-    : {};
+function logOrderResponse({ payload, response, error }) {
+  const symbol = normalizeSymbol(payload?.symbol || '');
   if (response?.id) {
-    console.log('alpaca_order_response', {
-      label,
-      id: response.id,
-      status: response.status || response.order_status || 'accepted',
-      ...safePayload,
-    });
+    console.log(`ORDER_OK id=${response.id} status=${response.status || response.order_status || 'accepted'} symbol=${symbol}`);
+    return;
+  }
+  if (response) {
+    const body = JSON.stringify(response);
+    console.warn(`ORDER_FAIL http=NA code=NA message=invalid_order_response body=${body}`);
     return;
   }
   if (error) {
-    console.warn('alpaca_order_error', {
-      label,
-      code: error?.statusCode ?? error?.errorCode ?? null,
-      message: error?.errorMessage || error?.message || 'Unknown error',
-      ...safePayload,
-    });
+    const httpStatus = error?.statusCode ?? 'NA';
+    const code = error?.errorCode ?? 'NA';
+    const message = error?.errorMessage || error?.message || 'Unknown error';
+    const body = error?.responseSnippet200 || error?.responseSnippet || '';
+    console.warn(`ORDER_FAIL http=${httpStatus} code=${code} message=${message} body=${body}`);
   }
 }
 
@@ -2304,8 +2290,14 @@ async function submitOrder(order = {}) {
   } = order;
 
   const normalizedSymbol = normalizeSymbol(rawSymbol);
-
+  const isCrypto = isCryptoSymbol(normalizedSymbol);
   const sideLower = String(side || '').toLowerCase();
+  const typeLower = String(type || '').toLowerCase();
+  const allowedCryptoTypes = new Set(['market', 'limit', 'stop_limit']);
+  const finalType = isCrypto && !allowedCryptoTypes.has(typeLower) ? 'market' : (typeLower || 'market');
+  const rawTif = String(time_in_force || '').toLowerCase();
+  const allowedCryptoTifs = new Set(['gtc', 'ioc', 'fok']);
+  const finalTif = isCrypto ? (allowedCryptoTifs.has(rawTif) ? rawTif : 'gtc') : (rawTif || time_in_force);
   const qtyNum = Number(qty);
   const limitPriceNum = Number(limit_price);
 
@@ -2366,16 +2358,20 @@ async function submitOrder(order = {}) {
   }
   const finalQty = sizeGuard.qty ?? qty;
   const finalNotional = sizeGuard.notional ?? notional;
+  const hasQty = Number.isFinite(Number(finalQty)) && Number(finalQty) > 0;
+  const hasNotional = Number.isFinite(Number(finalNotional)) && Number(finalNotional) > 0;
+  const useQty = hasQty;
+  const useNotional = !useQty && hasNotional;
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_submit' });
   const payload = {
     symbol: toTradeSymbol(normalizedSymbol),
-    qty: finalQty,
-    side,
-    type,
-    time_in_force,
-    limit_price,
-    notional: finalNotional,
+    side: sideLower,
+    type: finalType,
+    time_in_force: finalTif,
+    limit_price: Number.isFinite(limitPriceNum) ? limitPriceNum : undefined,
+    qty: useQty ? finalQty : undefined,
+    notional: useNotional ? finalNotional : undefined,
     client_order_id: buildClientOrderId(normalizedSymbol, 'order'),
   };
   logOrderPayload({ label: 'orders_submit', payload });
