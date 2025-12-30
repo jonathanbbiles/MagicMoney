@@ -8,7 +8,7 @@ import {
 import { getSettings } from '../state/settingsStore';
 import { isoDaysAgo, isFresh, parseTsMs } from '../utils/format';
 import { rateLimitedFetch as fetchWithBudget, sleep } from '../utils/network';
-import { isStock, toDataSymbol } from '../utils/symbols';
+import { isStock, toAlpacaCryptoSymbol, toInternalSymbol } from '../utils/symbols';
 
 let logHandler = () => {};
 export const registerAlpacaLogger = (fn) => {
@@ -133,23 +133,26 @@ export const invalidateOpenOrdersCache = () => { openOrdersCache = { ts: 0, item
 export const invalidatePositionsCache = () => { positionsCache = { ts: 0, items: [] }; };
 
 const isUnsupported = (sym) => {
-  const u = unsupportedSymbols.get(sym);
+  const normalized = toInternalSymbol(sym);
+  const u = unsupportedSymbols.get(normalized);
   if (!u) return false;
   if (Date.now() > u) {
-    unsupportedSymbols.delete(sym);
+    unsupportedSymbols.delete(normalized);
     return false;
   }
   return true;
 };
 
 export const markUnsupported = (sym, mins = 120) => {
-  unsupportedSymbols.set(sym, Date.now() + mins * 60000);
+  const normalized = toInternalSymbol(sym);
+  if (!normalized) return;
+  unsupportedSymbols.set(normalized, Date.now() + mins * 60000);
 };
 
 export const clearQuoteCache = () => quoteCache.clear();
 
 const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
-  const normalized = symbols.map((s) => toDataSymbol(s)).join(',');
+  const normalized = symbols.map((s) => toAlpacaCryptoSymbol(s)).join(',');
   return buildBackendUrl({
     path: `market/crypto/${what}`,
     params: { symbols: normalized, location: loc, ...params },
@@ -248,20 +251,21 @@ export const getStockClockCached = async (ttlMs = 30000) => {
   return v;
 };
 
-export const getCryptoQuotesBatch = async (dsyms = []) => {
-  if (!dsyms.length) return new Map();
-  const settings = getSettings();
-  const dataSymbols = dsyms.map((s) => toDataSymbol(s));
+export const getCryptoQuotesBatch = async (symbols = []) => {
+  const internalSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
+  if (!internalSymbols.length) return new Map();
+  const dataSymbols = internalSymbols.map((s) => toAlpacaCryptoSymbol(s));
   for (const loc of DATA_LOCATIONS) {
     try {
       const url = buildURLCrypto(loc, 'quotes', dataSymbols);
       const payload = await fetchMarketData('QUOTE', url);
       const raw = payload?.quotes || {};
       const out = new Map();
-      for (const dsym of dataSymbols) {
-        const q = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
+      for (const symbol of internalSymbols) {
+        const dataSymbol = toAlpacaCryptoSymbol(symbol);
+        const q = Array.isArray(raw[dataSymbol]) ? raw[dataSymbol][0] : raw[dataSymbol];
         if (!q) {
-          log('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'QUOTE' });
+          log('no_quote', symbol, { reason: 'no_data', requestType: 'QUOTE' });
           continue;
         }
         const bid = Number(q.bp ?? q.bid_price);
@@ -270,7 +274,7 @@ export const getCryptoQuotesBatch = async (dsyms = []) => {
         const as = Number(q.as ?? q.ask_size);
         const tms = parseTsMs(q.t);
         if (bid > 0 && ask > 0) {
-          out.set(dsym, {
+          out.set(symbol, {
             bid,
             ask,
             bs: Number.isFinite(bs) ? bs : null,
@@ -282,34 +286,36 @@ export const getCryptoQuotesBatch = async (dsyms = []) => {
       if (out.size) return out;
     } catch (err) {
       log('quote_http_error', 'QUOTE', { status: err?.statusCode || err?.code || 'exception', loc, body: err?.responseSnippet || err?.message || '' });
-      for (const dsym of dataSymbols) {
-        log('no_quote', dsym.replace('/', ''), { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
+      for (const symbol of internalSymbols) {
+        log('no_quote', symbol, { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
       }
     }
   }
   return new Map();
 };
 
-export const getCryptoTradesBatch = async (dsyms = []) => {
-  if (!dsyms.length) return new Map();
-  const dataSymbols = dsyms.map((s) => toDataSymbol(s));
+export const getCryptoTradesBatch = async (symbols = []) => {
+  const internalSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
+  if (!internalSymbols.length) return new Map();
+  const dataSymbols = internalSymbols.map((s) => toAlpacaCryptoSymbol(s));
   for (const loc of DATA_LOCATIONS) {
     try {
       const url = buildURLCrypto(loc, 'trades', dataSymbols);
       const payload = await fetchMarketData('TRADE', url);
       const raw = payload?.trades || {};
       const out = new Map();
-      for (const dsym of dataSymbols) {
-        const t = Array.isArray(raw[dsym]) ? raw[dsym][0] : raw[dsym];
+      for (const symbol of internalSymbols) {
+        const dataSymbol = toAlpacaCryptoSymbol(symbol);
+        const t = Array.isArray(raw[dataSymbol]) ? raw[dataSymbol][0] : raw[dataSymbol];
         const price = Number(t?.p ?? t?.price);
         const tms = parseTsMs(t?.t);
-        if (Number.isFinite(price) && price > 0) out.set(dsym, { price, tms });
+        if (Number.isFinite(price) && price > 0) out.set(symbol, { price, tms });
       }
       if (out.size) return out;
     } catch (err) {
       log('trade_http_error', 'TRADE', { status: err?.statusCode || err?.code || 'exception', loc, body: err?.responseSnippet || err?.message || '' });
-      for (const dsym of dataSymbols) {
-        log('no_quote', dsym.replace('/', ''), { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'TRADE' });
+      for (const symbol of internalSymbols) {
+        log('no_quote', symbol, { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'TRADE' });
       }
     }
   }
@@ -317,8 +323,9 @@ export const getCryptoTradesBatch = async (dsyms = []) => {
 };
 
 export const getCryptoBars1m = async (symbol, limit = 6) => {
-  const dsym = toDataSymbol(symbol);
-  const cached = barsCache.get(dsym);
+  const internalSymbol = toInternalSymbol(symbol);
+  const dsym = toAlpacaCryptoSymbol(internalSymbol);
+  const cached = barsCache.get(internalSymbol);
   const now = Date.now();
   if (cached && now - cached.ts < barsCacheTTL) {
     return cached.bars.slice(0, limit);
@@ -344,32 +351,32 @@ export const getCryptoBars1m = async (symbol, limit = 6) => {
             tms: parseTsMs(b.t),
           }))
           .filter((x) => Number.isFinite(x.close) && x.close > 0);
-        barsCache.set(dsym, { ts: now, bars: bars.slice() });
+        barsCache.set(internalSymbol, { ts: now, bars: bars.slice() });
         return bars.slice(0, limit);
       }
-      log('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'BARS' });
+      log('no_quote', internalSymbol, { reason: 'no_data', requestType: 'BARS' });
     } catch (err) {
       log('quote_http_error', 'BARS', { status: err?.statusCode || err?.code || 'exception', loc, body: err?.responseSnippet || err?.message || '' });
-      log('no_quote', dsym.replace('/', ''), { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
+      log('no_quote', internalSymbol, { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
     }
   }
   return [];
 };
 
 export const getCryptoBars1mBatch = async (symbols = [], limit = 6) => {
-  const uniqSyms = Array.from(new Set(symbols.filter(Boolean)));
+  const uniqSyms = Array.from(new Set(symbols.map((s) => toInternalSymbol(s)).filter(Boolean)));
   if (!uniqSyms.length) return new Map();
-  const dsymList = uniqSyms.map((s) => toDataSymbol(s));
+  const dsymList = uniqSyms.map((s) => toAlpacaCryptoSymbol(s));
   const out = new Map();
   const now = Date.now();
 
   const missing = [];
-  for (const dsym of dsymList) {
-    const cached = barsCache.get(dsym);
+  for (const sym of uniqSyms) {
+    const cached = barsCache.get(sym);
     if (cached && now - cached.ts < barsCacheTTL) {
-      out.set(dsym.replace('/', ''), cached.bars.slice(0, limit));
+      out.set(sym, cached.bars.slice(0, limit));
     } else {
-      missing.push(dsym);
+      missing.push(sym);
     }
   }
   if (!missing.length) return out;
@@ -378,13 +385,14 @@ export const getCryptoBars1mBatch = async (symbols = [], limit = 6) => {
     try {
       const url = buildBackendUrl({
         path: 'market/crypto/bars',
-        params: { timeframe: '1Min', limit: String(limit), symbols: missing.join(','), location: loc },
+        params: { timeframe: '1Min', limit: String(limit), symbols: missing.map((s) => toAlpacaCryptoSymbol(s)).join(','), location: loc },
         label: 'crypto_bars_batch',
       });
       const payload = await fetchMarketData('BARS', url);
       const raw = payload?.bars || {};
-      for (const dsym of missing) {
-        const arr = raw[dsym];
+      for (const sym of missing) {
+        const dataSymbol = toAlpacaCryptoSymbol(sym);
+        const arr = raw[dataSymbol];
         if (Array.isArray(arr) && arr.length) {
           const bars = arr
             .map((b) => ({
@@ -396,17 +404,17 @@ export const getCryptoBars1mBatch = async (symbols = [], limit = 6) => {
               tms: parseTsMs(b.t),
             }))
             .filter((x) => Number.isFinite(x.close) && x.close > 0);
-          barsCache.set(dsym, { ts: now, bars: bars.slice() });
-          out.set(dsym.replace('/', ''), bars.slice(0, limit));
+          barsCache.set(sym, { ts: now, bars: bars.slice() });
+          out.set(sym, bars.slice(0, limit));
         } else {
-          log('no_quote', dsym.replace('/', ''), { reason: 'no_data', requestType: 'BARS' });
+          log('no_quote', sym, { reason: 'no_data', requestType: 'BARS' });
         }
       }
       break;
     } catch (err) {
       log('quote_http_error', 'BARS', { status: err?.statusCode || err?.code || 'exception', loc, body: err?.responseSnippet || err?.message || '' });
-      for (const dsym of missing) {
-        log('no_quote', dsym.replace('/', ''), { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
+      for (const sym of missing) {
+        log('no_quote', sym, { reason: err?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'BARS' });
       }
     }
   }
@@ -458,40 +466,40 @@ export const stocksLatestQuotesBatch = async (symbols = []) => {
 
 export const getQuoteSmart = async (symbol, preloadedMap = null) => {
   try {
-    if (isStock(symbol)) {
-      markUnsupported(symbol, 60);
+    const normalizedSymbol = toInternalSymbol(symbol);
+    if (isStock(normalizedSymbol)) {
+      markUnsupported(normalizedSymbol, 60);
       return null;
     }
-    if (isUnsupported(symbol)) return null;
+    if (isUnsupported(normalizedSymbol)) return null;
 
     const settings = getSettings();
-    const cached = quoteCache.get(symbol);
+    const cached = quoteCache.get(normalizedSymbol);
     if (cached && Date.now() - cached.ts < settings.quoteTtlMs) return cached.q;
 
-    if (preloadedMap && preloadedMap.has(symbol)) {
-      const q = preloadedMap.get(symbol);
+    if (preloadedMap && preloadedMap.has(normalizedSymbol)) {
+      const q = preloadedMap.get(normalizedSymbol);
       if (q && isFresh(q.tms, settings.liveFreshMsCrypto)) return q;
     }
 
-    const dsym = toDataSymbol(symbol);
-    const m = await getCryptoQuotesBatch([dsym]);
-    const q0 = m.get(dsym);
+    const m = await getCryptoQuotesBatch([normalizedSymbol]);
+    const q0 = m.get(normalizedSymbol);
     if (q0 && isFresh(q0.tms, settings.liveFreshMsCrypto)) {
       const qObj = { bid: q0.bid, ask: q0.ask, bs: q0.bs, as: q0.as, tms: q0.tms };
-      quoteCache.set(symbol, { ts: Date.now(), q: qObj });
+      quoteCache.set(normalizedSymbol, { ts: Date.now(), q: qObj });
       return qObj;
     }
 
     if (!settings.liveRequireQuote) {
-      const tm = await getCryptoTradesBatch([dsym]);
-      const t = tm.get(dsym);
+      const tm = await getCryptoTradesBatch([normalizedSymbol]);
+      const t = tm.get(normalizedSymbol);
       if (t && isFresh(t.tms, settings.liveFreshTradeMsCrypto)) {
         const spread = settings.syntheticTradeSpreadBps;
         const price = t.price;
         if (price > 0) {
           const half = price * (spread / 20000);
           const synth = { bid: price - half, ask: price + half, bs: null, as: null, tms: Date.now() };
-          quoteCache.set(symbol, { ts: Date.now(), q: synth });
+          quoteCache.set(normalizedSymbol, { ts: Date.now(), q: synth });
           return synth;
         }
       }

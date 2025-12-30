@@ -305,6 +305,51 @@ function logHttpError({ symbol, label, url, error }) {
   }
 }
 
+function logOrderPayload({ label, payload }) {
+  if (!payload) return;
+  const safePayload = {
+    symbol: normalizeSymbol(payload.symbol),
+    qty: payload.qty ?? null,
+    notional: payload.notional ?? null,
+    side: payload.side,
+    type: payload.type,
+    time_in_force: payload.time_in_force,
+    limit_price: payload.limit_price,
+  };
+  console.log('alpaca_order_payload', { label, ...safePayload });
+}
+
+function logOrderResponse({ label, payload, response, error }) {
+  const safePayload = payload
+    ? {
+        symbol: normalizeSymbol(payload.symbol),
+        qty: payload.qty ?? null,
+        notional: payload.notional ?? null,
+        side: payload.side,
+        type: payload.type,
+        time_in_force: payload.time_in_force,
+        limit_price: payload.limit_price,
+      }
+    : {};
+  if (response?.id) {
+    console.log('alpaca_order_response', {
+      label,
+      id: response.id,
+      status: response.status || response.order_status || 'accepted',
+      ...safePayload,
+    });
+    return;
+  }
+  if (error) {
+    console.warn('alpaca_order_error', {
+      label,
+      code: error?.statusCode ?? error?.errorCode ?? null,
+      message: error?.errorMessage || error?.message || 'Unknown error',
+      ...safePayload,
+    });
+  }
+}
+
 async function requestJson({
   method,
   url,
@@ -760,23 +805,26 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     path: 'orders',
     label: 'orders_limit_buy',
   });
+  const buyPayload = {
+    symbol: normalizedSymbol,
+    qty: finalQty,
+    side: 'buy',
+    type: 'limit',
+    // crypto orders must be GTC
+    time_in_force: 'gtc',
+    limit_price: limitPrice,
+    client_order_id: buildClientOrderId(normalizedSymbol, 'limit-buy'),
+  };
+  logOrderPayload({ label: 'orders_limit_buy', payload: buyPayload });
   let buyOrder;
   try {
     buyOrder = await requestJson({
       method: 'POST',
       url: buyOrderUrl,
       headers: alpacaJsonHeaders(),
-      body: JSON.stringify({
-        symbol: normalizedSymbol,
-        qty: finalQty,
-        side: 'buy',
-        type: 'limit',
-        // crypto orders must be GTC
-        time_in_force: 'gtc',
-        limit_price: limitPrice,
-        client_order_id: buildClientOrderId(normalizedSymbol, 'limit-buy'),
-      }),
+      body: JSON.stringify(buyPayload),
     });
+    logOrderResponse({ label: 'orders_limit_buy', payload: buyPayload, response: buyOrder });
   } catch (err) {
     logHttpError({
       symbol: normalizedSymbol,
@@ -784,6 +832,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
       url: buyOrderUrl,
       error: err,
     });
+    logOrderResponse({ label: 'orders_limit_buy', payload: buyPayload, error: err });
     if (isNetworkError(err)) {
       logNetworkError({
         type: 'order',
@@ -1408,24 +1457,28 @@ async function submitLimitSell({
   const finalQty = sizeGuard.qty ?? qty;
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_limit_sell' });
+  const payload = {
+    symbol,
+    qty: finalQty,
+    side: 'sell',
+    type: 'limit',
+    time_in_force: 'gtc',
+    limit_price: limitPrice,
+    client_order_id: buildClientOrderId(symbol, 'limit-sell'),
+  };
+  logOrderPayload({ label: 'orders_limit_sell', payload });
   let response;
   try {
     response = await requestJson({
       method: 'POST',
       url,
       headers: alpacaJsonHeaders(),
-      body: JSON.stringify({
-        symbol,
-        qty: finalQty,
-        side: 'sell',
-        type: 'limit',
-        time_in_force: 'gtc',
-        limit_price: limitPrice,
-        client_order_id: buildClientOrderId(symbol, 'limit-sell'),
-      }),
+      body: JSON.stringify(payload),
     });
+    logOrderResponse({ label: 'orders_limit_sell', payload, response });
   } catch (err) {
     logHttpError({ symbol, label: 'orders', url, error: err });
+    logOrderResponse({ label: 'orders_limit_sell', payload, error: err });
     if (isNetworkError(err)) {
       logNetworkError({
         type: 'order',
@@ -1465,23 +1518,27 @@ async function submitMarketSell({
   const finalQty = sizeGuard.qty ?? qty;
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_market_sell' });
+  const payload = {
+    symbol,
+    qty: finalQty,
+    side: 'sell',
+    type: 'market',
+    time_in_force: 'gtc',
+    client_order_id: buildClientOrderId(symbol, 'market-sell'),
+  };
+  logOrderPayload({ label: 'orders_market_sell', payload });
   let response;
   try {
     response = await requestJson({
       method: 'POST',
       url,
       headers: alpacaJsonHeaders(),
-      body: JSON.stringify({
-        symbol,
-        qty: finalQty,
-        side: 'sell',
-        type: 'market',
-        time_in_force: 'gtc',
-        client_order_id: buildClientOrderId(symbol, 'market-sell'),
-      }),
+      body: JSON.stringify(payload),
     });
+    logOrderResponse({ label: 'orders_market_sell', payload, response });
   } catch (err) {
     logHttpError({ symbol, label: 'orders', url, error: err });
+    logOrderResponse({ label: 'orders_market_sell', payload, error: err });
     if (isNetworkError(err)) {
       logNetworkError({
         type: 'order',
@@ -1960,21 +2017,24 @@ async function placeMarketBuyThenSell(symbol) {
     path: 'orders',
     label: 'orders_market_buy',
   });
+  const buyPayload = {
+    symbol: normalizedSymbol,
+    qty: finalQty,
+    side: 'buy',
+    type: 'market',
+    time_in_force: 'gtc',
+    client_order_id: buildClientOrderId(normalizedSymbol, 'market-buy'),
+  };
+  logOrderPayload({ label: 'orders_market_buy', payload: buyPayload });
   let buyOrder;
   try {
     buyOrder = await requestJson({
       method: 'POST',
       url: buyOrderUrl,
       headers: alpacaJsonHeaders(),
-      body: JSON.stringify({
-        symbol: normalizedSymbol,
-        qty: finalQty,
-        side: 'buy',
-        type: 'market',
-        time_in_force: 'gtc',
-        client_order_id: buildClientOrderId(normalizedSymbol, 'market-buy'),
-      }),
+      body: JSON.stringify(buyPayload),
     });
+    logOrderResponse({ label: 'orders_market_buy', payload: buyPayload, response: buyOrder });
   } catch (err) {
     logHttpError({
       symbol: normalizedSymbol,
@@ -1982,6 +2042,7 @@ async function placeMarketBuyThenSell(symbol) {
       url: buyOrderUrl,
       error: err,
     });
+    logOrderResponse({ label: 'orders_market_buy', payload: buyPayload, error: err });
     throw err;
   }
 
@@ -2156,25 +2217,29 @@ async function submitOrder(order = {}) {
   const finalNotional = sizeGuard.notional ?? notional;
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_submit' });
+  const payload = {
+    symbol: normalizedSymbol,
+    qty: finalQty,
+    side,
+    type,
+    time_in_force,
+    limit_price,
+    notional: finalNotional,
+    client_order_id: buildClientOrderId(normalizedSymbol, 'order'),
+  };
+  logOrderPayload({ label: 'orders_submit', payload });
   let response;
   try {
     response = await requestJson({
       method: 'POST',
       url,
       headers: alpacaJsonHeaders(),
-      body: JSON.stringify({
-        symbol: normalizedSymbol,
-        qty: finalQty,
-        side,
-        type,
-        time_in_force,
-        limit_price,
-        notional: finalNotional,
-        client_order_id: buildClientOrderId(normalizedSymbol, 'order'),
-      }),
+      body: JSON.stringify(payload),
     });
+    logOrderResponse({ label: 'orders_submit', payload, response });
   } catch (err) {
     logHttpError({ symbol: normalizedSymbol, label: 'orders', url, error: err });
+    logOrderResponse({ label: 'orders_submit', payload, error: err });
     if (isNetworkError(err)) {
       logNetworkError({
         type: 'order',
