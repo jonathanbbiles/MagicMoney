@@ -1,6 +1,6 @@
-const MAX_QUOTE_AGE_SEC = Number(process.env.MAX_QUOTE_AGE_SEC || 120);
-const ABSURD_AGE_SEC = Number(process.env.ABSURD_AGE_SEC || 86400);
-const MAX_CLOCK_SKEW_SECONDS = 5;
+const MAX_QUOTE_AGE_MS = Number(process.env.MAX_QUOTE_AGE_MS || 30000);
+const ABSURD_AGE_MS = Number(process.env.ABSURD_AGE_MS || 86400 * 1000);
+const MAX_CLOCK_SKEW_MS = 5000;
 
 function normalizeQuoteTsMs(rawTs) {
   if (rawTs == null) return null;
@@ -34,31 +34,31 @@ function normalizeEpochNumber(rawTs) {
   return Number.isFinite(tsMs) ? tsMs : null;
 }
 
-function computeQuoteAgeSeconds({ nowMs, tsMs }) {
+function computeQuoteAgeMs({ nowMs, tsMs }) {
   if (!Number.isFinite(nowMs) || !Number.isFinite(tsMs)) return null;
-  let ageSec = (nowMs - tsMs) / 1000;
-  if (!Number.isFinite(ageSec)) return null;
-  if (ageSec < -MAX_CLOCK_SKEW_SECONDS) {
-    ageSec = 0;
+  let ageMs = nowMs - tsMs;
+  if (!Number.isFinite(ageMs)) return null;
+  if (ageMs < -MAX_CLOCK_SKEW_MS) {
+    ageMs = 0;
   }
-  return ageSec;
+  return ageMs;
 }
 
-function normalizeQuoteAgeSeconds(ageSec) {
-  if (!Number.isFinite(ageSec)) return null;
-  if (ageSec > ABSURD_AGE_SEC) return null;
-  return ageSec;
+function normalizeQuoteAgeMs(ageMs) {
+  if (!Number.isFinite(ageMs)) return null;
+  if (ageMs > ABSURD_AGE_MS) return null;
+  return ageMs;
 }
 
-function isStaleQuoteAge(ageSec) {
-  return Number.isFinite(ageSec) && ageSec > MAX_QUOTE_AGE_SEC;
+function isStaleQuoteAge(ageMs) {
+  return Number.isFinite(ageMs) && ageMs > MAX_QUOTE_AGE_MS;
 }
 
 module.exports = {
-  MAX_QUOTE_AGE_SEC,
-  ABSURD_AGE_SEC,
+  MAX_QUOTE_AGE_MS,
+  ABSURD_AGE_MS,
   normalizeQuoteTsMs,
-  computeQuoteAgeSeconds,
-  normalizeQuoteAgeSeconds,
+  computeQuoteAgeMs,
+  normalizeQuoteAgeMs,
   isStaleQuoteAge,
 };

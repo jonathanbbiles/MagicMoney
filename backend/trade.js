@@ -2,13 +2,14 @@ const { randomUUID } = require('crypto');
 
 const { httpJson } = require('./httpClient');
 const {
-  MAX_QUOTE_AGE_SEC,
-  ABSURD_AGE_SEC,
+  MAX_QUOTE_AGE_MS,
+  ABSURD_AGE_MS,
   normalizeQuoteTsMs,
-  computeQuoteAgeSeconds,
-  normalizeQuoteAgeSeconds,
+  computeQuoteAgeMs,
+  normalizeQuoteAgeMs,
   isStaleQuoteAge,
 } = require('./quoteUtils');
+const { canonicalPair, canonicalAsset } = require('./symbolUtils');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -141,7 +142,7 @@ const FORCE_EXIT_SECONDS = Number(process.env.FORCE_EXIT_SECONDS || 600);
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 100);
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
-const QUOTE_CACHE_MAX_AGE_SECONDS = 60;
+const QUOTE_CACHE_MAX_AGE_MS = 60000;
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
@@ -160,6 +161,7 @@ const marketDataState = {
   cooldownUntil: 0,
   cooldownLoggedAt: 0,
 };
+let dataDegradedUntil = 0;
 
  
 
@@ -203,27 +205,11 @@ function buildAlpacaUrl({ baseUrl, path, params, label }) {
 }
 
 function toTradeSymbol(rawSymbol) {
-  if (!rawSymbol) return rawSymbol;
-  const symbol = String(rawSymbol).trim().toUpperCase();
-  if (symbol.includes('/')) {
-    return symbol.replace(/\//g, '');
-  }
-  if (symbol.endsWith('-USD')) {
-    return symbol.replace(/-USD$/, 'USD');
-  }
-  return symbol;
+  return canonicalAsset(rawSymbol);
 }
 
 function toDataSymbol(rawSymbol) {
-  if (!rawSymbol) return rawSymbol;
-  const symbol = toTradeSymbol(rawSymbol);
-  if (symbol.includes('/')) {
-    return symbol.replace(/\/+/g, '/');
-  }
-  if (symbol.endsWith('USD') && symbol.length > 3) {
-    return `${symbol.slice(0, -3)}/USD`;
-  }
-  return symbol;
+  return canonicalPair(rawSymbol);
 }
 
 const supportedCryptoPairsState = {
@@ -277,6 +263,14 @@ function filterSupportedCryptoSymbols(symbols = []) {
 
 function isMarketDataCooldown() {
   return Date.now() < marketDataState.cooldownUntil;
+}
+
+function isDataDegraded() {
+  return Date.now() < dataDegradedUntil;
+}
+
+function markDataDegraded() {
+  dataDegradedUntil = Math.max(dataDegradedUntil, Date.now() + 2000);
 }
 
 function markMarketDataFailure(statusCode) {
@@ -437,6 +431,18 @@ async function requestMarketDataJson({ type, url, symbol }) {
     });
     throw err;
   }
+  if (isDataDegraded()) {
+    const err = new Error('Market data degraded');
+    err.errorCode = 'DEGRADED';
+    logMarketDataDiagnostics({
+      type,
+      url,
+      statusCode: null,
+      snippet: '',
+      errorType: 'degraded',
+    });
+    throw err;
+  }
 
   const result = await httpJson({
     method: 'GET',
@@ -459,6 +465,7 @@ async function requestMarketDataJson({ type, url, symbol }) {
       urlPath: result.error.urlPath || null,
     });
     markMarketDataFailure(result.error.statusCode ?? null);
+    markDataDegraded();
     lastHttpError = result.error;
     const err = new Error(result.error.errorMessage || 'Market data request failed');
     err.errorCode = errorType === 'network' ? 'NETWORK' : 'HTTP_ERROR';
@@ -471,6 +478,14 @@ async function requestMarketDataJson({ type, url, symbol }) {
     err.requestId = result.error.requestId || null;
     err.urlHost = result.error.urlHost || null;
     err.urlPath = result.error.urlPath || null;
+    if (err.statusCode === 429 && result.error.rateLimit) {
+      console.warn('marketdata_rate_limit', {
+        type,
+        limit: result.error.rateLimit.limit,
+        remaining: result.error.rateLimit.remaining,
+        reset: result.error.rateLimit.reset,
+      });
+    }
     throw err;
   }
 
@@ -506,12 +521,12 @@ function recordLastQuoteAt(symbol, { tsMs, source, reason }) {
   lastQuoteAt.set(normalizedSymbol, entry);
 }
 
-function logQuoteAgeWarning({ symbol, ageSec, source, tsMs }) {
+function logQuoteAgeWarning({ symbol, ageMs, source, tsMs }) {
   if (!DEBUG_QUOTE_TS) return;
-  if (!Number.isFinite(ageSec) || ageSec <= ABSURD_AGE_SEC) return;
+  if (!Number.isFinite(ageMs) || ageMs <= ABSURD_AGE_MS) return;
   console.warn('quote_age_warning', {
     symbol,
-    ageSeconds: Math.round(ageSec),
+    ageSeconds: Math.round(ageMs / 1000),
     source: source || null,
     tsMs: Number.isFinite(tsMs) ? tsMs : null,
   });
@@ -525,7 +540,7 @@ function normalizeSymbol(rawSymbol) {
 
   if (!rawSymbol) return rawSymbol;
 
-  return toTradeSymbol(rawSymbol);
+  return canonicalPair(rawSymbol);
 
 }
 
@@ -541,9 +556,9 @@ function logQuoteTimestampDebug({ symbol, rawTs, source }) {
   });
 }
 
-function formatLoggedAgeSeconds(ageSec) {
-  if (!Number.isFinite(ageSec)) return null;
-  return Math.min(Math.round(ageSec), MAX_LOGGED_QUOTE_AGE_SECONDS);
+function formatLoggedAgeSeconds(ageMs) {
+  if (!Number.isFinite(ageMs)) return null;
+  return Math.min(Math.round(ageMs / 1000), MAX_LOGGED_QUOTE_AGE_SECONDS);
 }
 
 function buildUrlWithParams(baseUrl, params = {}) {
@@ -557,7 +572,7 @@ function buildUrlWithParams(baseUrl, params = {}) {
 }
 
 function buildClientOrderId(symbol, purpose) {
-  const normalized = normalizeSymbol(symbol) || 'UNKNOWN';
+  const normalized = canonicalAsset(symbol) || 'UNKNOWN';
   return `${normalized}-${purpose}-${randomUUID()}`;
 }
 
@@ -855,7 +870,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     label: 'orders_limit_buy',
   });
   const buyPayload = {
-    symbol: normalizedSymbol,
+    symbol: toTradeSymbol(normalizedSymbol),
     qty: finalQty,
     side: 'buy',
     type: 'limit',
@@ -975,7 +990,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
 function isCryptoSymbol(symbol) {
 
-  return /USD$/.test(symbol);
+  return Boolean(symbol && canonicalPair(symbol).endsWith('/USD'));
 
 }
 
@@ -1129,7 +1144,7 @@ async function fetchPositions() {
 }
 
 async function fetchPosition(symbol) {
-  const normalized = normalizeSymbol(symbol);
+  const normalized = toTradeSymbol(symbol);
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: `positions/${encodeURIComponent(normalized)}`,
@@ -1143,7 +1158,7 @@ async function fetchPosition(symbol) {
 }
 
 async function fetchAsset(symbol) {
-  const normalized = normalizeSymbol(symbol);
+  const normalized = toTradeSymbol(symbol);
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: `assets/${encodeURIComponent(normalized)}`,
@@ -1254,17 +1269,17 @@ async function fetchFallbackTradeQuote(symbol, nowMs) {
     return null;
   }
 
-  const rawAgeSeconds = computeQuoteAgeSeconds({ nowMs, tsMs });
-  const ageSeconds = normalizeQuoteAgeSeconds(rawAgeSeconds);
-  if (Number.isFinite(rawAgeSeconds)) {
-    logQuoteAgeWarning({ symbol, ageSec: rawAgeSeconds, source: 'trade_fallback', tsMs });
+  const rawAgeMs = computeQuoteAgeMs({ nowMs, tsMs });
+  const ageMs = normalizeQuoteAgeMs(rawAgeMs);
+  if (Number.isFinite(rawAgeMs)) {
+    logQuoteAgeWarning({ symbol, ageMs: rawAgeMs, source: 'trade_fallback', tsMs });
   }
-  if (Number.isFinite(rawAgeSeconds) && !Number.isFinite(ageSeconds)) {
-    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(rawAgeSeconds) });
+  if (Number.isFinite(rawAgeMs) && !Number.isFinite(ageMs)) {
+    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(rawAgeMs) });
     return null;
   }
-  if (isStaleQuoteAge(ageSeconds)) {
-    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(ageSeconds) });
+  if (isStaleQuoteAge(ageMs)) {
+    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(ageMs) });
     return null;
   }
 
@@ -1285,14 +1300,14 @@ async function getLatestQuote(rawSymbol) {
   const nowMs = Date.now();
   const cached = quoteCache.get(symbol);
   const cachedTsMs = cached && Number.isFinite(cached.tsMs) ? cached.tsMs : null;
-  const cachedAgeSecondsRaw = Number.isFinite(cachedTsMs)
-    ? computeQuoteAgeSeconds({ nowMs, tsMs: cachedTsMs })
+  const cachedAgeMsRaw = Number.isFinite(cachedTsMs)
+    ? computeQuoteAgeMs({ nowMs, tsMs: cachedTsMs })
     : null;
-  const cachedAgeSeconds = normalizeQuoteAgeSeconds(cachedAgeSecondsRaw);
-  if (Number.isFinite(cachedAgeSecondsRaw)) {
-    logQuoteAgeWarning({ symbol, ageSec: cachedAgeSecondsRaw, source: cached?.source || 'cache', tsMs: cachedTsMs });
+  const cachedAgeMs = normalizeQuoteAgeMs(cachedAgeMsRaw);
+  if (Number.isFinite(cachedAgeMsRaw)) {
+    logQuoteAgeWarning({ symbol, ageMs: cachedAgeMsRaw, source: cached?.source || 'cache', tsMs: cachedTsMs });
   }
-  if (Number.isFinite(cachedAgeSeconds) && cachedAgeSeconds <= QUOTE_CACHE_MAX_AGE_SECONDS) {
+  if (Number.isFinite(cachedAgeMs) && cachedAgeMs <= QUOTE_CACHE_MAX_AGE_MS) {
     recordLastQuoteAt(symbol, { tsMs: cachedTsMs, source: 'cache' });
     return {
       bid: cached.bid,
@@ -1365,9 +1380,9 @@ async function getLatestQuote(rawSymbol) {
     }
     const reason = cached ? 'stale_cache' : 'no_data';
     if (cached && Number.isFinite(cachedTsMs)) {
-      const lastSeenAge = Number.isFinite(cachedAgeSeconds)
-        ? cachedAgeSeconds
-        : cachedAgeSecondsRaw;
+      const lastSeenAge = Number.isFinite(cachedAgeMs)
+        ? cachedAgeMs
+        : cachedAgeMsRaw;
       logSkip('stale_quote', { symbol, lastSeenAgeSeconds: formatLoggedAgeSeconds(lastSeenAge) });
     } else {
       logSkip('no_quote', { symbol, reason });
@@ -1386,10 +1401,10 @@ async function getLatestQuote(rawSymbol) {
   const ask = Number(quote.ap ?? quote.ask_price ?? quote.ask);
   const normalizedBid = Number.isFinite(bid) ? bid : null;
   const normalizedAsk = Number.isFinite(ask) ? ask : null;
-  const rawAgeSeconds = Number.isFinite(tsMs) ? computeQuoteAgeSeconds({ nowMs, tsMs }) : null;
-  const ageSeconds = normalizeQuoteAgeSeconds(rawAgeSeconds);
-  if (Number.isFinite(rawAgeSeconds)) {
-    logQuoteAgeWarning({ symbol, ageSec: rawAgeSeconds, source: 'alpaca', tsMs });
+  const rawAgeMs = Number.isFinite(tsMs) ? computeQuoteAgeMs({ nowMs, tsMs }) : null;
+  const ageMs = normalizeQuoteAgeMs(rawAgeMs);
+  if (Number.isFinite(rawAgeMs)) {
+    logQuoteAgeWarning({ symbol, ageMs: rawAgeMs, source: 'alpaca', tsMs });
   }
 
   if (!Number.isFinite(normalizedBid) || !Number.isFinite(normalizedAsk) || normalizedBid <= 0 || normalizedAsk <= 0) {
@@ -1398,9 +1413,9 @@ async function getLatestQuote(rawSymbol) {
       return fallbackQuote;
     }
     if (cached && Number.isFinite(cachedTsMs)) {
-      const lastSeenAge = Number.isFinite(cachedAgeSeconds)
-        ? cachedAgeSeconds
-        : cachedAgeSecondsRaw;
+      const lastSeenAge = Number.isFinite(cachedAgeMs)
+        ? cachedAgeMs
+        : cachedAgeMsRaw;
       logSkip('stale_quote', { symbol, lastSeenAgeSeconds: formatLoggedAgeSeconds(lastSeenAge) });
     } else {
       logSkip('no_quote', { symbol, reason: 'invalid_bid_ask' });
@@ -1419,22 +1434,22 @@ async function getLatestQuote(rawSymbol) {
     throw new Error(`Quote timestamp missing for ${symbol}`);
   }
 
-  if (Number.isFinite(rawAgeSeconds) && !Number.isFinite(ageSeconds)) {
+  if (Number.isFinite(rawAgeMs) && !Number.isFinite(ageMs)) {
     const fallbackQuote = await tryFallbackTradeQuote();
     if (fallbackQuote) {
       return fallbackQuote;
     }
-    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(rawAgeSeconds) });
+    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(rawAgeMs) });
     recordLastQuoteAt(symbol, { tsMs: null, source: 'stale', reason: 'absurd_age' });
     throw new Error(`Quote age absurd for ${symbol}`);
   }
 
-  if (isStaleQuoteAge(ageSeconds)) {
+  if (isStaleQuoteAge(ageMs)) {
     const fallbackQuote = await tryFallbackTradeQuote();
     if (fallbackQuote) {
       return fallbackQuote;
     }
-    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(ageSeconds) });
+    logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(ageMs) });
     recordLastQuoteAt(symbol, { tsMs, source: 'stale', reason: 'stale_quote' });
     throw new Error(`Quote stale for ${symbol}`);
   }
@@ -1594,7 +1609,7 @@ async function submitLimitSell({
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_limit_sell' });
   const payload = {
-    symbol,
+    symbol: toTradeSymbol(symbol),
     qty: finalQty,
     side: 'sell',
     type: 'limit',
@@ -1655,7 +1670,7 @@ async function submitMarketSell({
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_market_sell' });
   const payload = {
-    symbol,
+    symbol: toTradeSymbol(symbol),
     qty: finalQty,
     side: 'sell',
     type: 'market',
@@ -2154,7 +2169,7 @@ async function placeMarketBuyThenSell(symbol) {
     label: 'orders_market_buy',
   });
   const buyPayload = {
-    symbol: normalizedSymbol,
+    symbol: toTradeSymbol(normalizedSymbol),
     qty: finalQty,
     side: 'buy',
     type: 'market',
@@ -2354,7 +2369,7 @@ async function submitOrder(order = {}) {
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_submit' });
   const payload = {
-    symbol: normalizedSymbol,
+    symbol: toTradeSymbol(normalizedSymbol),
     qty: finalQty,
     side,
     type,
@@ -2495,14 +2510,14 @@ function getLastQuoteSnapshot() {
   for (const [symbol, entry] of lastQuoteAt.entries()) {
     const tsMs = entry?.tsMs;
     if (Number.isFinite(tsMs)) {
-      const rawAgeSeconds = computeQuoteAgeSeconds({ nowMs, tsMs });
-      const ageSeconds = normalizeQuoteAgeSeconds(rawAgeSeconds);
-      if (Number.isFinite(rawAgeSeconds)) {
-        logQuoteAgeWarning({ symbol, ageSec: rawAgeSeconds, source: entry.source, tsMs });
+      const rawAgeMs = computeQuoteAgeMs({ nowMs, tsMs });
+      const ageMs = normalizeQuoteAgeMs(rawAgeMs);
+      if (Number.isFinite(rawAgeMs)) {
+        logQuoteAgeWarning({ symbol, ageMs: rawAgeMs, source: entry.source, tsMs });
       }
       snapshot[symbol] = {
         ts: new Date(tsMs).toISOString(),
-        ageSeconds,
+        ageSeconds: Number.isFinite(ageMs) ? ageMs / 1000 : null,
         source: entry.source,
         reason: entry.reason ?? undefined,
       };

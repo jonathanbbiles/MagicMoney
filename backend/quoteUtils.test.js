@@ -2,7 +2,7 @@ const assert = require('assert/strict');
 
 const {
   normalizeQuoteTsMs,
-  computeQuoteAgeSeconds,
+  computeQuoteAgeMs,
 } = require('./quoteUtils');
 
 const NOW_MS = 1_700_000_000_000;
@@ -17,11 +17,11 @@ assert.equal(normalizeQuoteTsMs('not-a-date'), null);
 assert.equal(normalizeQuoteTsMs(null), null);
 
 assert.equal(
-  computeQuoteAgeSeconds({ nowMs: NOW_MS, tsMs: NOW_MS - 5_000 }),
-  5
+  computeQuoteAgeMs({ nowMs: NOW_MS, tsMs: NOW_MS - 5_000 }),
+  5_000
 );
 assert.equal(
-  computeQuoteAgeSeconds({ nowMs: NOW_MS, tsMs: NOW_MS + 6_000 }),
+  computeQuoteAgeMs({ nowMs: NOW_MS, tsMs: NOW_MS + 6_000 }),
   0
 );
 

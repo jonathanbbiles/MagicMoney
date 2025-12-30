@@ -18,21 +18,36 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
-const toInternalSymbol = (sym) => {
-  if (!sym) return "";
-  return String(sym).replace("/", "").toUpperCase().trim();
+const canonicalPair = (sym) => {
+  if (!sym) return '';
+  const raw = String(sym).trim().toUpperCase();
+  if (!raw) return '';
+  if (raw.includes('/')) {
+    const [base, quote] = raw.split('/');
+    if (!base) return raw;
+    return `${base}/${quote || 'USD'}`;
+  }
+  if (raw.includes('-')) {
+    const [base, quote] = raw.split('-');
+    if (!base) return raw;
+    return `${base}/${quote || 'USD'}`;
+  }
+  if (raw.endsWith('USD') && raw.length > 3) {
+    return `${raw.slice(0, -3)}/USD`;
+  }
+  return raw;
 };
 
-const toAlpacaCryptoSymbol = (sym) => {
-  const s = toInternalSymbol(sym);
-  if (s.length <= 3) return String(sym || "");
-  const base = s.slice(0, s.length - 3);
-  const quote = s.slice(-3);
-  return `${base}/${quote}`;
+const canonicalAsset = (sym) => {
+  if (!sym) return '';
+  const pair = canonicalPair(sym);
+  return pair ? pair.replace('/', '') : pair;
 };
 
-const normalizeCryptoSymbol = (sym) => toAlpacaCryptoSymbol(sym);
-const isCrypto = (sym) => /USD$/.test(toInternalSymbol(sym) || '');
+const toInternalSymbol = (sym) => canonicalPair(sym);
+const toAlpacaCryptoSymbol = (sym) => canonicalPair(sym);
+const normalizeCryptoSymbol = (sym) => canonicalPair(sym);
+const isCrypto = (sym) => canonicalPair(sym).endsWith('/USD');
 const isStock = (sym) => !isCrypto(sym);
 
 // SAFETY PATCH NOTES:
@@ -63,6 +78,9 @@ const BACKEND_HEADERS = {
   'Content-Type': 'application/json',
 };
 const DRY_RUN_STOPS = false; // Set true to log stop actions without sending orders
+const FORCE_ONE_TEST_BUY = ['1', 'true', 'yes'].includes(String(EX.FORCE_ONE_TEST_BUY || '').toLowerCase());
+const FORCE_ONE_TEST_BUY_NOTIONAL = Number(EX.FORCE_ONE_TEST_BUY_NOTIONAL || 2);
+let forceTestBuyUsed = false;
 console.log('[Backend ENV]', { base: BACKEND_BASE_URL });
 
 function bootConnectivityCheck(setStatusFn) {
@@ -106,9 +124,9 @@ const EQUITY_COMMISSION_PER_TRADE_USD = 0.0;
 
 // Legacy guard constants retained but superseded by settings (see DEFAULT_SETTINGS).
 const SLIP_BUFFER_BPS_BY_RISK = [1, 2, 3, 4, 5];
-const STABLES = new Set(['USDTUSD', 'USDCUSD']);
-// You can remove SHIBUSD from blacklist if you want to include it despite tiny tick size.
-const BLACKLIST = new Set(['SHIBUSD']);
+const STABLES = new Set(['USDT/USD', 'USDC/USD']);
+// You can remove SHIB/USD from blacklist if you want to include it despite tiny tick size.
+const BLACKLIST = new Set(['SHIB/USD']);
 const MIN_PRICE_FOR_TICK_SANE_USD = 0.001; // keep low, but still skip micro-price assets
 const DUST_FLATTEN_MAX_USD = 0.75;
 const DUST_SWEEP_MINUTES = 12;
@@ -316,6 +334,7 @@ let __TOKENS = 180; // ~180 req/min default budget
 let __LAST_REFILL = Date.now();
 const __REFILL_RATE = 180 / 60000; // tokens/ms
 const __MAX_TOKENS = 180;
+const RATE_LIMIT_BACKOFF_MS = [250, 500, 1000, 2000, 5000];
 async function __takeToken() {
   const now = Date.now();
   const elapsed = now - __LAST_REFILL;
@@ -332,6 +351,25 @@ async function __takeToken() {
   return __takeToken();
 }
 
+function readRateLimitHeaders(res) {
+  return {
+    limit: res?.headers?.get?.('x-ratelimit-limit') || null,
+    remaining: res?.headers?.get?.('x-ratelimit-remaining') || null,
+    reset: res?.headers?.get?.('x-ratelimit-reset') || null,
+  };
+}
+
+function computeRateLimitBackoff(attempt, headers = {}) {
+  const base = RATE_LIMIT_BACKOFF_MS[Math.min(attempt, RATE_LIMIT_BACKOFF_MS.length - 1)];
+  const resetRaw = headers.reset ? Number(headers.reset) : null;
+  if (Number.isFinite(resetRaw) && resetRaw > 0) {
+    const nowSec = Date.now() / 1000;
+    const waitMs = Math.max(0, Math.ceil((resetRaw - nowSec) * 1000));
+    return Math.max(base, Math.min(waitMs, 5000));
+  }
+  return base;
+}
+
 async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
   let lastErr = null;
   for (let i = 0; i <= retries; i++) {
@@ -343,7 +381,8 @@ async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
       clearTimeout(t);
       if (res.status === 429 || res.status >= 500) {
         if (i === retries) return res;
-        const extra = res.status === 429 ? 1200 + Math.floor(Math.random() * 800) : 0;
+        const headers = res.status === 429 ? readRateLimitHeaders(res) : null;
+        const extra = res.status === 429 ? computeRateLimitBackoff(i, headers || {}) : 0;
         await sleep(400 * Math.pow(2, i) + Math.floor(Math.random() * 300) + extra);
         continue;
       }
@@ -367,6 +406,7 @@ const marketDataState = {
   cooldownUntil: 0,
   cooldownLoggedAt: 0,
 };
+let dataDegradedUntil = 0;
 
 function buildBackendUrl({ path, params, label }) {
   const base = BACKEND_BASE_URL;
@@ -384,6 +424,10 @@ function buildBackendUrl({ path, params, label }) {
 }
 
 const isMarketDataCooldown = () => Date.now() < marketDataState.cooldownUntil;
+const isDataDegraded = () => Date.now() < dataDegradedUntil;
+const markDataDegraded = () => {
+  dataDegradedUntil = Math.max(dataDegradedUntil, Date.now() + 2000);
+};
 
 const markMarketDataFailure = () => {
   marketDataState.consecutiveFailures += 1;
@@ -415,12 +459,35 @@ async function fetchMarketData(type, url, opts = {}) {
     err.code = 'COOLDOWN';
     throw err;
   }
+  if (isDataDegraded()) {
+    logMarketDataDiagnostics({ type, url, statusCode: null, snippet: '', errorType: 'degraded' });
+    const err = new Error('Market data degraded');
+    err.code = 'DEGRADED';
+    throw err;
+  }
 
   try {
     const res = await f(url, opts, MARKET_DATA_TIMEOUT_MS, MARKET_DATA_RETRIES);
     const status = res?.status;
     if (!res?.ok) {
       const body = await res.text().catch(() => '');
+      if (status === 429) {
+        const rl = readRateLimitHeaders(res);
+        markDataDegraded();
+        logMarketDataDiagnostics({
+          type,
+          url,
+          statusCode: status,
+          snippet: body?.slice?.(0, 200),
+          errorType: 'rate_limit',
+        });
+        const err = new Error(`HTTP ${status}`);
+        err.code = 'RATE_LIMIT';
+        err.statusCode = status;
+        err.responseSnippet = body?.slice?.(0, 200);
+        err.rateLimit = rl;
+        throw err;
+      }
       logMarketDataDiagnostics({
         type,
         url,
@@ -429,6 +496,7 @@ async function fetchMarketData(type, url, opts = {}) {
         errorType: 'http',
       });
       markMarketDataFailure();
+      markDataDegraded();
       const err = new Error(`HTTP ${status}`);
       err.code = 'HTTP_ERROR';
       err.statusCode = status;
@@ -451,6 +519,7 @@ async function fetchMarketData(type, url, opts = {}) {
         errorType: 'parse',
       });
       markMarketDataFailure();
+      markDataDegraded();
       const parseErr = new Error('parse_error');
       parseErr.code = 'PARSE_ERROR';
       throw parseErr;
@@ -465,6 +534,7 @@ async function fetchMarketData(type, url, opts = {}) {
         errorType: 'network',
       });
       markMarketDataFailure();
+      markDataDegraded();
     }
     throw err;
   }
@@ -477,9 +547,9 @@ const fmtUSD = (n) =>
     ? `$ ${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
     : '—';
 const fmtPct = (n) => (Number.isFinite(n) ? `${n.toFixed(2)}%` : '—');
-const MAX_QUOTE_AGE_SEC = 120;
-const ABSURD_AGE_SEC = 86400;
-const MAX_CLOCK_SKEW_SECONDS = 5;
+const MAX_QUOTE_AGE_MS = Number(EX.MAX_QUOTE_AGE_MS || SETTINGS.quoteTtlMs || 30000);
+const ABSURD_AGE_MS = 86400 * 1000;
+const MAX_CLOCK_SKEW_MS = 5000;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(EX.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
 const quoteBadTsLogged = new Set();
@@ -512,15 +582,15 @@ const normalizeEpochNumber = (rawTs) => {
 
 const parseTsMs = normalizeQuoteTsMs;
 const isFresh = (tsMs, ttlMs) => Number.isFinite(tsMs) && (Date.now() - tsMs <= ttlMs);
-const computeQuoteAgeSeconds = ({ nowMs, tsMs }) => {
+const computeQuoteAgeMs = ({ nowMs, tsMs }) => {
   if (!Number.isFinite(nowMs) || !Number.isFinite(tsMs)) return null;
-  let ageSec = (nowMs - tsMs) / 1000;
-  if (!Number.isFinite(ageSec)) return null;
-  if (ageSec < -MAX_CLOCK_SKEW_SECONDS) ageSec = 0;
-  if (ageSec > ABSURD_AGE_SEC) return null;
-  return ageSec;
+  let ageMs = nowMs - tsMs;
+  if (!Number.isFinite(ageMs)) return null;
+  if (ageMs < -MAX_CLOCK_SKEW_MS) ageMs = 0;
+  if (ageMs > ABSURD_AGE_MS) return null;
+  return ageMs;
 };
-const formatLoggedAgeSeconds = (ageSec) => (Number.isFinite(ageSec) ? Math.round(ageSec) : null);
+const formatLoggedAgeSeconds = (ageMs) => (Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null);
 
 const logQuoteTimestampDebug = ({ symbol, rawFields, source }) => {
   if (!DEBUG_QUOTE_TS) return;
@@ -1095,23 +1165,23 @@ const PnlScoreboard = ({ days = 7 }) => {
 
 /* ───────────────────────────── 10) STATIC UNIVERSES ───────────────────────────── */
 const ORIGINAL_TOKENS = [
-  { name: 'ETH/USD',  symbol: 'ETHUSD',  cc: 'ETH'  },
-  { name: 'AAVE/USD', symbol: 'AAVEUSD', cc: 'AAVE' },
-  { name: 'LTC/USD',  symbol: 'LTCUSD',  cc: 'LTC'  },
-  { name: 'LINK/USD', symbol: 'LINKUSD', cc: 'LINK' },
-  { name: 'UNI/USD',  symbol: 'UNIUSD',  cc: 'UNI'  },
-  { name: 'SOL/USD',  symbol: 'SOLUSD',  cc: 'SOL'  },
-  { name: 'BTC/USD',  symbol: 'BTCUSD',  cc: 'BTC'  },
-  { name: 'AVAX/USD', symbol: 'AVAXUSD', cc: 'AVAX' },
-  { name: 'ADA/USD',  symbol: 'ADAUSD',  cc: 'ADA'  },
-  { name: 'MATIC/USD',symbol: 'MATICUSD',cc: 'MATIC'},
-  { name: 'XRP/USD',  symbol: 'XRPUSD',  cc: 'XRP'  },
-  { name: 'SHIB/USD', symbol: 'SHIBUSD', cc: 'SHIB' },
-  { name: 'BCH/USD',  symbol: 'BCHUSD',  cc: 'BCH'  },
-  { name: 'ETC/USD',  symbol: 'ETCUSD',  cc: 'ETC'  },
-  { name: 'TRX/USD',  symbol: 'TRXUSD',  cc: 'TRX'  },
-  { name: 'USDT/USD', symbol: 'USDTUSD', cc: 'USDT' },
-  { name: 'USDC/USD', symbol: 'USDCUSD', cc: 'USDC' },
+  { name: 'ETH/USD',  symbol: 'ETH/USD',  cc: 'ETH'  },
+  { name: 'AAVE/USD', symbol: 'AAVE/USD', cc: 'AAVE' },
+  { name: 'LTC/USD',  symbol: 'LTC/USD',  cc: 'LTC'  },
+  { name: 'LINK/USD', symbol: 'LINK/USD', cc: 'LINK' },
+  { name: 'UNI/USD',  symbol: 'UNI/USD',  cc: 'UNI'  },
+  { name: 'SOL/USD',  symbol: 'SOL/USD',  cc: 'SOL'  },
+  { name: 'BTC/USD',  symbol: 'BTC/USD',  cc: 'BTC'  },
+  { name: 'AVAX/USD', symbol: 'AVAX/USD', cc: 'AVAX' },
+  { name: 'ADA/USD',  symbol: 'ADA/USD',  cc: 'ADA'  },
+  { name: 'MATIC/USD',symbol: 'MATIC/USD',cc: 'MATIC'},
+  { name: 'XRP/USD',  symbol: 'XRP/USD',  cc: 'XRP'  },
+  { name: 'SHIB/USD', symbol: 'SHIB/USD', cc: 'SHIB' },
+  { name: 'BCH/USD',  symbol: 'BCH/USD',  cc: 'BCH'  },
+  { name: 'ETC/USD',  symbol: 'ETC/USD',  cc: 'ETC'  },
+  { name: 'TRX/USD',  symbol: 'TRX/USD',  cc: 'TRX'  },
+  { name: 'USDT/USD', symbol: 'USDT/USD', cc: 'USDT' },
+  { name: 'USDC/USD', symbol: 'USDC/USD', cc: 'USDC' },
 ];
 const CRYPTO_CORE_TRACKED = ORIGINAL_TOKENS.filter(t => !STABLES.has(t.symbol));
 
@@ -1130,6 +1200,28 @@ const lastQuoteBatchMissing = new Map();
 const unsupportedSymbols = new Map();
 const unsupportedLocalSymbols = new Set();
 const unsupportedLogTimestamps = new Map();
+const getQuoteLastSeenMs = (quote) => {
+  const tsMs = Number(quote?.tsMs ?? 0);
+  const recvMs = Number(quote?.receivedAtMs ?? 0);
+  return Math.max(tsMs || 0, recvMs || 0);
+};
+const isStaleQuoteEntry = (quote) => {
+  const lastSeenMs = getQuoteLastSeenMs(quote);
+  if (!Number.isFinite(lastSeenMs) || lastSeenMs <= 0) return true;
+  return (Date.now() - lastSeenMs) > MAX_QUOTE_AGE_MS;
+};
+const logStaleQuote = (symbol, quote, context = {}) => {
+  const lastSeenMs = getQuoteLastSeenMs(quote);
+  const lastSeenIso = Number.isFinite(lastSeenMs) && lastSeenMs > 0 ? new Date(lastSeenMs).toISOString() : null;
+  const ageMs = Number.isFinite(lastSeenMs) && lastSeenMs > 0 ? Date.now() - lastSeenMs : null;
+  logTradeAction('stale_quote', symbol, {
+    lastSeenIso,
+    lastSeenAgeSec: formatLoggedAgeSeconds(ageMs),
+    lastError: quote?.lastError ?? null,
+    source: quote?.source ?? null,
+    ...context,
+  });
+};
 const isUnsupported = (sym) => {
   const normalized = toInternalSymbol(sym);
   const u = unsupportedSymbols.get(normalized);
@@ -1223,7 +1315,7 @@ const barsCacheTTL = 30000; // 30 seconds
 
 /* ─────────────────────────────── 12) CRYPTO DATA API ─────────────────────────────── */
 const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
-  const normalized = symbols.map((s) => toAlpacaCryptoSymbol(s)).join(',');
+  const normalized = symbols.map((s) => canonicalPair(s)).join(',');
   return buildBackendUrl({
     path: `market/crypto/${what}`,
     params: { symbols: normalized, location: loc, ...params },
@@ -1234,7 +1326,7 @@ const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
 async function getCryptoQuotesBatch(symbols = []) {
   const internalSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
   if (!internalSymbols.length) return new Map();
-  const dataSymbols = internalSymbols.map((s) => toAlpacaCryptoSymbol(s));
+  const dataSymbols = internalSymbols.map((s) => canonicalPair(s));
   const now = Date.now();
   for (const loc of DATA_LOCATIONS) {
     try {
@@ -1243,7 +1335,7 @@ async function getCryptoQuotesBatch(symbols = []) {
       const raw = j?.quotes || {};
       const out = new Map();
       for (const symbol of internalSymbols) {
-        const dataSymbol = toAlpacaCryptoSymbol(symbol);
+        const dataSymbol = canonicalPair(symbol);
         const q = Array.isArray(raw[dataSymbol]) ? raw[dataSymbol][0] : raw[dataSymbol];
         if (!q) {
           logTradeAction('no_quote', symbol, { reason: 'no_data', requestType: 'QUOTE' });
@@ -1254,9 +1346,27 @@ async function getCryptoQuotesBatch(symbols = []) {
         const ask = Number(q.ap ?? q.ask_price);
         const bs = Number(q.bs ?? q.bid_size);
         const as = Number(q.as ?? q.ask_size);
-        const tms = parseQuoteTimestampMs({ symbol, rawFields: q, source: 'crypto_quote' });
-        if (bid > 0 && ask > 0 && Number.isFinite(tms)) {
-          out.set(symbol, { bid, ask, bs: Number.isFinite(bs) ? bs : null, as: Number.isFinite(as) ? as : null, tms });
+        const parsedTsMs = parseQuoteTimestampMs({ symbol, rawFields: q, source: 'crypto_quote' });
+        const tsMs = Number.isFinite(parsedTsMs) ? parsedTsMs : 0;
+        if (bid > 0 && ask > 0) {
+          const receivedAtMs = now;
+          const mid = (bid + ask) / 2;
+          const spreadBps = mid > 0 ? ((ask - bid) / mid) * 10000 : 0;
+          const source = tsMs > 0 ? 'quote_ts' : 'recv_ts';
+          const quote = {
+            bid,
+            ask,
+            bs: Number.isFinite(bs) ? bs : null,
+            as: Number.isFinite(as) ? as : null,
+            mid,
+            spreadBps,
+            tsMs,
+            receivedAtMs,
+            source,
+            lastError: null,
+          };
+          out.set(symbol, quote);
+          quoteCache.set(symbol, quote);
           lastQuoteBatchMissing.delete(symbol);
         }
       }
@@ -1270,6 +1380,12 @@ async function getCryptoQuotesBatch(symbols = []) {
           continue;
         }
         logTradeAction('no_quote', symbol, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
+        const cached = quoteCache.get(symbol);
+        if (cached) {
+          cached.lastError = e?.message || e?.code || 'request_failed';
+          cached.receivedAtMs = now;
+          quoteCache.set(symbol, cached);
+        }
         lastQuoteBatchMissing.set(symbol, now);
       }
     }
@@ -1279,7 +1395,7 @@ async function getCryptoQuotesBatch(symbols = []) {
 async function getCryptoTradesBatch(symbols = []) {
   const internalSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
   if (!internalSymbols.length) return new Map();
-  const dataSymbols = internalSymbols.map((s) => toAlpacaCryptoSymbol(s));
+  const dataSymbols = internalSymbols.map((s) => canonicalPair(s));
   for (const loc of DATA_LOCATIONS) {
     try {
       const url = buildURLCrypto(loc, 'trades', dataSymbols);
@@ -1287,7 +1403,7 @@ async function getCryptoTradesBatch(symbols = []) {
       const raw = j?.trades || {};
       const out = new Map();
       for (const symbol of internalSymbols) {
-        const dataSymbol = toAlpacaCryptoSymbol(symbol);
+        const dataSymbol = canonicalPair(symbol);
         const t = Array.isArray(raw[dataSymbol]) ? raw[dataSymbol][0] : raw[dataSymbol];
         const p = Number(t?.p ?? t?.price);
         const tms = parseQuoteTimestampMs({ symbol, rawFields: t, source: 'crypto_trade' });
@@ -1305,7 +1421,7 @@ async function getCryptoTradesBatch(symbols = []) {
 }
 async function getCryptoBars1m(symbol, limit = 6) {
   const internalSymbol = toInternalSymbol(symbol);
-  const dataSymbol = toAlpacaCryptoSymbol(internalSymbol);
+  const dataSymbol = canonicalPair(internalSymbol);
   const cached = barsCache.get(internalSymbol);
   const now = Date.now();
   if (cached && (now - cached.ts) < barsCacheTTL) {
@@ -1344,7 +1460,7 @@ async function getCryptoBars1m(symbol, limit = 6) {
 async function getCryptoBars1mBatch(symbols = [], limit = 6) {
   const uniqSyms = Array.from(new Set(symbols.map((s) => toInternalSymbol(s)).filter(Boolean)));
   if (!uniqSyms.length) return new Map();
-  const dsymList = uniqSyms.map((s) => toAlpacaCryptoSymbol(s));
+  const dsymList = uniqSyms.map((s) => canonicalPair(s));
   const out = new Map();
   const now = Date.now();
 
@@ -1363,13 +1479,13 @@ async function getCryptoBars1mBatch(symbols = [], limit = 6) {
     try {
       const url = buildBackendUrl({
         path: 'market/crypto/bars',
-        params: { timeframe: '1Min', limit: String(limit), symbols: missing.map((s) => toAlpacaCryptoSymbol(s)).join(','), location: loc },
+        params: { timeframe: '1Min', limit: String(limit), symbols: missing.map((s) => canonicalPair(s)).join(','), location: loc },
         label: 'crypto_bars_batch',
       });
       const j = await fetchMarketData('BARS', url, { headers: BACKEND_HEADERS });
       const raw = j?.bars || {};
       for (const symbol of missing) {
-        const dataSymbol = toAlpacaCryptoSymbol(symbol);
+        const dataSymbol = canonicalPair(symbol);
         const arr = raw[dataSymbol];
         if (Array.isArray(arr) && arr.length) {
           const bars = arr.map((b) => ({
@@ -1480,7 +1596,7 @@ async function cryptoDailyBars(symbols = [], limit = 10) {
   const out = new Map();
   for (const loc of DATA_LOCATIONS) {
     try {
-      const ds = uniq.map((s) => toAlpacaCryptoSymbol(s)).join(',');
+      const ds = uniq.map((s) => canonicalPair(s)).join(',');
       const url = buildBackendUrl({
         path: 'market/crypto/bars',
         params: { timeframe: '1Day', limit: String(limit), symbols: ds, location: loc },
@@ -1489,7 +1605,7 @@ async function cryptoDailyBars(symbols = [], limit = 10) {
       const j = await fetchMarketData('BARS', url, { headers: BACKEND_HEADERS });
       const raw = j?.bars || {};
       for (const sym of uniq) {
-        const dataSymbol = toAlpacaCryptoSymbol(sym);
+        const dataSymbol = canonicalPair(sym);
         const arr = raw[dataSymbol];
         if (Array.isArray(arr) && arr.length) {
           out.set(sym, arr.map(b => ({
@@ -1516,9 +1632,9 @@ async function cryptoDailyBars(symbols = [], limit = 10) {
 async function computeBenchReturns(days = 7) {
   // Use SPY for stocks proxy; BTCUSD for crypto proxy.
   const spyBarsMap = await stocksDailyBars(['SPY'], days + 2);
-  const btcBarsMap = await cryptoDailyBars(['BTCUSD'], days + 2);
+  const btcBarsMap = await cryptoDailyBars(['BTC/USD'], days + 2);
   const spy = (spyBarsMap.get('SPY') || []).slice(-(days + 1));
-  const btc = (btcBarsMap.get('BTCUSD') || []).slice(-(days + 1));
+  const btc = (btcBarsMap.get('BTC/USD') || []).slice(-(days + 1));
   const pct = (arr) => (arr.length >= 2 && arr[0].close > 0)
     ? (arr[arr.length - 1].close / arr[0].close) - 1
     : 0;
@@ -1917,51 +2033,30 @@ async function getQuotesBatch(symbols) {
 
   if (cryptos.length) {
     const internalSymbols = Array.from(new Set(cryptos)).filter((sym) => !isUnsupportedLocal(sym));
-    for (let i = 0; i < internalSymbols.length; i += 6) {
-      const slice = internalSymbols.slice(i, i + 6);
-      const missing = [];
-      let qmap = await getCryptoQuotesBatch(slice);
-      for (const symbol of slice) {
-        const q = qmap.get(symbol);
-        if (!q) {
-          missing.push(symbol);
-          quoteCache.delete(symbol);
-          continue;
-        }
-
-        // Freshness by exchange timestamp
-        const fresh = isFresh(q.tms, SETTINGS.liveFreshMsCrypto);
-
-        // If not fresh, do NOT include in batch output or cache
-        if (!fresh) {
-          missing.push(symbol);
-          quoteCache.delete(symbol);
-          continue;
-        }
-
-        out.set(symbol, {
-          bid: q.bid,
-          ask: q.ask,
-          bs: q.bs ?? null,
-          as: q.as ?? null,
-          tms: q.tms
-        });
-
-        // Cache only fresh quotes and include tms in cached object
-        quoteCache.set(symbol, {
-          ts: now,
-          q: { bid: q.bid, ask: q.ask, bs: q.bs ?? null, as: q.as ?? null, tms: q.tms }
-        });
-        lastQuoteBatchMissing.delete(symbol);
+    const missing = [];
+    const qmap = await getCryptoQuotesBatch(internalSymbols);
+    for (const symbol of internalSymbols) {
+      const q = qmap.get(symbol);
+      if (!q) {
+        missing.push(symbol);
+        quoteCache.delete(symbol);
+        continue;
       }
-      if (missing.length) {
-        for (const symbol of missing) {
-          lastQuoteBatchMissing.set(symbol, now);
-        }
+      if (isStaleQuoteEntry(q)) {
+        missing.push(symbol);
+        logStaleQuote(symbol, q, { reason: 'stale_quote' });
+        continue;
       }
-      const gotCount = slice.length - missing.length;
-      console.log(`QUOTE_BATCH got=${gotCount} missing=${missing.length} missingSymbols=${JSON.stringify(missing)}`);
+      out.set(symbol, q);
+      lastQuoteBatchMissing.delete(symbol);
     }
+    if (missing.length) {
+      for (const symbol of missing) {
+        lastQuoteBatchMissing.set(symbol, now);
+      }
+    }
+    const gotCount = internalSymbols.length - missing.length;
+    console.log(`QUOTE_BATCH got=${gotCount} missing=${missing.length} missingSymbols=${JSON.stringify(missing)}`);
   }
 
   if (stocks.length) {
@@ -1978,27 +2073,27 @@ async function getQuoteSmart(symbol, preloadedMap = null) {
     if (isStock(normalizedSymbol)) { markUnsupported(normalizedSymbol, 60); return null; }
     if (isUnsupportedLocal(normalizedSymbol)) return null;
 
-    // Always use cached real quotes if within TTL
+    // Always use cached real quotes if within staleness window
     {
       const c = quoteCache.get(normalizedSymbol);
-      const withinTtl = c && (Date.now() - c.ts < SETTINGS.quoteTtlMs);
-      const freshExch = c && isFresh(c.q?.tms, SETTINGS.liveFreshMsCrypto);
-      if (withinTtl && freshExch) return c.q;
+      if (c && !isStaleQuoteEntry(c)) return c;
+      if (c && isStaleQuoteEntry(c)) {
+        logStaleQuote(normalizedSymbol, c, { reason: 'stale_quote' });
+      }
     }
 
     // Use preloaded map if available and fresh
     if (preloadedMap && preloadedMap.has(normalizedSymbol)) {
       const q = preloadedMap.get(normalizedSymbol);
-      if (q && isFresh(q.tms, SETTINGS.liveFreshMsCrypto)) return q;
+      if (q && !isStaleQuoteEntry(q)) return q;
     }
 
     // Try to fetch a real quote
     const m = await getCryptoQuotesBatch([normalizedSymbol]);
     const q0 = m.get(normalizedSymbol);
-    if (q0 && isFresh(q0.tms, SETTINGS.liveFreshMsCrypto)) {
-      const qObj = { bid: q0.bid, ask: q0.ask, bs: q0.bs, as: q0.as, tms: q0.tms };
-      quoteCache.set(normalizedSymbol, { ts: Date.now(), q: qObj });
-      return qObj;
+    if (q0 && !isStaleQuoteEntry(q0)) {
+      quoteCache.set(normalizedSymbol, q0);
+      return q0;
     }
 
     // Fallback: synthesize a quote from last trade if allowed
@@ -2008,8 +2103,21 @@ async function getQuoteSmart(symbol, preloadedMap = null) {
       if (t && isFresh(t.tms, SETTINGS.liveFreshTradeMsCrypto)) {
         const synth = synthQuoteFromTrade(t.price, SETTINGS.syntheticTradeSpreadBps);
         if (synth) {
-          quoteCache.set(normalizedSymbol, { ts: Date.now(), q: synth });
-          return synth;
+          const receivedAtMs = Date.now();
+          const quote = {
+            bid: synth.bid,
+            ask: synth.ask,
+            bs: null,
+            as: null,
+            mid: synth.bid && synth.ask ? 0.5 * (synth.bid + synth.ask) : synth.bid,
+            spreadBps: 0,
+            tsMs: Number.isFinite(synth.tms) ? synth.tms : 0,
+            receivedAtMs,
+            source: 'trade_fallback',
+            lastError: null,
+          };
+          quoteCache.set(normalizedSymbol, quote);
+          return quote;
         }
       }
     }
@@ -2178,6 +2286,50 @@ const logOrderError = (context, order, error = null, res = null, data = null) =>
   return payload;
 };
 
+const orderFailureEvents = [];
+const ORDER_FAILURE_WINDOW_MS = 60000;
+const categorizeOrderFailure = ({ status, error }) => {
+  if (status === 401) return '401';
+  if (status === 403) return '403';
+  if (status === 422) return '422';
+  if (status === 429) return '429';
+  if (Number.isFinite(status) && status >= 500) return '5xx';
+  const msg = error?.message || '';
+  if (error?.name === 'TypeError' || msg.includes('Network') || msg.includes('fetch')) return 'network';
+  return 'unknown';
+};
+const recordOrderFailure = (code) => {
+  const now = Date.now();
+  orderFailureEvents.push({ code, ts: now });
+  const cutoff = now - ORDER_FAILURE_WINDOW_MS;
+  while (orderFailureEvents.length && orderFailureEvents[0].ts < cutoff) {
+    orderFailureEvents.shift();
+  }
+  const summary = { 401: 0, 403: 0, 422: 0, 429: 0, '5xx': 0, network: 0, unknown: 0 };
+  for (const ev of orderFailureEvents) {
+    if (summary[ev.code] == null) summary[ev.code] = 0;
+    summary[ev.code] += 1;
+  }
+  console.warn('order_failures_60s', { failures_by_code: summary });
+};
+const logOrderFailure = ({ order, endpoint, status, body, error }) => {
+  const code = categorizeOrderFailure({ status, error });
+  const payload = {
+    symbol: toInternalSymbol(order?.symbol),
+    side: order?.side,
+    notional: order?.notional ?? null,
+    qty: order?.qty ?? null,
+    order_type: order?.type,
+    limit_price: order?.limit_price ?? null,
+    endpoint,
+    status,
+    response_body: body ?? null,
+    error_code: code,
+  };
+  console.warn('order_submit_failed', payload);
+  recordOrderFailure(code);
+};
+
 const RECENT_ORDER_TTL_MS = 10 * 60 * 1000;
 const recentOrders = new Map();
 
@@ -2208,7 +2360,7 @@ const pruneRecentOrders = () => {
 
 const getPositionInfo = async (symbol) => {
   try {
-    const res = await f(`${BACKEND_BASE_URL}/positions/${symbol}`, { headers: BACKEND_HEADERS });
+    const res = await f(`${BACKEND_BASE_URL}/positions/${encodeURIComponent(canonicalAsset(symbol))}`, { headers: BACKEND_HEADERS });
     if (!res.ok) return null;
     const info = await res.json();
     const qty = parseFloat(info.qty ?? '0');
@@ -2232,7 +2384,12 @@ const getAllPositions = async () => {
     const r = await f(`${BACKEND_BASE_URL}/positions`, { headers: BACKEND_HEADERS });
     if (!r.ok) return [];
     const arr = await r.json();
-    return Array.isArray(arr) ? arr : [];
+    return Array.isArray(arr)
+      ? arr.map((pos) => ({
+        ...pos,
+        symbol: canonicalPair(pos.symbol),
+      }))
+      : [];
   } catch { return []; }
 };
 const getOrdersByStatus = async (status = 'open') => {
@@ -2240,7 +2397,12 @@ const getOrdersByStatus = async (status = 'open') => {
     const r = await f(`${BACKEND_BASE_URL}/orders?status=${encodeURIComponent(status)}&nested=true&limit=100`, { headers: BACKEND_HEADERS });
     if (!r.ok) return [];
     const arr = await r.json();
-    return Array.isArray(arr) ? arr : [];
+    return Array.isArray(arr)
+      ? arr.map((order) => ({
+        ...order,
+        symbol: canonicalPair(order.symbol),
+      }))
+      : [];
   } catch { return []; }
 };
 const getOpenOrders = async () => getOrdersByStatus('open');
@@ -2343,7 +2505,7 @@ async function getUsableBuyingPower({ forCrypto = true } = {}) {
       if (side !== 'buy') continue;
 
       const sym = o.symbol || '';
-      const isCryptoSym = /USD$/.test(sym);
+      const isCryptoSym = canonicalPair(sym).endsWith('/USD');
       if (forCrypto !== isCryptoSym) continue;
 
       const qty  = +o.qty || +o.quantity || NaN;
@@ -2564,6 +2726,47 @@ async function getAccountSummaryRaw() {
     daytradeBuyingPower: dtbp,
     cash
   };
+}
+
+const preflightState = {
+  lastCheckedMs: 0,
+  blocked: false,
+  reason: null,
+  account: null,
+};
+async function preflightAccountCheck() {
+  const now = Date.now();
+  if (now - preflightState.lastCheckedMs < 60000) return preflightState;
+  preflightState.lastCheckedMs = now;
+  try {
+    const res = await f(`${BACKEND_BASE_URL}/account`, { headers: BACKEND_HEADERS });
+    const status = res.status;
+    const account = await res.json().catch(() => ({}));
+    const tradingBlocked = Boolean(account.trading_blocked ?? account.tradingBlocked);
+    const accountBlocked = Boolean(account.account_blocked ?? account.accountBlocked);
+    const cryptoStatus = account.crypto_status ?? account.cryptoStatus ?? null;
+    const blocked = tradingBlocked || accountBlocked || (cryptoStatus && cryptoStatus !== 'ACTIVE');
+    preflightState.blocked = blocked;
+    preflightState.reason = blocked
+      ? `blocked${tradingBlocked ? ':trading' : ''}${accountBlocked ? ':account' : ''}${cryptoStatus && cryptoStatus !== 'ACTIVE' ? `:crypto_status=${cryptoStatus}` : ''}`
+      : null;
+    preflightState.account = account;
+    console.log('preflight_account', {
+      status,
+      crypto_status: cryptoStatus,
+      trading_blocked: tradingBlocked,
+      account_blocked: accountBlocked,
+    });
+    if (blocked) {
+      console.warn('preflight_blocked', { reason: preflightState.reason });
+    }
+    return preflightState;
+  } catch (e) {
+    console.warn('preflight_account_failed', { error: e?.message || e });
+    preflightState.blocked = false;
+    preflightState.reason = null;
+    return preflightState;
+  }
 }
 function capNotional(symbol, proposed, equity) {
   const hardCap = SETTINGS.absMaxNotionalUSD;
@@ -2982,7 +3185,7 @@ const HoldingsChangeBarChart = () => {
 /* ─────────────────────────── 24) ENTRY / ORDERING / EXITS ─────────────────────────── */
 async function fetchAssetMeta(symbol) {
   try {
-    const r = await f(`${BACKEND_BASE_URL}/assets/${encodeURIComponent(symbol)}`, { headers: BACKEND_HEADERS });
+    const r = await f(`${BACKEND_BASE_URL}/assets/${encodeURIComponent(canonicalAsset(symbol))}`, { headers: BACKEND_HEADERS });
     if (!r.ok) return null;
     const a = await r.json();
     if (a && typeof a === 'object') {
@@ -3113,13 +3316,13 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       };
       try {
         logOrderPayload('buy_limit', order);
+        attemptsSent += 1;
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_limit', order, res, data);
         const orderOk = Boolean(res.ok && data?.ok && data?.orderId);
         if (orderOk) {
           attempted = true;
-          attemptsSent += 1;
           const status = String(data.status || '').toLowerCase();
           recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
           if (status === 'filled') {
@@ -3129,6 +3332,12 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
           }
         } else {
           attemptsFailed += 1;
+          logOrderFailure({
+            order,
+            endpoint: `${BACKEND_BASE_URL}/orders`,
+            status: res.status,
+            body: data?.error?.message || data?.message || data?.raw || raw?.slice?.(0, 200) || '',
+          });
         }
         if (orderOk) {
           lastOrderId = data.orderId; placedLimit = join; lastReplaceAt = nowTs;
@@ -3139,6 +3348,13 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         logOrderError('buy_limit', order, e);
         logTradeAction('quote_exception', normalizedSymbol, { error: e.message });
         attemptsFailed += 1;
+        logOrderFailure({
+          order,
+          endpoint: `${BACKEND_BASE_URL}/orders`,
+          status: null,
+          body: e?.message || null,
+          error: e,
+        });
       }
     }
 
@@ -3191,13 +3407,13 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       const order = { symbol: normalizedSymbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif };
       try {
         logOrderPayload('buy_market', order);
+        attemptsSent += 1;
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_market', order, res, data);
         const orderOk = Boolean(res.ok && data?.ok && data?.orderId);
         if (orderOk) {
           attempted = true;
-          attemptsSent += 1;
           const status = String(data.status || '').toLowerCase();
           recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
           if (status === 'filled') {
@@ -3207,6 +3423,12 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
           }
         } else {
           attemptsFailed += 1;
+          logOrderFailure({
+            order,
+            endpoint: `${BACKEND_BASE_URL}/orders`,
+            status: res.status,
+            body: data?.error?.message || data?.message || data?.raw || raw?.slice?.(0, 200) || '',
+          });
         }
         if (orderOk) {
           logTradeAction('buy_success', normalizedSymbol, { qty: mQty, limit: 'mkt' });
@@ -3231,6 +3453,13 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         logOrderError('buy_market', order, e);
         logTradeAction('quote_exception', normalizedSymbol, { error: e.message });
         attemptsFailed += 1;
+        logOrderFailure({
+          order,
+          endpoint: `${BACKEND_BASE_URL}/orders`,
+          status: null,
+          body: e?.message || null,
+          error: e,
+        });
       }
     }
   }
@@ -3264,11 +3493,24 @@ async function marketSell(symbol, qty) {
       __openOrdersCache = { ts: 0, items: [] };
       return data;
     }
+    logOrderFailure({
+      order: mkt,
+      endpoint: `${BACKEND_BASE_URL}/orders`,
+      status: res.status,
+      body: data?.error?.message || data?.message || data?.raw || raw?.slice?.(0, 200) || '',
+    });
     logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt ${res.status} ${data?.error?.message || data?.message || data?.raw?.slice?.(0, 120) || ''}` });
     return null;
   } catch (e) {
     logOrderError('sell_market', mkt, e);
     logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt exception ${e.message}` });
+    logOrderFailure({
+      order: mkt,
+      endpoint: `${BACKEND_BASE_URL}/orders`,
+      status: null,
+      body: e?.message || null,
+      error: e,
+    });
     return null;
   }
 }
@@ -3501,11 +3743,24 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       logTradeAction('tp_limit_set', symbol, { id: data.orderId, limit: order.limit_price });
     } else {
       const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
+      logOrderFailure({
+        order,
+        endpoint: `${BACKEND_BASE_URL}/orders`,
+        status: res.status,
+        body: msg,
+      });
       logTradeAction('tp_limit_error', symbol, { error: `POST ${res.status} ${msg}` });
     }
   } catch (e) {
     logOrderError('sell_limit', { symbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit }, e);
     logTradeAction('tp_limit_error', symbol, { error: e.message });
+    logOrderFailure({
+      order: { symbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit },
+      endpoint: `${BACKEND_BASE_URL}/orders`,
+      status: null,
+      body: e?.message || null,
+      error: e,
+    });
   }
 };
 
@@ -3776,10 +4031,10 @@ export default function App() {
     const report = { checkedAt: new Date().toISOString(), sections: {} };
 
     try {
-      const m = await getCryptoQuotesBatch(['BTCUSD', 'ETHUSD']);
-      const bt = m.get('BTCUSD'), et = m.get('ETHUSD');
-      const freshB = !!bt && isFresh(bt.tms, effectiveSettings.liveFreshMsCrypto);
-      const freshE = !!et && isFresh(et.tms, effectiveSettings.liveFreshMsCrypto);
+      const m = await getCryptoQuotesBatch(['BTC/USD', 'ETH/USD']);
+      const bt = m.get('BTC/USD'), et = m.get('ETH/USD');
+      const freshB = !!bt && !isStaleQuoteEntry(bt);
+      const freshE = !!et && !isStaleQuoteEntry(et);
       report.sections.crypto = { ok: !!(freshB || freshE), detail: { 'BTC/USD': !!freshB, 'ETH/USD': !!freshE } };
       logTradeAction(freshB || freshE ? 'health_ok' : 'health_warn', 'SYSTEM', { section: 'crypto', note: freshB || freshE ? '' : 'no fresh quotes' });
     } catch (e) {
@@ -3834,6 +4089,9 @@ export default function App() {
       `${symbol} — READY — willAttemptBuy orderUsd=${orderText}, price=${priceText}, spread=${spreadText}`
     );
   };
+  const logDecisionTrace = (symbol, reason, details = {}) => {
+    console.log('decision_trace', { symbol, reason, ...details });
+  };
 
   async function computeEntrySignal(asset, d, riskLvl, preQuoteMap = null, preBarsMap = null, batchId = null) {
     let bars1 = [];
@@ -3859,25 +4117,15 @@ export default function App() {
       if (missingAt) {
         return { entryReady: false, why: 'no_quote', meta: { freshSec: null, lastSeenAgeSec: null } };
       }
-      let lastSeenAgeSec = null;
-      try {
-        const tm = await getCryptoTradesBatch([normalized]);
-        const t = tm.get(normalized);
-        if (Number.isFinite(t?.tms)) {
-          let rawAgeSec = (Date.now() - t.tms) / 1000;
-          if (rawAgeSec < -MAX_CLOCK_SKEW_SECONDS) rawAgeSec = 0;
-          if (rawAgeSec > ABSURD_AGE_SEC) {
-            logBadQuoteTimestamp({ symbol: normalized, rawFields: { tms: t.tms } });
-            rawAgeSec = null;
-          }
-          lastSeenAgeSec = Number.isFinite(rawAgeSec) ? rawAgeSec : null;
-        }
-      } catch {}
-      if (Number.isFinite(lastSeenAgeSec)) {
+      const cached = quoteCache.get(normalized);
+      if (cached && isStaleQuoteEntry(cached)) {
+        logStaleQuote(normalized, cached, { reason: 'stale_quote' });
+        const lastSeenMs = getQuoteLastSeenMs(cached);
+        const ageMs = Number.isFinite(lastSeenMs) ? Date.now() - lastSeenMs : null;
         return {
           entryReady: false,
           why: 'stale_quote',
-          meta: { lastSeenAgeSec: formatLoggedAgeSeconds(lastSeenAgeSec) },
+          meta: { lastSeenAgeSec: formatLoggedAgeSeconds(ageMs) },
         };
       }
       return { entryReady: false, why: 'no_quote', meta: { freshSec: null } };
@@ -4039,10 +4287,64 @@ export default function App() {
     if (TRADING_HALTED) {
       logTradeAction('daily_halt', normalizedSymbol, { reason: HALT_REASON || 'Rule' });
       logGateFail(normalizedSymbol, 'trading_halted', `reason=${HALT_REASON || 'Rule'}`);
-      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'trading_halted' };
+    }
+    const preflight = await preflightAccountCheck();
+    if (preflight?.blocked) {
+      logTradeAction('entry_skipped', normalizedSymbol, { entryReady: false, reason: 'preflight_blocked' });
+      logGateFail(normalizedSymbol, 'preflight_blocked', preflight.reason || '');
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'preflight_blocked' };
+    }
+    if (FORCE_ONE_TEST_BUY && !forceTestBuyUsed && !STABLES.has(normalizedSymbol) && !BLACKLIST.has(normalizedSymbol)) {
+      const notional = Math.max(1, Math.min(5, FORCE_ONE_TEST_BUY_NOTIONAL || 2));
+      const order = { symbol: normalizedSymbol, notional, side: 'buy', type: 'market', time_in_force: 'gtc' };
+      console.warn('FORCE_ONE_TEST_BUY', { symbol: normalizedSymbol, notional });
+      logTradeAction('quote_ok', normalizedSymbol, { spreadBps: 0, note: 'force_one_test_buy' });
+      let attemptsSent = 0;
+      let attemptsFailed = 0;
+      let ordersOpen = 0;
+      let fillsCount = 0;
+      try {
+        logOrderPayload('force_test_buy', order);
+        forceTestBuyUsed = true;
+        attemptsSent += 1;
+        const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
+        const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
+        logOrderResponse('force_test_buy', order, res, data);
+        const orderOk = Boolean(res.ok && data?.ok && data?.orderId);
+        if (orderOk) {
+          const status = String(data.status || '').toLowerCase();
+          recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
+          if (status === 'filled') {
+            fillsCount += 1;
+          } else {
+            ordersOpen += 1;
+          }
+          return { attempted: true, filled: true, attemptsSent, attemptsFailed, ordersOpen, fillsCount, decisionReason: 'force_test_buy' };
+        }
+        attemptsFailed += 1;
+        logOrderFailure({
+          order,
+          endpoint: `${BACKEND_BASE_URL}/orders`,
+          status: res.status,
+          body: data?.error?.message || data?.message || data?.raw || raw?.slice?.(0, 200) || '',
+        });
+        return { attempted: true, filled: false, attemptsSent, attemptsFailed, ordersOpen, fillsCount, decisionReason: 'force_test_buy_failed' };
+      } catch (e) {
+        attemptsFailed += 1;
+        logOrderError('force_test_buy', order, e);
+        logOrderFailure({
+          order,
+          endpoint: `${BACKEND_BASE_URL}/orders`,
+          status: null,
+          body: e?.message || null,
+          error: e,
+        });
+        return { attempted: true, filled: false, attemptsSent, attemptsFailed, ordersOpen, fillsCount, decisionReason: 'force_test_buy_failed' };
+      }
     }
     if (STABLES.has(normalizedSymbol)) {
-      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'stable_asset' };
     }
 
     await cleanupStaleBuyOrders(30);
@@ -4064,7 +4366,7 @@ export default function App() {
           max_positions: cap,
           open_orders_count: openOrdersCount,
         });
-        return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
+        return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'cap_reached' };
       }
     } catch {}
 
@@ -4075,7 +4377,7 @@ export default function App() {
     if (trulyHeld) {
       logTradeAction('entry_skipped', normalizedSymbol, { entryReady: false, reason: 'held' });
       logGateFail(normalizedSymbol, 'held');
-      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'held' };
     }
 
     const sig = sigPre || (await computeEntrySignal({ symbol: normalizedSymbol, cc: ccSymbol }, d, effectiveSettings.riskLevel, preQuoteMap, null, batchId));
@@ -4105,7 +4407,7 @@ export default function App() {
         open_orders_count: openOrdersCount,
         max_positions: cap,
       });
-      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'buying_power' };
     }
 
     let entryPx = Number.isFinite(sig?.quote?.bid) && sig.quote.bid > 0 ? sig.quote.bid : sig?.quote?.ask;
@@ -4143,7 +4445,7 @@ export default function App() {
         max_positions: cap,
         order_notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
       });
-      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'min_notional' };
     }
 
     if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig.quote.bid;
@@ -4164,7 +4466,7 @@ export default function App() {
         order_notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
         order_qty: qty,
       });
-      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'min_notional' };
     }
 
     console.log(`${normalizedSymbol} — GateCheck`, {
@@ -4192,6 +4494,7 @@ export default function App() {
         attemptsFailed: result.attemptsFailed ?? 0,
         ordersOpen: result.ordersOpen ?? 0,
         fillsCount: result.fillsCount ?? 0,
+        decisionReason: result.decisionReason || (result.attempted ? 'order_failed' : 'order_skipped'),
       };
     }
 
@@ -4243,6 +4546,7 @@ export default function App() {
       attemptsFailed: result.attemptsFailed ?? 0,
       ordersOpen: result.ordersOpen ?? 0,
       fillsCount: result.fillsCount ?? 0,
+      decisionReason: 'filled',
     };
   };
 
@@ -4429,6 +4733,7 @@ export default function App() {
     let results = [];
     try {
       await getAccountSummaryThrottled();
+      await preflightAccountCheck();
 
       const [positions, allOpenOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached()]);
       const posBySym = new Map((positions || []).map((p) => [p.symbol, p]));
@@ -4466,7 +4771,7 @@ export default function App() {
       const cryptoSlice = cryptosAll.slice(cStart, Math.min(cStart + effectiveSettings.stockPageSize, cryptosAll.length));
       cryptoPageRef.current += 1;
 
-      const cryptoSymbolsForQuotes = cryptoSlice.map((t) => t.symbol);
+      const cryptoSymbolsForQuotes = cryptoSlice.map((t) => toInternalSymbol(t.symbol));
 
       const barsMap = effectiveSettings.enforceMomentum ? await getCryptoBars1mBatch(cryptoSymbolsForQuotes, 6) : null;
 
@@ -4499,18 +4804,20 @@ export default function App() {
       const spreadSamples = [];
       const scanBatchId = `scan_${Date.now()}_${cIdx}`;
       for (const asset of cryptoSlice) {
-        const d = { spreadMax: eff(asset.symbol, 'spreadMaxBps') };
-        const token = { ...asset, price: null, entryReady: false, error: null, time: new Date().toLocaleTimeString(), spreadBps: null, tpBps: null };
+        const normalizedSymbol = toInternalSymbol(asset.symbol);
+        const d = { spreadMax: eff(normalizedSymbol, 'spreadMaxBps') };
+        const token = { ...asset, symbol: normalizedSymbol, price: null, entryReady: false, error: null, time: new Date().toLocaleTimeString(), spreadBps: null, tpBps: null };
+        let decisionReason = null;
         try {
-          const qDisplay = batchMap.get(asset.symbol);
+          const qDisplay = batchMap.get(normalizedSymbol);
           if (qDisplay && qDisplay.bid > 0 && qDisplay.ask > 0) token.price = 0.5 * (qDisplay.bid + qDisplay.ask);
 
-          const prevState = tradeStateRef.current[asset.symbol] || {};
-          const posNow = posBySym.get(asset.symbol);
+          const prevState = tradeStateRef.current[normalizedSymbol] || {};
+          const posNow = posBySym.get(normalizedSymbol);
           const isHolding = !!(posNow && Number(posNow.qty) > 0);
-          tradeStateRef.current[asset.symbol] = { ...prevState, wasHolding: isHolding };
+          tradeStateRef.current[normalizedSymbol] = { ...prevState, wasHolding: isHolding };
 
-          const sig = await computeEntrySignal(asset, d, effectiveSettings.riskLevel, batchMap, barsMap, scanBatchId);
+          const sig = await computeEntrySignal({ ...asset, symbol: normalizedSymbol }, d, effectiveSettings.riskLevel, batchMap, barsMap, scanBatchId);
           token.entryReady = sig.entryReady;
 
           if (sig?.quote && sig.quote.bid > 0 && sig.quote.ask > 0) {
@@ -4518,31 +4825,39 @@ export default function App() {
             spreadSamples.push(((sig.quote.ask - sig.quote.bid) / mid2) * 10000);
           }
 
-          if (sig.entryReady) {
+          const forceTest = FORCE_ONE_TEST_BUY && !forceTestBuyUsed && autoTrade;
+          if (sig.entryReady || forceTest) {
             token.spreadBps = sig.spreadBps ?? null;
             token.tpBps = sig.tpBps ?? null;
-            readyCount++;
+            if (sig.entryReady) {
+              readyCount++;
+            }
             if (autoTrade) {
-              const result = await placeOrder(asset.symbol, asset.cc, d, sig, batchMap, { tradeStateRef, touchMemoRef }, scanBatchId);
+              const result = await placeOrder(normalizedSymbol, asset.cc, d, sig, batchMap, { tradeStateRef, touchMemoRef }, scanBatchId);
               attemptsSent += result?.attemptsSent || 0;
               attemptsFailed += result?.attemptsFailed || 0;
               ordersOpen += result?.ordersOpen || 0;
               fillsCount += result?.fillsCount || 0;
+              decisionReason = result?.decisionReason || (result?.filled ? 'filled' : (result?.attempted ? 'order_failed' : 'order_skipped'));
             } else {
-              logTradeAction('entry_skipped', asset.symbol, { entryReady: true, reason: 'auto_off' });
+              logTradeAction('entry_skipped', normalizedSymbol, { entryReady: true, reason: 'auto_off' });
+              decisionReason = 'auto_off';
             }
           } else {
             watchCount++;
             skippedCount++;
             if (sig?.why) reasonCounts[sig.why] = (reasonCounts[sig.why] || 0) + 1;
-            logTradeAction('entry_skipped', asset.symbol, { entryReady: false, reason: sig.why, ...(sig.meta || {}) });
+            logTradeAction('entry_skipped', normalizedSymbol, { entryReady: false, reason: sig.why, ...(sig.meta || {}) });
+            decisionReason = sig?.why || 'signal_false';
           }
         } catch (err) {
           token.error = err?.message || String(err);
-          logTradeAction('scan_error', asset.symbol, { error: token.error });
+          logTradeAction('scan_error', normalizedSymbol, { error: token.error });
           watchCount++;
           skippedCount++;
+          decisionReason = 'scan_error';
         }
+        logDecisionTrace(normalizedSymbol, decisionReason || 'unknown');
         results.push(token);
       }
 
