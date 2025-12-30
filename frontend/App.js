@@ -18,13 +18,22 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
-import {
-  isCrypto,
-  isStock,
-  normalizeCryptoSymbol,
-  toAlpacaCryptoSymbol,
-  toInternalSymbol,
-} from '../src/utils/symbols';
+const toInternalSymbol = (sym) => {
+  if (!sym) return "";
+  return String(sym).replace("/", "").toUpperCase().trim();
+};
+
+const toAlpacaCryptoSymbol = (sym) => {
+  const s = toInternalSymbol(sym);
+  if (s.length <= 3) return String(sym || "");
+  const base = s.slice(0, s.length - 3);
+  const quote = s.slice(-3);
+  return `${base}/${quote}`;
+};
+
+const normalizeCryptoSymbol = (sym) => toAlpacaCryptoSymbol(sym);
+const isCrypto = (sym) => /USD$/.test(toInternalSymbol(sym) || '');
+const isStock = (sym) => !isCrypto(sym);
 
 // SAFETY PATCH NOTES:
 // - Moved import-time connectivity call into a mount-only effect.
