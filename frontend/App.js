@@ -2162,18 +2162,51 @@ const logOrderResponse = (context, order, res, data) => {
   return payload;
 };
 
+const logOrderError = (context, order, error = null, res = null, data = null) => {
+  const payload = {
+    symbol: toInternalSymbol(order?.symbol),
+    qty: order?.qty ?? null,
+    notional: order?.notional ?? null,
+    side: order?.side,
+    type: order?.type,
+    time_in_force: order?.time_in_force,
+    limit_price: order?.limit_price,
+  };
+  const httpStatus = res?.status ?? error?.statusCode ?? error?.status ?? 'NA';
+  const code = data?.code ?? data?.error_code ?? error?.code ?? error?.errorCode ?? '';
+  const message =
+    data?.message ||
+    data?.error ||
+    error?.message ||
+    error?.name ||
+    'unknown_error';
+  const body =
+    typeof data === 'string'
+      ? data
+      : data
+        ? JSON.stringify(data || {})
+        : error?.responseSnippet || error?.body || '';
+  console.warn(
+    `ORDER_ERROR ${payload.symbol} http=${httpStatus} code=${code} message=${message} body=${body}`
+  );
+  return payload;
+};
+
 const RECENT_ORDER_TTL_MS = 10 * 60 * 1000;
 const recentOrders = new Map();
 
 const recordRecentOrder = ({ id, symbol, status, submittedAt }) => {
   if (!id) return;
   const now = Date.now();
+  const normalizedStatus = String(status || '').toLowerCase();
   recentOrders.set(id, {
     id,
     symbol: toInternalSymbol(symbol),
-    status: status || null,
+    status: normalizedStatus || null,
     submittedAt: submittedAt || new Date(now).toISOString(),
     lastSeenAt: now,
+    countedFill: false,
+    countedReject: false,
   });
 };
 
@@ -2250,10 +2283,12 @@ const logOrderState = (order) => {
 
 async function pollRecentOrderStates() {
   pruneRecentOrders();
-  if (!recentOrders.size) return { ordersOpen: 0 };
+  if (!recentOrders.size) return { ordersOpen: 0, fillsCount: 0, attemptsFailed: 0 };
   const openOrders = await getOrdersByStatus('open');
   const openMap = new Map((openOrders || []).map((o) => [o.id, o]));
   let ordersOpen = 0;
+  let fillsCount = 0;
+  let attemptsFailed = 0;
 
   let allMap = null;
   const recentIds = Array.from(recentOrders.keys());
@@ -2264,18 +2299,32 @@ async function pollRecentOrderStates() {
 
   for (const [id, order] of recentOrders.entries()) {
     const openOrder = openMap.get(id);
+    const resolvedOrder = openOrder || (allMap && allMap.get(id)) || null;
+    const status = String(resolvedOrder?.status || resolvedOrder?.order_status || order.status || '').toLowerCase();
+    const filledQty = Number(resolvedOrder?.filled_qty ?? resolvedOrder?.filledQty ?? 0);
+
     if (openOrder) {
       ordersOpen += 1;
       logOrderState(openOrder);
       order.lastSeenAt = Date.now();
-      continue;
     }
-    if (allMap && allMap.has(id)) {
-      logOrderState(allMap.get(id));
+
+    if (resolvedOrder && !openOrder) {
+      logOrderState(resolvedOrder);
       order.lastSeenAt = Date.now();
     }
+
+    if ((filledQty > 0 || status === 'filled') && !order.countedFill) {
+      fillsCount += 1;
+      order.countedFill = true;
+    }
+
+    if (status === 'rejected' && !order.countedReject) {
+      attemptsFailed += 1;
+      order.countedReject = true;
+    }
   }
-  return { ordersOpen };
+  return { ordersOpen, fillsCount, attemptsFailed };
 }
 
 let __positionsCache = { ts: 0, items: [] };
@@ -3101,6 +3150,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
           __openOrdersCache = { ts: 0, items: [] };
         }
       } catch (e) {
+        logOrderError('buy_limit', order, e);
         logTradeAction('quote_exception', normalizedSymbol, { error: e.message });
         attemptsFailed += 1;
       }
@@ -3192,6 +3242,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
           logTradeAction('quote_exception', normalizedSymbol, { error: `BUY mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 80) || ''}` });
         }
       } catch (e) {
+        logOrderError('buy_market', order, e);
         logTradeAction('quote_exception', normalizedSymbol, { error: e.message });
         attemptsFailed += 1;
       }
@@ -3230,6 +3281,7 @@ async function marketSell(symbol, qty) {
     logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 120) || ''}` });
     return null;
   } catch (e) {
+    logOrderError('sell_market', mkt, e);
     logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt exception ${e.message}` });
     return null;
   }
@@ -3466,6 +3518,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       logTradeAction('tp_limit_error', symbol, { error: `POST ${res.status} ${msg}` });
     }
   } catch (e) {
+    logOrderError('sell_limit', { symbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit }, e);
     logTradeAction('tp_limit_error', symbol, { error: e.message });
   }
 };
@@ -3817,8 +3870,8 @@ export default function App() {
     if (!q || !(q.bid > 0 && q.ask > 0)) {
       const normalized = toInternalSymbol(asset.symbol);
       const missingAt = lastQuoteBatchMissing.get(normalized);
-      if (missingAt && (Date.now() - missingAt) < 60000) {
-        return { entryReady: false, why: 'no_quote', meta: { freshSec: null } };
+      if (missingAt) {
+        return { entryReady: false, why: 'no_quote', meta: { freshSec: null, lastSeenAgeSec: null } };
       }
       let lastSeenAgeSec = null;
       try {
@@ -4407,9 +4460,10 @@ export default function App() {
         supportedCryptoSetRef.current = supportedSet;
       }
       const isSupportedSymbol = (sym) => {
-        const normalized = normalizeCryptoSymbol(sym);
+        const internal = toInternalSymbol(sym);
+        const normalized = normalizeCryptoSymbol(internal);
         if (!normalized) return false;
-        return !isUnsupportedLocal(sym) && isSupportedCryptoSymbol(normalized, supportedSet);
+        return !isUnsupportedLocal(internal) && isSupportedCryptoSymbol(normalized, supportedSet);
       };
       const dropped = [];
       const supportedTracked = effectiveTracked.filter((t) => {
@@ -4417,9 +4471,7 @@ export default function App() {
         if (!ok) dropped.push(toInternalSymbol(t.symbol));
         return ok;
       });
-      if (dropped.length) {
-        console.log(`UNIVERSE_DROPPED count=${dropped.length} symbols=${JSON.stringify(dropped.slice(0, 20))}`);
-      }
+      console.log(`UNIVERSE_DROPPED count=${dropped.length} symbols=${JSON.stringify(dropped.slice(0, 20))}`);
 
       let cryptosAll = supportedTracked;
       const cryptoPages = Math.max(1, Math.ceil(Math.max(0, cryptosAll.length) / effectiveSettings.stockPageSize));
@@ -4523,8 +4575,13 @@ export default function App() {
       });
       logTradeAction('scan_summary', 'STATIC', { readyCount, attemptsSent, attemptsFailed, ordersOpen, fillsCount });
       const followUp = await pollRecentOrderStates();
-      if (Number.isFinite(followUp?.ordersOpen)) {
-        setScanStats((prev) => ({ ...prev, ordersOpen: followUp.ordersOpen }));
+      if (followUp && Number.isFinite(followUp?.ordersOpen)) {
+        setScanStats((prev) => ({
+          ...prev,
+          ordersOpen: followUp.ordersOpen,
+          fillsCount: (prev.fillsCount || 0) + (followUp.fillsCount || 0),
+          attemptsFailed: (prev.attemptsFailed || 0) + (followUp.attemptsFailed || 0),
+        }));
       }
     } catch (e) {
       logTradeAction('scan_error', 'ALL', { error: e?.message || String(e) });
