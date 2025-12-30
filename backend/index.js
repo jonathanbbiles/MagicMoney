@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const express = require('express');
+const cors = require('cors');
 
 const {
   placeMarketBuyThenSell,
@@ -24,15 +25,118 @@ const {
   fetchStockQuotes,
   fetchStockTrades,
   fetchStockBars,
+  fetchAccount,
+  fetchPortfolioHistory,
+  fetchActivities,
+  fetchClock,
+  fetchPositions,
+  fetchPosition,
+  fetchAsset,
+  loadSupportedCryptoPairs,
+  getSupportedCryptoPairsSnapshot,
+  filterSupportedCryptoSymbols,
 } = require('./trade');
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
 
 const app = express();
 
+app.use(cors());
 app.use(express.json());
 
- 
+const VERSION =
+  process.env.VERSION ||
+  process.env.RENDER_GIT_COMMIT ||
+  process.env.COMMIT_SHA ||
+  'dev';
+
+app.get('/health', (req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString(), version: VERSION });
+});
+
+app.get('/account', async (req, res) => {
+  try {
+    const account = await fetchAccount();
+    res.json(account);
+  } catch (error) {
+    console.error('Account fetch error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/account/portfolio/history', async (req, res) => {
+  try {
+    const history = await fetchPortfolioHistory(req.query || {});
+    res.json(history);
+  } catch (error) {
+    console.error('Portfolio history error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/account/activities', async (req, res) => {
+  try {
+    const result = await fetchActivities(req.query || {});
+    if (result?.nextPageToken) {
+      res.set('x-next-page-token', result.nextPageToken);
+    }
+    res.json({ items: result?.items || [], nextPageToken: result?.nextPageToken || null });
+  } catch (error) {
+    console.error('Account activities error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/clock', async (req, res) => {
+  try {
+    const clock = await fetchClock();
+    res.json(clock);
+  } catch (error) {
+    console.error('Clock fetch error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/positions', async (req, res) => {
+  try {
+    const positions = await fetchPositions();
+    res.json(Array.isArray(positions) ? positions : []);
+  } catch (error) {
+    console.error('Positions fetch error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/positions/:symbol', async (req, res) => {
+  try {
+    const position = await fetchPosition(req.params.symbol);
+    res.json(position || null);
+  } catch (error) {
+    console.error('Position fetch error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/assets/:symbol', async (req, res) => {
+  try {
+    const asset = await fetchAsset(req.params.symbol);
+    res.json(asset || null);
+  } catch (error) {
+    console.error('Asset fetch error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/crypto/supported', async (req, res) => {
+  try {
+    await loadSupportedCryptoPairs();
+    const snapshot = getSupportedCryptoPairsSnapshot();
+    res.json({ pairs: snapshot.pairs || [], lastUpdated: snapshot.lastUpdated || null });
+  } catch (error) {
+    console.error('Supported crypto error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Sequentially place a limit buy order followed by a limit sell once filled
 
@@ -75,13 +179,32 @@ app.post('/buy', async (req, res) => {
       limit_price,
     });
 
-    res.json(result);
+    if (result?.id) {
+      res.json({
+        ok: true,
+        orderId: result.id,
+        status: result.status || result.order_status || 'accepted',
+        submittedAt: result.submitted_at || result.submittedAt || null,
+      });
+    } else {
+      res.status(500).json({
+        ok: false,
+        error: { message: 'Order rejected', code: null, status: 500 },
+      });
+    }
 
   } catch (error) {
 
     console.error('Buy error:', error?.responseSnippet || error.message);
 
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      ok: false,
+      error: {
+        message: error.message,
+        code: error?.errorCode ?? error?.code ?? null,
+        status: error?.statusCode ?? 500,
+      },
+    });
 
   }
 
@@ -100,10 +223,29 @@ app.get('/orders', async (req, res) => {
 app.post('/orders', async (req, res) => {
   try {
     const result = await submitOrder(req.body || {});
-    res.json(result);
+    if (result?.id) {
+      res.json({
+        ok: true,
+        orderId: result.id,
+        status: result.status || result.order_status || 'accepted',
+        submittedAt: result.submitted_at || result.submittedAt || null,
+      });
+    } else {
+      res.status(500).json({
+        ok: false,
+        error: { message: 'Order rejected', code: null, status: 500 },
+      });
+    }
   } catch (error) {
     console.error('Order submit error:', error?.responseSnippet || error.message);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({
+      ok: false,
+      error: {
+        message: error.message,
+        code: error?.errorCode ?? error?.code ?? null,
+        status: error?.statusCode ?? 500,
+      },
+    });
   }
 });
 
@@ -221,8 +363,12 @@ app.get('/market/crypto/quotes', async (req, res) => {
   if (!symbols.length) {
     return res.status(400).json({ error: 'symbols_required' });
   }
+  const filtered = filterSupportedCryptoSymbols(symbols);
+  if (!filtered.length) {
+    return res.json({ quotes: {} });
+  }
   try {
-    const payload = await fetchCryptoQuotes({ symbols, location });
+    const payload = await fetchCryptoQuotes({ symbols: filtered, location });
     return res.json(payload || {});
   } catch (error) {
     console.error('Market crypto quotes error:', error?.responseSnippet200 || error.message);
@@ -243,8 +389,12 @@ app.get('/market/crypto/trades', async (req, res) => {
   if (!symbols.length) {
     return res.status(400).json({ error: 'symbols_required' });
   }
+  const filtered = filterSupportedCryptoSymbols(symbols);
+  if (!filtered.length) {
+    return res.json({ trades: {} });
+  }
   try {
-    const payload = await fetchCryptoTrades({ symbols, location });
+    const payload = await fetchCryptoTrades({ symbols: filtered, location });
     return res.json(payload || {});
   } catch (error) {
     console.error('Market crypto trades error:', error?.responseSnippet200 || error.message);
@@ -267,9 +417,13 @@ app.get('/market/crypto/bars', async (req, res) => {
   if (!symbols.length) {
     return res.status(400).json({ error: 'symbols_required' });
   }
+  const filtered = filterSupportedCryptoSymbols(symbols);
+  if (!filtered.length) {
+    return res.json({ bars: {} });
+  }
   try {
     const payload = await fetchCryptoBars({
-      symbols,
+      symbols: filtered,
       location,
       limit: Number.isFinite(limit) ? limit : 6,
       timeframe,
@@ -367,7 +521,11 @@ initializeInventoryFromPositions()
 
     console.log(`Initialized inventory for ${inventory.size} symbols.`);
 
-    return runDustCleanup();
+    return loadSupportedCryptoPairs()
+      .catch((err) => {
+        console.error('Supported crypto pairs preload failed', err?.message || err);
+      })
+      .then(() => runDustCleanup());
 
   })
 
