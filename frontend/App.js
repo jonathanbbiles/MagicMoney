@@ -24,7 +24,7 @@ import {
   normalizeCryptoSymbol,
   toAlpacaCryptoSymbol,
   toInternalSymbol,
-} from './src/utils/symbols';
+} from '../src/utils/symbols';
 
 // SAFETY PATCH NOTES:
 // - Moved import-time connectivity call into a mount-only effect.
