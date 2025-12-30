@@ -226,6 +226,55 @@ function toDataSymbol(rawSymbol) {
   return symbol;
 }
 
+const supportedCryptoPairsState = {
+  loaded: false,
+  pairs: new Set(),
+  lastUpdated: null,
+};
+
+async function loadSupportedCryptoPairs({ force = false } = {}) {
+  if (supportedCryptoPairsState.loaded && !force) return supportedCryptoPairsState.pairs;
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'assets',
+    params: { asset_class: 'crypto' },
+    label: 'crypto_assets',
+  });
+  try {
+    const data = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+    const nextPairs = new Set();
+    (Array.isArray(data) ? data : []).forEach((asset) => {
+      if (!asset?.tradable || asset?.status !== 'active') return;
+      const normalized = toDataSymbol(asset.symbol);
+      if (normalized && normalized.endsWith('/USD')) {
+        nextPairs.add(normalized);
+      }
+    });
+    supportedCryptoPairsState.pairs = nextPairs;
+    supportedCryptoPairsState.loaded = true;
+    supportedCryptoPairsState.lastUpdated = new Date().toISOString();
+  } catch (err) {
+    console.warn('supported_pairs_fetch_failed', err?.errorMessage || err?.message || err);
+  }
+  return supportedCryptoPairsState.pairs;
+}
+
+function getSupportedCryptoPairsSnapshot() {
+  return {
+    pairs: Array.from(supportedCryptoPairsState.pairs),
+    lastUpdated: supportedCryptoPairsState.lastUpdated,
+  };
+}
+
+function filterSupportedCryptoSymbols(symbols = []) {
+  if (!supportedCryptoPairsState.pairs.size) return symbols;
+  return symbols.filter((sym) => supportedCryptoPairsState.pairs.has(toDataSymbol(sym)));
+}
+
 function isMarketDataCooldown() {
   return Date.now() < marketDataState.cooldownUntil;
 }
@@ -1018,6 +1067,93 @@ async function getAccountInfo() {
 
   };
 
+}
+
+async function fetchAccount() {
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'account', label: 'account_raw' });
+  return requestJson({
+    method: 'GET',
+    url,
+    headers: alpacaHeaders(),
+  });
+}
+
+async function fetchPortfolioHistory(params = {}) {
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'account/portfolio/history',
+    params,
+    label: 'portfolio_history',
+  });
+  return requestJson({
+    method: 'GET',
+    url,
+    headers: alpacaHeaders(),
+  });
+}
+
+async function fetchActivities(params = {}) {
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'account/activities',
+    params,
+    label: 'account_activities',
+  });
+  const items = await requestJson({
+    method: 'GET',
+    url,
+    headers: alpacaHeaders(),
+  });
+  return {
+    items: Array.isArray(items) ? items : [],
+    nextPageToken: null,
+  };
+}
+
+async function fetchClock() {
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'clock', label: 'market_clock' });
+  return requestJson({
+    method: 'GET',
+    url,
+    headers: alpacaHeaders(),
+  });
+}
+
+async function fetchPositions() {
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions' });
+  return requestJson({
+    method: 'GET',
+    url,
+    headers: alpacaHeaders(),
+  });
+}
+
+async function fetchPosition(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: `positions/${encodeURIComponent(normalized)}`,
+    label: 'positions_single',
+  });
+  return requestJson({
+    method: 'GET',
+    url,
+    headers: alpacaHeaders(),
+  });
+}
+
+async function fetchAsset(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: `assets/${encodeURIComponent(normalized)}`,
+    label: 'asset',
+  });
+  return requestJson({
+    method: 'GET',
+    url,
+    headers: alpacaHeaders(),
+  });
 }
 
  
@@ -2556,6 +2692,16 @@ module.exports = {
   fetchStockQuotes,
   fetchStockTrades,
   fetchStockBars,
+  fetchAccount,
+  fetchPortfolioHistory,
+  fetchActivities,
+  fetchClock,
+  fetchPositions,
+  fetchPosition,
+  fetchAsset,
+  loadSupportedCryptoPairs,
+  getSupportedCryptoPairsSnapshot,
+  filterSupportedCryptoSymbols,
 
   startExitManager,
   getConcurrencyGuardStatus,

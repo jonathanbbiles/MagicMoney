@@ -46,53 +46,50 @@ const isStock = (sym) => !isCrypto(sym);
 const VERSION = 'v1';
 const EX = Constants?.expoConfig?.extra || Constants?.manifest?.extra || {};
 
-// (per user request: do not change keys)
-const ALPACA_KEY = 'AKANN0IP04IH45Z6FG3L';
-const ALPACA_SECRET = 'qvaKRqP9Q3XMVMEYqVnq2BEgPGhQQQfWg1JT7bWV';
-// Force LIVE trading endpoint, ignoring EX/APCA overrides
-const ALPACA_BASE_URL = EX.APCA_API_BASE || 'https://api.alpaca.markets/v2';
 const RENDER_BACKEND_URL = 'https://magicmoney.onrender.com';
 // Dev-only override for physical devices: set to your LAN IP (e.g., 'http://192.168.x.x:10000').
 const DEV_LAN_IP = '';
-const BACKEND_BASE_URL = __DEV__
-  ? (EX.BACKEND_BASE_URL || DEV_LAN_IP || 'http://localhost:3000')
-  : (EX.BACKEND_BASE_URL || RENDER_BACKEND_URL);
+const normalizeBaseUrl = (value) => String(value || '').trim().replace(/\/+$/, '');
+const BACKEND_BASE_URL = normalizeBaseUrl(
+  __DEV__
+    ? (EX.BACKEND_BASE_URL || DEV_LAN_IP || 'http://localhost:3000')
+    : (EX.BACKEND_BASE_URL || RENDER_BACKEND_URL)
+);
 
-const DATA_ROOT_CRYPTO = 'https://data.alpaca.markets/v1beta3/crypto';
 // IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
 const DATA_LOCATIONS = ['us'];
-const DATA_ROOT_STOCKS_V2 = 'https://data.alpaca.markets/v2/stocks';
-
-const HEADERS = {
-  'APCA-API-KEY-ID': ALPACA_KEY,
-  'APCA-API-SECRET-KEY': ALPACA_SECRET,
-  Accept: 'application/json',
-  'Content-Type': 'application/json',
-};
 const BACKEND_HEADERS = {
   Accept: 'application/json',
   'Content-Type': 'application/json',
 };
 const DRY_RUN_STOPS = false; // Set true to log stop actions without sending orders
-// Safety guard: crash loudly if a paper endpoint is ever used
-if (typeof ALPACA_BASE_URL === 'string' && /paper-api\.alpaca\.markets/i.test(ALPACA_BASE_URL)) {
-  throw new Error('Paper trading endpoint detected. LIVE ONLY is enforced. Fix ALPACA_BASE_URL.');
-}
-console.log('[Alpaca ENV]', { base: ALPACA_BASE_URL, mode: 'LIVE' });
 console.log('[Backend ENV]', { base: BACKEND_BASE_URL });
 
 function bootConnectivityCheck(setStatusFn) {
   let active = true;
   (async () => {
+    const startedAt = Date.now();
     try {
-      await getAccountSummaryRaw();
+      const res = await f(`${BACKEND_BASE_URL}/health`, { headers: BACKEND_HEADERS }, 8000, 1);
+      const ms = Date.now() - startedAt;
+      const ok = !!res?.ok;
+      const data = await res.json().catch(() => null);
+      console.log(`BACKEND health ok=${ok} ms=${ms}`);
       if (!active) return;
-      console.log('✅ Connected to Alpaca LIVE endpoint:', ALPACA_BASE_URL);
+      if (!ok) {
+        const message = data?.error || data?.message || `HTTP ${res?.status ?? 'NA'}`;
+        console.log(`BACKEND_UNREACHABLE ${message}`);
+        setStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: message });
+        return;
+      }
       setStatusFn?.({ ok: true, checkedAt: new Date().toISOString(), error: null });
     } catch (e) {
+      const ms = Date.now() - startedAt;
+      const message = e?.message || String(e);
+      console.log(`BACKEND health ok=false ms=${ms}`);
+      console.log(`BACKEND_UNREACHABLE ${message}`);
       if (!active) return;
-      console.log('❌ Alpaca connection error:', e?.message || e);
-      setStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: e?.message || String(e) });
+      setStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: message });
     }
   })();
   return () => { active = false; };
@@ -371,8 +368,8 @@ const marketDataState = {
   cooldownLoggedAt: 0,
 };
 
-function buildAlpacaUrl({ baseUrl, path, params, label }) {
-  const base = String(baseUrl || '').replace(/\/+$/, '');
+function buildBackendUrl({ path, params, label }) {
+  const base = BACKEND_BASE_URL;
   const cleanPath = String(path || '').replace(/^\/+/, '');
   const url = new URL(`${base}/${cleanPath}`);
   if (params) {
@@ -382,7 +379,7 @@ function buildAlpacaUrl({ baseUrl, path, params, label }) {
     });
   }
   const finalUrl = url.toString();
-  console.log('alpaca_request_url', { label, url: finalUrl });
+  console.log('backend_request_url', { label, url: finalUrl });
   return finalUrl;
 }
 
@@ -595,8 +592,8 @@ async function getPortfolioHistory({
     pnl_reset: String(pnl_reset),
     extended_hours: String(!!extended_hours),
   });
-  const url = `${ALPACA_BASE_URL}/account/portfolio/history?${sp.toString()}`;
-  const res = await f(url, { headers: HEADERS });
+  const url = `${BACKEND_BASE_URL}/account/portfolio/history?${sp.toString()}`;
+  const res = await f(url, { headers: BACKEND_HEADERS });
   if (!res.ok) return null;
   try { return await res.json(); } catch { return null; }
 }
@@ -611,12 +608,19 @@ async function getActivities({ afterISO, untilISO, pageToken, types } = {}) {
   if (untilISO) params.set('until', untilISO);
   if (pageToken) params.set('page_token', pageToken);
 
-  const url = `${ALPACA_BASE_URL}/account/activities?${params.toString()}`;
-  const res = await f(url, { headers: HEADERS });
+  const url = `${BACKEND_BASE_URL}/account/activities?${params.toString()}`;
+  const res = await f(url, { headers: BACKEND_HEADERS });
   let items = [];
-  try { items = await res.json(); } catch {}
+  let payload = null;
+  try { payload = await res.json(); } catch {}
+  if (Array.isArray(payload)) {
+    items = payload;
+  } else if (payload && Array.isArray(payload.items)) {
+    items = payload.items;
+  }
   const next = res.headers?.get?.('x-next-page-token') || null;
-  return { items: Array.isArray(items) ? items : [], next };
+  const nextJson = payload?.nextPageToken || payload?.next_page_token || null;
+  return { items: Array.isArray(items) ? items : [], next: next || nextJson };
 }
 
 async function getPnLAndFeesSnapshot() {
@@ -653,7 +657,7 @@ async function getPnLAndFeesSnapshot() {
 /* ───────────────────────────── 8) MARKET CLOCK (STOCKS) ───────────────────────────── */
 async function getStockClock() {
   try {
-    const r = await f(`${ALPACA_BASE_URL}/clock`, { headers: HEADERS });
+    const r = await f(`${BACKEND_BASE_URL}/clock`, { headers: BACKEND_HEADERS });
     if (!r.ok) return { is_open: false };
     const j = await r.json();
     return { is_open: !!j.is_open, next_open: j.next_open, next_close: j.next_close };
@@ -1190,18 +1194,15 @@ async function fetchSupportedCryptoPairs({ force = false } = {}) {
   }
 
   try {
-    const base = ALPACA_BASE_URL.replace(/\/v2$/, '');
-    const url = `${base}/v2/assets?asset_class=crypto`;
-    const res = await f(url, { headers: HEADERS }, 12000, 2);
+    const url = `${BACKEND_BASE_URL}/crypto/supported`;
+    const res = await f(url, { headers: BACKEND_HEADERS }, 12000, 2);
     if (!res?.ok) throw new Error(`HTTP ${res?.status || 'unknown'}`);
-    const data = await res.json().catch(() => []);
+    const data = await res.json().catch(() => ({}));
+    const pairs = Array.isArray(data?.pairs) ? data.pairs : [];
     const supported = new Set(
-      (Array.isArray(data) ? data : []).flatMap((asset) => {
-        if (!asset?.tradable || asset?.status !== 'active') return [];
-        const normalized = normalizeCryptoSymbol(asset.symbol);
-        if (!normalized || !normalized.endsWith('/USD')) return [];
-        return [normalized];
-      })
+      pairs
+        .map((pair) => normalizeCryptoSymbol(pair))
+        .filter((pair) => pair && pair.endsWith('/USD'))
     );
     const arr = Array.from(supported);
     await Promise.all([
@@ -1223,10 +1224,9 @@ const barsCacheTTL = 30000; // 30 seconds
 /* ─────────────────────────────── 12) CRYPTO DATA API ─────────────────────────────── */
 const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
   const normalized = symbols.map((s) => toAlpacaCryptoSymbol(s)).join(',');
-  return buildAlpacaUrl({
-    baseUrl: DATA_ROOT_CRYPTO,
-    path: `${loc}/latest/${what}`,
-    params: { symbols: normalized, ...params },
+  return buildBackendUrl({
+    path: `market/crypto/${what}`,
+    params: { symbols: normalized, location: loc, ...params },
     label: `crypto_${what}`,
   });
 };
@@ -1235,10 +1235,11 @@ async function getCryptoQuotesBatch(symbols = []) {
   const internalSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
   if (!internalSymbols.length) return new Map();
   const dataSymbols = internalSymbols.map((s) => toAlpacaCryptoSymbol(s));
+  const now = Date.now();
   for (const loc of DATA_LOCATIONS) {
     try {
       const url = buildURLCrypto(loc, 'quotes', dataSymbols);
-      const j = await fetchMarketData('QUOTE', url, { headers: HEADERS });
+      const j = await fetchMarketData('QUOTE', url, { headers: BACKEND_HEADERS });
       const raw = j?.quotes || {};
       const out = new Map();
       for (const symbol of internalSymbols) {
@@ -1246,6 +1247,7 @@ async function getCryptoQuotesBatch(symbols = []) {
         const q = Array.isArray(raw[dataSymbol]) ? raw[dataSymbol][0] : raw[dataSymbol];
         if (!q) {
           logTradeAction('no_quote', symbol, { reason: 'no_data', requestType: 'QUOTE' });
+          lastQuoteBatchMissing.set(symbol, now);
           continue;
         }
         const bid = Number(q.bp ?? q.bid_price);
@@ -1255,6 +1257,7 @@ async function getCryptoQuotesBatch(symbols = []) {
         const tms = parseQuoteTimestampMs({ symbol, rawFields: q, source: 'crypto_quote' });
         if (bid > 0 && ask > 0 && Number.isFinite(tms)) {
           out.set(symbol, { bid, ask, bs: Number.isFinite(bs) ? bs : null, as: Number.isFinite(as) ? as : null, tms });
+          lastQuoteBatchMissing.delete(symbol);
         }
       }
       if (out.size) return out;
@@ -1267,6 +1270,7 @@ async function getCryptoQuotesBatch(symbols = []) {
           continue;
         }
         logTradeAction('no_quote', symbol, { reason: e?.code === 'COOLDOWN' ? 'cooldown' : 'request_failed', requestType: 'QUOTE' });
+        lastQuoteBatchMissing.set(symbol, now);
       }
     }
   }
@@ -1279,7 +1283,7 @@ async function getCryptoTradesBatch(symbols = []) {
   for (const loc of DATA_LOCATIONS) {
     try {
       const url = buildURLCrypto(loc, 'trades', dataSymbols);
-      const j = await fetchMarketData('TRADE', url, { headers: HEADERS });
+      const j = await fetchMarketData('TRADE', url, { headers: BACKEND_HEADERS });
       const raw = j?.trades || {};
       const out = new Map();
       for (const symbol of internalSymbols) {
@@ -1309,13 +1313,12 @@ async function getCryptoBars1m(symbol, limit = 6) {
   }
   for (const loc of DATA_LOCATIONS) {
     try {
-      const url = buildAlpacaUrl({
-        baseUrl: DATA_ROOT_CRYPTO,
-        path: `${loc}/bars`,
-        params: { timeframe: '1Min', limit: String(limit), symbols: dataSymbol },
+      const url = buildBackendUrl({
+        path: 'market/crypto/bars',
+        params: { timeframe: '1Min', limit: String(limit), symbols: dataSymbol, location: loc },
         label: 'crypto_bars',
       });
-      const j = await fetchMarketData('BARS', url, { headers: HEADERS });
+      const j = await fetchMarketData('BARS', url, { headers: BACKEND_HEADERS });
       const arr = j?.bars?.[dataSymbol];
       if (Array.isArray(arr) && arr.length) {
         const bars = arr.map((b) => ({
@@ -1358,13 +1361,12 @@ async function getCryptoBars1mBatch(symbols = [], limit = 6) {
 
   for (const loc of DATA_LOCATIONS) {
     try {
-      const url = buildAlpacaUrl({
-        baseUrl: DATA_ROOT_CRYPTO,
-        path: `${loc}/bars`,
-        params: { timeframe: '1Min', limit: String(limit), symbols: missing.map((s) => toAlpacaCryptoSymbol(s)).join(',') },
+      const url = buildBackendUrl({
+        path: 'market/crypto/bars',
+        params: { timeframe: '1Min', limit: String(limit), symbols: missing.map((s) => toAlpacaCryptoSymbol(s)).join(','), location: loc },
         label: 'crypto_bars_batch',
       });
-      const j = await fetchMarketData('BARS', url, { headers: HEADERS });
+      const j = await fetchMarketData('BARS', url, { headers: BACKEND_HEADERS });
       const raw = j?.bars || {};
       for (const symbol of missing) {
         const dataSymbol = toAlpacaCryptoSymbol(symbol);
@@ -1400,13 +1402,12 @@ async function stocksLatestQuotesBatch(symbols = []) {
   if (!symbols.length) return new Map();
   const csv = symbols.join(',');
   try {
-    const url = buildAlpacaUrl({
-      baseUrl: DATA_ROOT_STOCKS_V2,
-      path: 'quotes/latest',
+    const url = buildBackendUrl({
+      path: 'market/stocks/quotes',
       params: { symbols: csv },
       label: 'stocks_latest_quotes',
     });
-    const j = await fetchMarketData('QUOTE', url, { headers: HEADERS });
+    const j = await fetchMarketData('QUOTE', url, { headers: BACKEND_HEADERS });
     const out = new Map();
     for (const sym of symbols) {
       const qraw = j?.quotes?.[sym];
@@ -1437,9 +1438,8 @@ async function stocksDailyBars(symbols = [], limit = 10) {
   if (!symbols.length) return new Map();
   const csv = symbols.join(',');
   try {
-    const url = buildAlpacaUrl({
-      baseUrl: DATA_ROOT_STOCKS_V2,
-      path: 'bars',
+    const url = buildBackendUrl({
+      path: 'market/stocks/bars',
       params: {
         timeframe: '1Day',
         symbols: csv,
@@ -1448,7 +1448,7 @@ async function stocksDailyBars(symbols = [], limit = 10) {
       },
       label: 'stocks_daily_bars',
     });
-    const j = await fetchMarketData('BARS', url, { headers: HEADERS });
+    const j = await fetchMarketData('BARS', url, { headers: BACKEND_HEADERS });
     const raw = j?.bars || {};
     const out = new Map();
     for (const sym of symbols) {
@@ -1481,13 +1481,12 @@ async function cryptoDailyBars(symbols = [], limit = 10) {
   for (const loc of DATA_LOCATIONS) {
     try {
       const ds = uniq.map((s) => toAlpacaCryptoSymbol(s)).join(',');
-      const url = buildAlpacaUrl({
-        baseUrl: DATA_ROOT_CRYPTO,
-        path: `${loc}/bars`,
-        params: { timeframe: '1Day', limit: String(limit), symbols: ds },
+      const url = buildBackendUrl({
+        path: 'market/crypto/bars',
+        params: { timeframe: '1Day', limit: String(limit), symbols: ds, location: loc },
         label: 'crypto_daily_bars',
       });
-      const j = await fetchMarketData('BARS', url, { headers: HEADERS });
+      const j = await fetchMarketData('BARS', url, { headers: BACKEND_HEADERS });
       const raw = j?.bars || {};
       for (const sym of uniq) {
         const dataSymbol = toAlpacaCryptoSymbol(sym);
@@ -2137,38 +2136,25 @@ const logOrderPayload = (context, order) => {
     limit_price: order.limit_price,
     postOnly: order.post_only ?? order.postOnly ?? null,
   };
-  const notionalText = payload.notional ?? '';
-  const qtyText = payload.qty ?? '';
-  const limitText = payload.limit_price ?? '';
-  const tifText = payload.time_in_force ?? '';
-  const postOnlyText = payload.postOnly ?? '';
-  console.log(
-    `ORDER_SUBMIT ${symbol} side=${payload.side} notional=${notionalText} qty=${qtyText} type=${payload.type} limit=${limitText} tif=${tifText} postOnly=${postOnlyText}`
-  );
+  const notionalText = payload.notional ?? 'NA';
+  console.log(`ORDER_SUBMIT symbol=${symbol} notional=${notionalText}`);
   return payload;
 };
 
 const logOrderResponse = (context, order, res, data) => {
-  const payload = {
-    symbol: toInternalSymbol(order?.symbol),
-    qty: order?.qty ?? null,
-    notional: order?.notional ?? null,
-    side: order?.side,
-    type: order?.type,
-    time_in_force: order?.time_in_force,
-    limit_price: order?.limit_price,
+  const ok = Boolean(res?.ok && data?.ok && data?.orderId);
+  const orderId = data?.orderId || 'NA';
+  const status = data?.status || 'NA';
+  const err = ok
+    ? 'NA'
+    : (data?.error?.message || data?.error || data?.message || data?.raw || 'unknown_error');
+  console.log(`ORDER_RESULT ok=${ok} orderId=${orderId} status=${status} err=${err}`);
+  return {
+    ok,
+    orderId,
+    status,
+    err,
   };
-  if (res?.ok && data?.id) {
-    console.log(
-      `ORDER_RESULT ${payload.symbol} id=${data.id} status=${data.status || data.order_status || 'accepted'} filled_qty=${data.filled_qty ?? 0} filled_avg_price=${data.filled_avg_price ?? ''} submitted_at=${data.submitted_at ?? ''}`
-    );
-  } else {
-    const message = data?.message || data?.error || data?.raw || 'unknown_error';
-    console.warn(
-      `ORDER_ERROR ${payload.symbol} http=${res?.status ?? 'NA'} code=${data?.code ?? data?.error_code ?? ''} message=${message} body=${typeof data === 'string' ? data : JSON.stringify(data || {})}`
-    );
-  }
-  return payload;
 };
 
 const logOrderError = (context, order, error = null, res = null, data = null) => {
@@ -2181,23 +2167,14 @@ const logOrderError = (context, order, error = null, res = null, data = null) =>
     time_in_force: order?.time_in_force,
     limit_price: order?.limit_price,
   };
-  const httpStatus = res?.status ?? error?.statusCode ?? error?.status ?? 'NA';
-  const code = data?.code ?? data?.error_code ?? error?.code ?? error?.errorCode ?? '';
   const message =
     data?.message ||
     data?.error ||
     error?.message ||
     error?.name ||
     'unknown_error';
-  const body =
-    typeof data === 'string'
-      ? data
-      : data
-        ? JSON.stringify(data || {})
-        : error?.responseSnippet || error?.body || '';
-  console.warn(
-    `ORDER_ERROR ${payload.symbol} http=${httpStatus} code=${code} message=${message} body=${body}`
-  );
+  const err = message || 'unknown_error';
+  console.warn(`ORDER_RESULT ok=false orderId=NA status=NA err=${err}`);
   return payload;
 };
 
@@ -2231,7 +2208,7 @@ const pruneRecentOrders = () => {
 
 const getPositionInfo = async (symbol) => {
   try {
-    const res = await f(`${ALPACA_BASE_URL}/positions/${symbol}`, { headers: HEADERS });
+    const res = await f(`${BACKEND_BASE_URL}/positions/${symbol}`, { headers: BACKEND_HEADERS });
     if (!res.ok) return null;
     const info = await res.json();
     const qty = parseFloat(info.qty ?? '0');
@@ -2252,7 +2229,7 @@ const getPositionInfo = async (symbol) => {
 };
 const getAllPositions = async () => {
   try {
-    const r = await f(`${ALPACA_BASE_URL}/positions`, { headers: HEADERS });
+    const r = await f(`${BACKEND_BASE_URL}/positions`, { headers: BACKEND_HEADERS });
     if (!r.ok) return [];
     const arr = await r.json();
     return Array.isArray(arr) ? arr : [];
@@ -2545,7 +2522,7 @@ if (typeof globalThis !== 'undefined') {
 }
 
 async function getAccountSummaryRaw() {
-  const res = await f(`${ALPACA_BASE_URL}/account`, { headers: HEADERS });
+  const res = await f(`${BACKEND_BASE_URL}/account`, { headers: BACKEND_HEADERS });
   if (!res.ok) throw new Error(`Account ${res.status}`);
   const a = await res.json();
   const num = (x) => { const n = parseFloat(x); return Number.isFinite(n) ? n : NaN; };
@@ -3005,7 +2982,7 @@ const HoldingsChangeBarChart = () => {
 /* ─────────────────────────── 24) ENTRY / ORDERING / EXITS ─────────────────────────── */
 async function fetchAssetMeta(symbol) {
   try {
-    const r = await f(`${ALPACA_BASE_URL}/assets/${encodeURIComponent(symbol)}`, { headers: HEADERS });
+    const r = await f(`${BACKEND_BASE_URL}/assets/${encodeURIComponent(symbol)}`, { headers: BACKEND_HEADERS });
     if (!r.ok) return null;
     const a = await r.json();
     if (a && typeof a === 'object') {
@@ -3139,13 +3116,13 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_limit', order, res, data);
-        if (res.ok && data.id) {
+        const orderOk = Boolean(res.ok && data?.ok && data?.orderId);
+        if (orderOk) {
           attempted = true;
           attemptsSent += 1;
-          const filledQty = Number(data.filled_qty ?? 0);
-          const status = String(data.status || data.order_status || '').toLowerCase();
-          recordRecentOrder({ id: data.id, symbol: normalizedSymbol, status, submittedAt: data.submitted_at });
-          if (filledQty > 0 || status === 'filled') {
+          const status = String(data.status || '').toLowerCase();
+          recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
+          if (status === 'filled') {
             fillsCount += 1;
           } else {
             ordersOpen += 1;
@@ -3153,8 +3130,8 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         } else {
           attemptsFailed += 1;
         }
-        if (res.ok && data.id) {
-          lastOrderId = data.id; placedLimit = join; lastReplaceAt = nowTs;
+        if (orderOk) {
+          lastOrderId = data.orderId; placedLimit = join; lastReplaceAt = nowTs;
           logTradeAction('buy_camped', normalizedSymbol, { limit: order.limit_price });
           __openOrdersCache = { ts: 0, items: [] };
         }
@@ -3217,13 +3194,13 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_market', order, res, data);
-        if (res.ok && data.id) {
+        const orderOk = Boolean(res.ok && data?.ok && data?.orderId);
+        if (orderOk) {
           attempted = true;
           attemptsSent += 1;
-          const filledQty = Number(data.filled_qty ?? 0);
-          const status = String(data.status || data.order_status || '').toLowerCase();
-          recordRecentOrder({ id: data.id, symbol: normalizedSymbol, status, submittedAt: data.submitted_at });
-          if (filledQty > 0 || status === 'filled') {
+          const status = String(data.status || '').toLowerCase();
+          recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
+          if (status === 'filled') {
             fillsCount += 1;
           } else {
             ordersOpen += 1;
@@ -3231,7 +3208,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         } else {
           attemptsFailed += 1;
         }
-        if (res.ok && data.id) {
+        if (orderOk) {
           logTradeAction('buy_success', normalizedSymbol, { qty: mQty, limit: 'mkt' });
           __positionsCache = { ts: 0, items: [] };
           __openOrdersCache = { ts: 0, items: [] };
@@ -3248,7 +3225,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
             fillsCount,
           };
         } else {
-          logTradeAction('quote_exception', normalizedSymbol, { error: `BUY mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 80) || ''}` });
+          logTradeAction('quote_exception', normalizedSymbol, { error: `BUY mkt ${res.status} ${data?.error?.message || data?.message || data?.raw?.slice?.(0, 80) || ''}` });
         }
       } catch (e) {
         logOrderError('buy_market', order, e);
@@ -3282,12 +3259,12 @@ async function marketSell(symbol, qty) {
     const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(mkt) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     logOrderResponse('sell_market', mkt, res, data);
-    if (res.ok && data.id) {
+    if (res.ok && data?.ok && data?.orderId) {
       __positionsCache = { ts: 0, items: [] };
       __openOrdersCache = { ts: 0, items: [] };
       return data;
     }
-    logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt ${res.status} ${data?.message || data?.raw?.slice?.(0, 120) || ''}` });
+    logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt ${res.status} ${data?.error?.message || data?.message || data?.raw?.slice?.(0, 120) || ''}` });
     return null;
   } catch (e) {
     logOrderError('sell_market', mkt, e);
@@ -3518,12 +3495,12 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     logOrderResponse('sell_limit', order, res, data);
-    if (res.ok && data.id) {
+    if (res.ok && data?.ok && data?.orderId) {
       tradeStateRef.current[symbol] = { ...(state || {}), lastLimitPostTs: now };
       if (existing) { await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null); }
-      logTradeAction('tp_limit_set', symbol, { id: data.id, limit: order.limit_price });
+      logTradeAction('tp_limit_set', symbol, { id: data.orderId, limit: order.limit_price });
     } else {
-      const msg = data?.message || data?.raw?.slice?.(0, 100) || '';
+      const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
       logTradeAction('tp_limit_error', symbol, { error: `POST ${res.status} ${msg}` });
     }
   } catch (e) {
