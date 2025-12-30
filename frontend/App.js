@@ -78,6 +78,8 @@ const BACKEND_HEADERS = {
   'Content-Type': 'application/json',
 };
 const DRY_RUN_STOPS = false; // Set true to log stop actions without sending orders
+const MIN_ORDER_NOTIONAL_USD = 5;
+const AUTO_BUMP_MIN_NOTIONAL = false;
 const FORCE_ONE_TEST_BUY = ['1', 'true', 'yes'].includes(String(EX.FORCE_ONE_TEST_BUY || '').toLowerCase());
 const FORCE_ONE_TEST_BUY_NOTIONAL = Number(EX.FORCE_ONE_TEST_BUY_NOTIONAL || 2);
 let forceTestBuyUsed = false;
@@ -1871,6 +1873,7 @@ const logTradeAction = async (type, symbol, details = {}) => {
 };
 const FRIENDLY = {
   quote_ok: { sev: 'info', msg: (d) => `Quote OK (${(d.spreadBps ?? 0).toFixed(1)} bps)` },
+  quote_stale: { sev: 'warn', msg: (d) => `Quote STALE (${(d.spreadBps ?? 0).toFixed(1)} bps)` },
   quote_http_error: { sev: 'warn', msg: (d) => `Alpaca ${d.symbol || 'quotes'} ${d.status}${d.loc ? ' • ' + d.loc : ''}${d.body ? ' • ' + d.body : ''}` },
   quote_exception:  { sev: 'error', msg: (d) => `Quote/Order exception: ${d?.error ?? ''}` },
   trade_http_error: { sev: 'warn', msg: (d) => `Alpaca ${d.symbol || 'trades'} ${d.status}${d.loc ? ' • ' + d.loc : ''}${d.body ? ' • ' + d.body : ''}` },
@@ -1890,7 +1893,29 @@ const FRIENDLY = {
   },
   scan_error: { sev: 'error', msg: (d) => `Scan error: ${d.error}` },
   skip_wide_spread: { sev: 'warn', msg: (d) => `Skip: spread ${d.spreadBps} bps > max` },
-  skip_small_order: { sev: 'warn', msg: () => `Skip: below min notional or funding` },
+  skip_small_order: {
+    sev: 'warn',
+    msg: (d) => {
+      const reason = d?.reason || 'below_min_notional';
+      if (reason === 'insufficient_funding') {
+        const bp = Number.isFinite(d?.buyingPower) ? d.buyingPower.toFixed(2) : d?.buyingPower;
+        const req = Number.isFinite(d?.requiredNotional) ? d.requiredNotional.toFixed(2) : d?.requiredNotional;
+        const reserve = Number.isFinite(d?.reserve) ? d.reserve.toFixed(2) : d?.reserve;
+        return `Skip: insufficient_funding (buyingPower=${bp}, requiredNotional=${req}${reserve != null ? `, reserve=${reserve}` : ''})`;
+      }
+      if (reason === 'below_min_notional') {
+        const comp = Number.isFinite(d?.computedNotional) ? d.computedNotional.toFixed(2) : d?.computedNotional;
+        const min = Number.isFinite(d?.minNotional) ? d.minNotional.toFixed(2) : d?.minNotional;
+        return `Skip: below_min_notional (computedNotional=${comp}, minNotional=${min})`;
+      }
+      return `Skip: ${reason}`;
+    },
+  },
+  bump_qty_to_min_notional: {
+    sev: 'info',
+    msg: (d) =>
+      `BUMP_QTY_TO_MIN_NOTIONAL oldQty=${d.oldQty} newQty=${d.newQty} oldNotional=${d.oldNotional} newNotional=${d.newNotional}`,
+  },
   entry_skipped: { sev: 'info', msg: (d) => `Skip — ${d.reason}${fmtSkipDetail(d.reason, d)}` },
   risk_changed: { sev: 'info', msg: (d) => `Risk→${d.level} (spread≤${d.spreadMax}bps)` },
   concurrency_guard: { sev: 'warn', msg: (d) => `Concurrency guard: cap ${d.cap} @ avg ${d.avg?.toFixed?.(1) ?? d.avg} bps` },
@@ -3207,8 +3232,145 @@ async function fetchAssetMeta(symbol) {
     return a;
   } catch { return null; }
 }
-async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usableBP = null) {
+function createQtyQuantizer(symbol, meta) {
+  const rawQtyInc = meta?._qty_inc ?? 0.000001;
+  const QINC = Number.isFinite(rawQtyInc) && rawQtyInc > 0 ? rawQtyInc : 0.000001;
+  const qtyStepDecimals = Math.min(9, (QINC.toString().split('.')[1] || '').length || 6);
+  return (value) => {
+    if (!(value > 0) || !(QINC > 0)) return 0;
+    const scaled = Math.floor(value / QINC + 1e-9);
+    if (!(scaled > 0)) return 0;
+    let quantized = Number((scaled * QINC).toFixed(qtyStepDecimals));
+    if (isStock(symbol) && meta && meta._fractionable === false) {
+      quantized = Math.floor(quantized);
+    }
+    const scaledFinal = Math.floor(quantized / QINC + 1e-9);
+    if (!(scaledFinal > 0)) return 0;
+    return Number((scaledFinal * QINC).toFixed(qtyStepDecimals));
+  };
+}
+/**
+ * Decision flow: compute notional → enforce funding (priority) → enforce min notional
+ * with optional bump (if allowed) → otherwise ATTEMPT.
+ * Priority order for skips: insufficient_funding → below_min_notional.
+ */
+function validateOrderCandidate({
+  symbol,
+  side,
+  qty,
+  price,
+  computedNotional,
+  minNotional,
+  buyingPower,
+  cash,
+  reserve,
+  maxPositions,
+  currentOpenPositions,
+  maxNotional,
+  quantizeQty,
+  autoBumpMinNotional = AUTO_BUMP_MIN_NOTIONAL,
+}) {
+  const resolvedMinNotional = Number.isFinite(minNotional) && minNotional > 0 ? minNotional : MIN_ORDER_NOTIONAL_USD;
+  let resolvedNotional = Number.isFinite(computedNotional) ? computedNotional : null;
+  if (!Number.isFinite(resolvedNotional) && Number.isFinite(qty) && qty > 0 && Number.isFinite(price) && price > 0) {
+    resolvedNotional = qty * price;
+  }
+  const requiredNotional = Number.isFinite(resolvedNotional) ? resolvedNotional : null;
+  const fundingNotional = Number.isFinite(resolvedNotional)
+    ? Math.max(resolvedNotional, resolvedMinNotional)
+    : resolvedMinNotional;
+  const hasFunding = Number.isFinite(buyingPower)
+    ? (Number.isFinite(fundingNotional) ? buyingPower >= fundingNotional : buyingPower > 0)
+    : true;
+
+  if (!hasFunding) {
+    logTradeAction('skip_small_order', symbol, {
+      reason: 'insufficient_funding',
+      buyingPower,
+      cash,
+      requiredNotional: fundingNotional,
+      reserve,
+    });
+    console.log(`${symbol} — Skip: insufficient_funding`, { buyingPower, requiredNotional: fundingNotional, reserve });
+    return {
+      decision: 'SKIP_insufficient_funding',
+      reason: 'insufficient_funding',
+      qty,
+      computedNotional: resolvedNotional,
+      minNotional: resolvedMinNotional,
+    };
+  }
+
+  if (Number.isFinite(requiredNotional) && requiredNotional < resolvedMinNotional) {
+    const canBump =
+      autoBumpMinNotional &&
+      typeof quantizeQty === 'function' &&
+      Number.isFinite(price) &&
+      price > 0 &&
+      (!Number.isFinite(maxNotional) || resolvedMinNotional <= maxNotional) &&
+      (!Number.isFinite(buyingPower) || buyingPower >= resolvedMinNotional);
+    if (canBump) {
+      const oldQty = qty;
+      const oldNotional = requiredNotional;
+      const rawQty = resolvedMinNotional / price;
+      const bumpedQty = quantizeQty(rawQty);
+      const bumpedNotional = bumpedQty > 0 ? bumpedQty * price : 0;
+      if (bumpedQty > 0 && bumpedNotional >= resolvedMinNotional) {
+        logTradeAction('bump_qty_to_min_notional', symbol, {
+          oldQty,
+          newQty: bumpedQty,
+          oldNotional,
+          newNotional: bumpedNotional,
+        });
+        console.log('BUMP_QTY_TO_MIN_NOTIONAL', {
+          symbol,
+          oldQty,
+          newQty: bumpedQty,
+          oldNotional,
+          newNotional: bumpedNotional,
+        });
+        return {
+          decision: 'ATTEMPT',
+          reason: null,
+          qty: bumpedQty,
+          computedNotional: bumpedNotional,
+          minNotional: resolvedMinNotional,
+        };
+      }
+    }
+    logTradeAction('skip_small_order', symbol, {
+      reason: 'below_min_notional',
+      computedNotional: requiredNotional,
+      minNotional: resolvedMinNotional,
+      bumpAllowed: canBump,
+    });
+    console.log(`${symbol} — Skip: below_min_notional`, {
+      computedNotional: requiredNotional,
+      minNotional: resolvedMinNotional,
+      bumpAllowed: canBump,
+    });
+    return {
+      decision: 'SKIP_below_min_notional',
+      reason: 'below_min_notional',
+      qty,
+      computedNotional: requiredNotional,
+      minNotional: resolvedMinNotional,
+    };
+  }
+
+  return {
+    decision: 'ATTEMPT',
+    reason: null,
+    qty,
+    computedNotional: resolvedNotional,
+    minNotional: resolvedMinNotional,
+  };
+}
+async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usableBP = null, decisionContext = null) {
   const normalizedSymbol = toInternalSymbol(symbol);
+  const emitDecisionSnapshot = typeof decisionContext?.emitDecisionSnapshot === 'function'
+    ? decisionContext.emitDecisionSnapshot
+    : null;
   let attempted = false;
   let attemptsSent = 0;
   let attemptsFailed = 0;
@@ -3220,24 +3382,19 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   const TICK = Number.isFinite(rawTick) && rawTick > 0 ? rawTick : (isStock(symbol) ? 0.01 : 1e-5);
   const rawQtyInc = meta?._qty_inc ?? 0.000001;
   const QINC = Number.isFinite(rawQtyInc) && rawQtyInc > 0 ? rawQtyInc : 0.000001;
-  const qtyStepDecimals = Math.min(9, (QINC.toString().split('.')[1] || '').length || 6);
-  const quantizeQty = (value) => {
-    if (!(value > 0) || !(QINC > 0)) return 0;
-    const scaled = Math.floor(value / QINC + 1e-9);
-    if (!(scaled > 0)) return 0;
-    return Number((scaled * QINC).toFixed(qtyStepDecimals));
-  };
+  const quantizeQty = createQtyQuantizer(symbol, meta);
   let plannedQty = quantizeQty(qty);
-  if (isStock(symbol) && meta && meta._fractionable === false) {
-    plannedQty = Math.floor(plannedQty);
+  if (!(plannedQty > 0)) {
+    emitDecisionSnapshot?.('SKIP_below_min_trade', { qty: plannedQty, computedNotional: null });
+    return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
   }
-  plannedQty = quantizeQty(plannedQty);
-  if (!(plannedQty > 0)) return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
   if (plannedQty < MIN_TRADE_QTY) {
+    emitDecisionSnapshot?.('SKIP_below_min_trade', { qty: plannedQty, computedNotional: null });
     logTradeAction('skip_small_order', normalizedSymbol, { reason: 'below_min_trade', qty: plannedQty, minQty: MIN_TRADE_QTY });
     return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
   }
   qty = plannedQty;
+  const minNotional = meta?._min_notional > 0 ? meta._min_notional : MIN_ORDER_NOTIONAL_USD;
 
   let lastOrderId = null, placedLimit = null, lastReplaceAt = 0;
   const t0 = Date.now(), CAMP_SEC = SETTINGS.makerCampSec;
@@ -3294,8 +3451,24 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     const notionalPx = Number.isFinite(bidNow) && bidNow > 0
       ? bidNow
       : (Number.isFinite(askNow) && askNow > 0 ? askNow : join);
-    if (meta && meta._min_notional > 0 && Number.isFinite(notionalPx) && notionalPx > 0) {
-      if (qty * notionalPx < meta._min_notional) return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
+    if (Number.isFinite(notionalPx) && notionalPx > 0) {
+      const sizingCheck = validateOrderCandidate({
+        symbol: normalizedSymbol,
+        side: 'buy',
+        qty,
+        price: notionalPx,
+        computedNotional: qty * notionalPx,
+        minNotional,
+        buyingPower: usableBP,
+      });
+      if (sizingCheck.decision !== 'ATTEMPT') {
+        emitDecisionSnapshot?.(sizingCheck.decision, {
+          qty: sizingCheck.qty ?? qty,
+          computedNotional: sizingCheck.computedNotional,
+        });
+        return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
+      }
+      qty = sizingCheck.qty ?? qty;
     }
 
     if (isStock(symbol) && meta && meta._fractionable === false) {
@@ -3319,14 +3492,18 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       };
       try {
         logOrderPayload('buy_limit', order);
+        emitDecisionSnapshot?.('ATTEMPT', {
+          qty,
+          computedNotional: Number.isFinite(join) && join > 0 ? qty * join : null,
+        });
+        attemptsSent += 1;
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_limit', order, res, data);
-        const orderOk = Boolean(res.ok && data?.ok && data?.orderId);
+        const status = String(data?.status || '').toLowerCase();
+        const orderOk = Boolean(res.ok && data?.ok && data?.orderId && status !== 'rejected');
         if (orderOk) {
-          attemptsSent += 1;
           attempted = true;
-          const status = String(data.status || '').toLowerCase();
           recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
           if (status === 'filled') {
             fillsCount += 1;
@@ -3400,24 +3577,42 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         if (!(mQty > 0)) return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
       }
       if (!(mQty > 0)) return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
-      if (meta && meta._min_notional > 0) {
-        const pxRef = Number.isFinite(q.bid) && q.bid > 0 ? q.bid : q.ask;
-        if (Number.isFinite(pxRef) && pxRef > 0 && mQty * pxRef < meta._min_notional) {
+      const pxRef = Number.isFinite(q.bid) && q.bid > 0 ? q.bid : q.ask;
+      if (Number.isFinite(pxRef) && pxRef > 0) {
+        const sizingCheck = validateOrderCandidate({
+          symbol: normalizedSymbol,
+          side: 'buy',
+          qty: mQty,
+          price: pxRef,
+          computedNotional: mQty * pxRef,
+          minNotional,
+          buyingPower: usableBP,
+        });
+        if (sizingCheck.decision !== 'ATTEMPT') {
+          emitDecisionSnapshot?.(sizingCheck.decision, {
+            qty: sizingCheck.qty ?? mQty,
+            computedNotional: sizingCheck.computedNotional,
+          });
           return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
         }
+        mQty = sizingCheck.qty ?? mQty;
       }
       const tif = isStock(symbol) ? 'day' : 'gtc';
       const order = { symbol: normalizedSymbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif };
       try {
         logOrderPayload('buy_market', order);
+        emitDecisionSnapshot?.('ATTEMPT', {
+          qty: mQty,
+          computedNotional: Number.isFinite(q.ask) && q.ask > 0 ? mQty * q.ask : null,
+        });
+        attemptsSent += 1;
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_market', order, res, data);
-        const orderOk = Boolean(res.ok && data?.ok && data?.orderId);
+        const status = String(data?.status || '').toLowerCase();
+        const orderOk = Boolean(res.ok && data?.ok && data?.orderId && status !== 'rejected');
         if (orderOk) {
-          attemptsSent += 1;
           attempted = true;
-          const status = String(data.status || '').toLowerCase();
           recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
           if (status === 'filled') {
             fillsCount += 1;
@@ -3465,6 +3660,9 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         });
       }
     }
+  }
+  if (!attempted && attemptsSent === 0) {
+    emitDecisionSnapshot?.('SKIP_no_attempt', { qty, computedNotional: null });
   }
   return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
 }
@@ -4096,6 +4294,35 @@ export default function App() {
   const logDecisionTrace = (symbol, reason, details = {}) => {
     console.log('decision_trace', { symbol, reason, ...details });
   };
+  const logDecisionSnapshot = ({
+    symbol,
+    side,
+    qty,
+    computedNotional,
+    minNotional,
+    buyingPower,
+    cash,
+    reserve,
+    maxPositions,
+    currentOpenPositions,
+    decision,
+  }) => {
+    console.log(
+      `DECISION_SNAPSHOT ${JSON.stringify({
+        symbol,
+        side,
+        qty,
+        computedNotional,
+        minNotional,
+        buyingPower,
+        cash,
+        reserve,
+        maxPositions,
+        currentOpenPositions,
+        decision,
+      })}`
+    );
+  };
 
   async function computeEntrySignal(asset, d, riskLvl, preQuoteMap = null, preBarsMap = null, batchId = null) {
     let bars1 = [];
@@ -4160,9 +4387,12 @@ export default function App() {
     }
 
     const spreadBps = ((q.ask - q.bid) / mid) * 10000;
-    if (!isStaleQuoteEntry(q)) {
-      logTradeAction('quote_ok', asset.symbol, { spreadBps: +spreadBps.toFixed(1), batchId });
+    if (isStaleQuoteEntry(q)) {
+      logTradeAction('quote_stale', asset.symbol, { spreadBps: +spreadBps.toFixed(1), batchId });
+      logStaleQuote(asset.symbol, q, { reason: 'stale_quote' });
+      return { entryReady: false, why: 'stale_quote', meta: { lastSeenAgeSec: formatLoggedAgeSeconds(Date.now() - getQuoteLastSeenMs(q)) } };
     }
+    logTradeAction('quote_ok', asset.symbol, { spreadBps: +spreadBps.toFixed(1), batchId });
 
     if (spreadBps > d.spreadMax + SPREAD_EPS_BPS) {
       logTradeAction('skip_wide_spread', asset.symbol, { spreadBps: +spreadBps.toFixed(1) });
@@ -4312,13 +4542,13 @@ export default function App() {
       try {
         logOrderPayload('force_test_buy', order);
         forceTestBuyUsed = true;
+        attemptsSent += 1;
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('force_test_buy', order, res, data);
-        const orderOk = Boolean(res.ok && data?.ok && data?.orderId);
+        const status = String(data?.status || '').toLowerCase();
+        const orderOk = Boolean(res.ok && data?.ok && data?.orderId && status !== 'rejected');
         if (orderOk) {
-          attemptsSent += 1;
-          const status = String(data.status || '').toLowerCase();
           recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
           if (status === 'filled') {
             fillsCount += 1;
@@ -4361,9 +4591,11 @@ export default function App() {
     } catch {}
     const cap = concurrencyCapBySpread(globalSpreadAvgRef.current);
 
+    let currentOpenPositions = null;
     try {
       const allPos = await getAllPositionsCached();
       const nonStableOpen = (allPos || []).filter((p) => Number(p.qty) > 0 && Number(p.market_value || p.marketValue || 0) > 1).length;
+      currentOpenPositions = nonStableOpen;
       if (nonStableOpen >= cap) {
         logTradeAction('concurrency_guard', normalizedSymbol, { cap, avg: globalSpreadAvgRef.current, hitRate: (function(){let h=0,t=0;for(const s of Object.values(symStats)){for(const b of (s.hitByHour||[])){h+=b.h||0;t+=b.t||0;}}return t>0?(h/t):null;})() });
         logGateFail(normalizedSymbol, 'max_positions', '', {
@@ -4390,6 +4622,10 @@ export default function App() {
       return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0 };
     }
 
+    const meta = await fetchAssetMeta(normalizedSymbol);
+    const minNotional = meta?._min_notional > 0 ? meta._min_notional : MIN_ORDER_NOTIONAL_USD;
+    const quantizeQty = createQtyQuantizer(normalizedSymbol, meta);
+
     // Fetch fresh, pending-aware BP to avoid 403s
     const bpInfo = await getUsableBuyingPower({ forCrypto: isCrypto(normalizedSymbol) });
     let equity   = Number.isFinite(acctSummary.portfolioValue) ? acctSummary.portfolioValue : (bpInfo.snapshot?.equity ?? NaN);
@@ -4405,10 +4641,36 @@ export default function App() {
 
     const buyingPower = bpInfo.usable; // this is the only number we size from
     if (!Number.isFinite(buyingPower) || buyingPower <= 0) {
+      const validation = validateOrderCandidate({
+        symbol: normalizedSymbol,
+        side: 'buy',
+        qty: null,
+        price: null,
+        computedNotional: minNotional,
+        minNotional,
+        buyingPower,
+        cash: bpInfo.snapshot?.cash,
+        reserve: bpInfo.pending,
+        maxPositions: cap,
+        currentOpenPositions,
+      });
+      logDecisionSnapshot({
+        symbol: normalizedSymbol,
+        side: 'buy',
+        qty: null,
+        computedNotional: validation.computedNotional,
+        minNotional: validation.minNotional,
+        buyingPower,
+        cash: bpInfo.snapshot?.cash,
+        reserve: bpInfo.pending,
+        maxPositions: cap,
+        currentOpenPositions,
+        decision: validation.decision,
+      });
       logTradeAction('entry_skipped', normalizedSymbol, { entryReady: true, reason: 'skip_small_order', note: 'no usable BP' });
       logGateFail(normalizedSymbol, 'buying_power', '', {
         buying_power: Number.isFinite(buyingPower) ? Number(buyingPower.toFixed(2)) : buyingPower,
-        min_notional: 5,
+        min_notional: minNotional,
         open_orders_count: openOrdersCount,
         max_positions: cap,
       });
@@ -4439,20 +4701,14 @@ export default function App() {
       ? Math.min(notionalBase, kellyNotional)
       : notionalBase;
 
-    if (sig?.quote && !isStaleQuoteEntry(sig.quote)) {
-      logTradeAction('quote_ok', normalizedSymbol, { spreadBps: (sig?.spreadBps ?? 0), bp_base: bpInfo.base, bp_pending: bpInfo.pending, bp_usable: buyingPower, batchId: sig?.batchId ?? batchId });
-    }
-
-    if (!Number.isFinite(notional) || notional < 5) {
-      logTradeAction('skip_small_order', normalizedSymbol);
-      logGateFail(normalizedSymbol, 'min_notional', '', {
-        buying_power: Number.isFinite(buyingPower) ? Number(buyingPower.toFixed(2)) : buyingPower,
-        min_notional: 5,
-        open_orders_count: openOrdersCount,
-        max_positions: cap,
-        order_notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
-      });
-      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'min_notional' };
+    if (sig?.quote) {
+      if (isStaleQuoteEntry(sig.quote)) {
+        const mid = sig.quote.bid && sig.quote.ask ? 0.5 * (sig.quote.bid + sig.quote.ask) : sig.quote.bid;
+        const spreadBps = Number.isFinite(mid) && mid > 0 ? ((sig.quote.ask - sig.quote.bid) / mid) * 10000 : (sig?.spreadBps ?? 0);
+        logTradeAction('quote_stale', normalizedSymbol, { spreadBps: +Number(spreadBps || 0).toFixed(1), batchId: sig?.batchId ?? batchId });
+      } else {
+        logTradeAction('quote_ok', normalizedSymbol, { spreadBps: (sig?.spreadBps ?? 0), bp_base: bpInfo.base, bp_pending: bpInfo.pending, bp_usable: buyingPower, batchId: sig?.batchId ?? batchId });
+      }
     }
 
     if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig.quote.bid;
@@ -4462,37 +4718,100 @@ export default function App() {
     const feeFrac = (effectiveSettings.feeBpsMaker || 15) / 10000; // assume maker for entry
     const cushion = 0.0008; // 8 bps headroom
     const denom = Math.max(pxForSizing * (1 + feeFrac + cushion), 1e-9);
-    let qty = +(notional / denom).toFixed(9);
-    if (!Number.isFinite(qty) || qty <= 0) {
-      logTradeAction('skip_small_order', normalizedSymbol);
-      logGateFail(normalizedSymbol, 'min_notional', '', {
+    let qty = quantizeQty(notional / denom);
+    const computedNotional = Number.isFinite(pxForSizing) && pxForSizing > 0 ? qty * pxForSizing : notional;
+    const validation = validateOrderCandidate({
+      symbol: normalizedSymbol,
+      side: 'buy',
+      qty,
+      price: pxForSizing,
+      computedNotional,
+      minNotional,
+      buyingPower,
+      cash: bpInfo.snapshot?.cash,
+      reserve: bpInfo.pending,
+      maxPositions: cap,
+      currentOpenPositions,
+      maxNotional: notionalBase,
+      quantizeQty,
+    });
+    qty = validation.qty ?? qty;
+    const finalNotional = Number.isFinite(validation.computedNotional) ? validation.computedNotional : computedNotional;
+    if (validation.decision !== 'ATTEMPT') {
+      logDecisionSnapshot({
+        symbol: normalizedSymbol,
+        side: 'buy',
+        qty,
+        computedNotional: finalNotional,
+        minNotional: validation.minNotional,
+        buyingPower,
+        cash: bpInfo.snapshot?.cash,
+        reserve: bpInfo.pending,
+        maxPositions: cap,
+        currentOpenPositions,
+        decision: validation.decision,
+      });
+      const gateReason = validation.reason === 'insufficient_funding' ? 'insufficient_funding' : 'min_notional';
+      logGateFail(normalizedSymbol, gateReason, '', {
         buying_power: Number.isFinite(buyingPower) ? Number(buyingPower.toFixed(2)) : buyingPower,
-        min_notional: 5,
+        min_notional: minNotional,
         open_orders_count: openOrdersCount,
         max_positions: cap,
-        order_notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
+        order_notional: Number.isFinite(finalNotional) ? Number(finalNotional.toFixed(2)) : finalNotional,
         order_qty: qty,
+        reserve: Number.isFinite(bpInfo.pending) ? Number(bpInfo.pending.toFixed(2)) : bpInfo.pending,
       });
-      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'min_notional' };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: validation.reason || 'min_notional' };
     }
 
     console.log(`${normalizedSymbol} — GateCheck`, {
       buying_power: Number.isFinite(buyingPower) ? Number(buyingPower.toFixed(2)) : buyingPower,
-      min_notional: 5,
+      min_notional: minNotional,
       open_orders_count: openOrdersCount,
       max_positions: cap,
-      order_notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
+      order_notional: Number.isFinite(finalNotional) ? Number(finalNotional.toFixed(2)) : finalNotional,
       order_qty: qty,
     });
 
     // console.log('USABLE BP', symbol, buyingPower);
+    const emitDecisionSnapshot = (() => {
+      let logged = false;
+      return (decision, overrides = {}) => {
+        if (logged) return;
+        logged = true;
+        logDecisionSnapshot({
+          symbol: normalizedSymbol,
+          side: 'buy',
+          qty: overrides.qty ?? qty,
+          computedNotional: overrides.computedNotional ?? finalNotional,
+          minNotional,
+          buyingPower,
+          cash: bpInfo.snapshot?.cash,
+          reserve: bpInfo.pending,
+          maxPositions: cap,
+          currentOpenPositions,
+          decision,
+        });
+      };
+    })();
     logReadyAttempt({
       symbol: normalizedSymbol,
-      orderUsd: notional,
+      orderUsd: finalNotional,
       price: entryPx,
       spreadBps: sig?.spreadBps,
     });
-    const result = await placeMakerThenMaybeTakerBuy(normalizedSymbol, qty, preQuoteMap, buyingPower);
+    const result = await placeMakerThenMaybeTakerBuy(
+      normalizedSymbol,
+      qty,
+      preQuoteMap,
+      buyingPower,
+      {
+        emitDecisionSnapshot,
+        minNotional,
+        buyingPower,
+        reserve: bpInfo.pending,
+      }
+    );
     if (!result.filled) {
       return {
         attempted: result.attempted,
