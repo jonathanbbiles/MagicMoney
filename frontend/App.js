@@ -1872,7 +1872,8 @@ const FRIENDLY = {
   quote_exception:  { sev: 'error', msg: (d) => `Quote/Order exception: ${d?.error ?? ''}` },
   trade_http_error: { sev: 'warn', msg: (d) => `Alpaca ${d.symbol || 'trades'} ${d.status}${d.loc ? ' • ' + d.loc : ''}${d.body ? ' • ' + d.body : ''}` },
   unsupported_symbol: { sev: 'warn', msg: (d) => `Unsupported symbol: ${d.sym}` },
-  buy_camped: { sev: 'info', msg: (d) => `Camping bid @ ${d.limit}` },
+  buy_camped: { sev: 'info', msg: (d) => `BUY camping bid @ ${d.limit}` },
+  sell_resting: { sev: 'info', msg: (d) => `SELL resting ask @ ${d.limit}` },
   buy_replaced: { sev: 'info', msg: (d) => `Replaced bid → ${d.limit}` },
   buy_success: { sev: 'success', msg: (d) => `BUY filled qty ${d.qty} @≤${d.limit}` },
   buy_unfilled_canceled: { sev: 'warn', msg: () => `BUY unfilled — canceled bid` },
@@ -1883,7 +1884,10 @@ const FRIENDLY = {
   scan_summary: {
     sev: 'info',
     msg: (d) =>
-      `Scan: ready ${d.readyCount} / attempts_sent ${d.attemptsSent} / attempts_failed ${d.attemptsFailed} / open ${d.ordersOpen} / fills ${d.fillsCount}`,
+      `Scan: ready ${d.readyCount} / attempts_sent ${d.attemptsSent} / attempts_failed ${d.attemptsFailed}` +
+      ` / open ${d.ordersOpen} (buy ${d.openBuy ?? 0}, sell ${d.openSell ?? 0})` +
+      ` / fills ${d.fillsCount}` +
+      ` / cancels ${d.cancels ?? 0} (ttl ${d.cancelsDueToTtl ?? 0})`,
   },
   scan_error: { sev: 'error', msg: (d) => `Scan error: ${d.error}` },
   skip_wide_spread: { sev: 'warn', msg: (d) => `Skip: spread ${d.spreadBps} bps > max` },
@@ -2611,6 +2615,53 @@ async function cancelOrder(orderId) {
     return false;
   }
 }
+
+const parseOrderTimestampMs = (order) => {
+  const raw =
+    order?.submitted_at ||
+    order?.submittedAt ||
+    order?.created_at ||
+    order?.createdAt ||
+    order?.updated_at ||
+    order?.updatedAt;
+  if (!raw) return null;
+  const ts = Date.parse(raw);
+  return Number.isFinite(ts) ? ts : null;
+};
+
+const getOrderAgeMs = (order, now = Date.now()) => {
+  const ts = parseOrderTimestampMs(order);
+  if (!Number.isFinite(ts)) return null;
+  return Math.max(0, now - ts);
+};
+
+const isSellOrderStale = (order, now = Date.now()) => {
+  const ageMs = getOrderAgeMs(order, now);
+  return Number.isFinite(ageMs) && ageMs >= SELL_ORDER_TTL_MS;
+};
+
+const getOrderRemainingQty = (order) => {
+  const qty = Number(order?.qty ?? order?.quantity ?? NaN);
+  const filled = Number(order?.filled_qty ?? order?.filledQty ?? 0);
+  if (!Number.isFinite(qty)) return null;
+  return Math.max(0, qty - (Number.isFinite(filled) ? filled : 0));
+};
+
+const markSellReplaceCooldown = (symbol, now = Date.now()) => {
+  sellReplaceCooldownBySymbol.set(normalizePair(symbol), now);
+};
+
+const isSellReplaceCooldownActive = (symbol, now = Date.now()) => {
+  const last = sellReplaceCooldownBySymbol.get(normalizePair(symbol)) || 0;
+  return now - last < SELL_ORDER_REPLACE_COOLDOWN_MS;
+};
+
+const buildExitClientOrderId = (symbol) => {
+  const normalized = normalizePair(symbol).replace('/', '');
+  return `EXIT-${normalized}-${Date.now()}`;
+};
+
+const getSellExitTimeInForce = (symbol) => (isStock(symbol) ? 'day' : 'ioc');
 
 const RISK_EXIT_COOLDOWN_MS = 60000;
 function computeRiskDecision({ entryPrice, currentPrice, peakPrice, trailingActive, settings }) {
@@ -3696,8 +3747,16 @@ async function marketSell(symbol, qty) {
     logTradeAction('tp_limit_error', normalizedSymbol, { error: 'SELL mkt skipped — no available qty' });
     return null;
   }
-  const tif = isStock(symbol) ? 'day' : 'gtc';
-  const mkt = { symbol: normalizedSymbol, qty: usableQty, side: 'sell', type: 'market', time_in_force: tif };
+  const tif = getSellExitTimeInForce(symbol);
+  const mkt = {
+    symbol: normalizedSymbol,
+    qty: usableQty,
+    side: 'sell',
+    type: 'market',
+    time_in_force: tif,
+    client_order_id: buildExitClientOrderId(normalizedSymbol),
+    reason: 'exit_market',
+  };
   if (DRY_RUN_STOPS) {
     logTradeAction('risk_stop', normalizedSymbol, { dryRun: true, qty: usableQty, order: mkt });
     return { dryRun: true, order: mkt };
@@ -3734,6 +3793,9 @@ async function marketSell(symbol, qty) {
   }
 }
 
+const SELL_ORDER_TTL_MS = 60000;
+const SELL_ORDER_REPLACE_COOLDOWN_MS = 15000;
+const sellReplaceCooldownBySymbol = new Map();
 const SELL_EPS_BPS = 0.2;
 
 /**
@@ -3838,6 +3900,9 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
   const entryPx = state.entry ?? posInfo.basis ?? posInfo.mark ?? 0;
   const qty = Number(posInfo.available ?? 0);
   if (!(entryPx > 0) || !(qty > 0)) return;
+
+  const now = Date.now();
+  if (isSellReplaceCooldownActive(normalizedSymbol, now)) return;
 
   const riskExited = await ensureRiskExits(normalizedSymbol, { tradeStateRef, pos: posInfo });
   if (riskExited) return;
@@ -3950,10 +4015,9 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     }
   }
 
-  const limitTIF = isStock(symbol) ? 'day' : 'gtc';
+  const limitTIF = getSellExitTimeInForce(symbol);
   let existing = openSellBySym?.get?.(normalizedSymbol) || null;
   if (existing && (existing.type || '').toLowerCase() !== 'limit') existing = null;
-  const now = Date.now();
   const lastTs = state.lastLimitPostTs || 0;
   const existingLimit = existing ? parseFloat(existing.limit_price ?? existing.limitPrice) : NaN;
   const priceDrift = Number.isFinite(existingLimit)
@@ -3971,6 +4035,8 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       type: 'limit',
       time_in_force: limitTIF,
       limit_price: finalLimit.toFixed(decimals),
+      client_order_id: buildExitClientOrderId(normalizedSymbol),
+      reason: 'exit_tp_limit',
     };
     logOrderPayload('sell_limit', order);
     const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
@@ -3980,6 +4046,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       tradeStateRef.current[normalizedSymbol] = { ...(state || {}), lastLimitPostTs: now };
       if (existing) { await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null); }
       logTradeAction('tp_limit_set', normalizedSymbol, { id: data.orderId, limit: order.limit_price });
+      logTradeAction('sell_resting', normalizedSymbol, { limit: order.limit_price });
     } else {
       const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
       logOrderFailure({
@@ -4011,20 +4078,102 @@ const reconcileExits = async ({
   touchMemoRef,
   settings,
 }) => {
-  const openSellBySym = new Map(
-    (openOrders || [])
-      .filter((o) => (o.side || '').toLowerCase() === 'sell')
-      .map((o) => [o.pairSymbol ?? normalizePair(o.symbol), o])
-  );
+  const openSellOrdersBySym = new Map();
+  let openBuyCount = 0;
+  let openSellCount = 0;
+  for (const order of openOrders || []) {
+    const side = String(order?.side || '').toLowerCase();
+    if (side === 'buy') openBuyCount += 1;
+    if (side !== 'sell') continue;
+    openSellCount += 1;
+    const sym = order.pairSymbol ?? normalizePair(order.symbol);
+    const list = openSellOrdersBySym.get(sym) || [];
+    list.push(order);
+    openSellOrdersBySym.set(sym, list);
+  }
+
+  const openSellBySym = new Map();
+  for (const [sym, list] of openSellOrdersBySym.entries()) {
+    const sorted = list
+      .slice()
+      .sort((a, b) => (parseOrderTimestampMs(b) || 0) - (parseOrderTimestampMs(a) || 0));
+    openSellOrdersBySym.set(sym, sorted);
+    if (sorted.length) openSellBySym.set(sym, sorted[0]);
+  }
+
+  const now = Date.now();
+  const qtyEpsilon = 1e-9;
+  let cancelsCount = 0;
+  let ttlCancelsCount = 0;
+
+  const cancelSellOrder = async (order, reason) => {
+    if (!order?.id) return false;
+    const ok = await cancelOrder(order.id);
+    if (ok) {
+      cancelsCount += 1;
+      if (reason === 'ttl') ttlCancelsCount += 1;
+      if (reason) {
+        console.log('sell_order_cancel', {
+          symbol: order.pairSymbol ?? normalizePair(order.symbol),
+          orderId: order.id,
+          reason,
+        });
+      }
+    }
+    return ok;
+  };
 
   for (const pos of positions || []) {
     const symbol = pos.pairSymbol ?? normalizePair(pos.symbol);
     const qty = Number(pos.qty ?? pos.quantity ?? 0);
-    const hasOpenSell = openSellBySym.has(symbol);
+    const sellOrders = openSellOrdersBySym.get(symbol) || [];
+    const hasOpenSell = sellOrders.length > 0;
     console.log('EXIT_CHECK', { symbol, hasOpenSell });
 
-    if (!autoTrade || hasOpenSell) continue;
-    if (!(qty > 0)) continue;
+    if (!(qty > 0)) {
+      if (sellOrders.length) {
+        await Promise.all(sellOrders.map((order) => cancelSellOrder(order, 'position_closed')));
+        openSellBySym.delete(symbol);
+      }
+      continue;
+    }
+
+    if (sellOrders.length > 1) {
+      const [, ...extras] = sellOrders;
+      await Promise.all(extras.map((order) => cancelSellOrder(order, 'duplicate_sell')));
+      if (extras.length) {
+        markSellReplaceCooldown(symbol, now);
+        sellOrders.splice(1);
+        openSellBySym.set(symbol, sellOrders[0]);
+      }
+    }
+
+    let existing = openSellBySym.get(symbol) || null;
+    if (existing) {
+      const remaining = getOrderRemainingQty(existing);
+      if (Number.isFinite(remaining) && Math.abs(remaining - qty) > qtyEpsilon) {
+        await cancelSellOrder(existing, 'qty_mismatch');
+        markSellReplaceCooldown(symbol, now);
+        openSellBySym.delete(symbol);
+        existing = null;
+      }
+    }
+
+    if (existing && isSellOrderStale(existing, now)) {
+      const ageMs = getOrderAgeMs(existing, now);
+      const limit = existing.limit_price ?? existing.limitPrice ?? 'NA';
+      const tif = existing.time_in_force ?? existing.timeInForce ?? 'NA';
+      console.log(
+        `SELL TTL cancel: ${symbol} orderId=${existing.id} ageSec=${(ageMs / 1000).toFixed(1)} limit=${limit} tif=${tif}`
+      );
+      await cancelSellOrder(existing, 'ttl');
+      markSellReplaceCooldown(symbol, now);
+      openSellBySym.delete(symbol);
+      existing = null;
+    }
+
+    if (!autoTrade || existing) continue;
+    if (isSellReplaceCooldownActive(symbol, now)) continue;
 
     const meta = await fetchAssetMeta(symbol);
     const quantizeQty = createQtyQuantizer(symbol, meta);
@@ -4070,6 +4219,13 @@ const reconcileExits = async ({
     }
     await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos });
   }
+
+  return {
+    openBuyCount,
+    openSellCount,
+    cancelsCount,
+    ttlCancelsCount,
+  };
 };
 
 /* ───────────────────────── 25) CONCURRENCY / PDT ───────────────────────────── */
@@ -5279,7 +5435,7 @@ export default function App() {
       console.log('ACCOUNT', scanBpInfo.snapshot ?? null);
       console.log('POSITIONS_RAW', positions);
       console.log('OPEN_ORDERS_RAW', allOpenOrders);
-      await reconcileExits({
+      const exitMetrics = await reconcileExits({
         positions,
         openOrders: allOpenOrders,
         autoTrade,
@@ -5437,7 +5593,21 @@ export default function App() {
         skipped: skippedCount,
         reasons: reasonCounts,
       });
-      logTradeAction('scan_summary', 'STATIC', { readyCount, attemptsSent, attemptsFailed, ordersOpen, fillsCount });
+      const openBuy = exitMetrics?.openBuyCount ?? 0;
+      const openSell = exitMetrics?.openSellCount ?? 0;
+      const cancels = exitMetrics?.cancelsCount ?? 0;
+      const cancelsDueToTtl = exitMetrics?.ttlCancelsCount ?? 0;
+      logTradeAction('scan_summary', 'STATIC', {
+        readyCount,
+        attemptsSent,
+        attemptsFailed,
+        ordersOpen,
+        fillsCount,
+        openBuy,
+        openSell,
+        cancels,
+        cancelsDueToTtl,
+      });
       const followUp = await pollRecentOrderStates();
       if (followUp && Number.isFinite(followUp?.ordersOpen)) {
         setScanStats((prev) => ({
