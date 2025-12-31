@@ -1,46 +1,22 @@
-const SYMBOL_CANONICAL_MAP = new Map([
-  ['BCH/USD', 'BCH/USD'],
-  ['BCH-USD', 'BCH/USD'],
-  ['UNI/USD', 'UNI/USD'],
-  ['UNI-USD', 'UNI/USD'],
-  ['LTC/USD', 'LTC/USD'],
-  ['LTC-USD', 'LTC/USD'],
-  ['XRP/USD', 'XRP/USD'],
-  ['XRP-USD', 'XRP/USD'],
-  ['BTC/USD', 'BTC/USD'],
-  ['BTC-USD', 'BTC/USD'],
-  ['ETH/USD', 'ETH/USD'],
-  ['ETH-USD', 'ETH/USD'],
-  ['SOL/USD', 'SOL/USD'],
-  ['SOL-USD', 'SOL/USD'],
-  ['AAVE/USD', 'AAVE/USD'],
-  ['AAVE-USD', 'AAVE/USD'],
-]);
-
 export function normalizePair(sym) {
   if (!sym) return sym;
   const t = String(sym).trim().toUpperCase();
-  if (SYMBOL_CANONICAL_MAP.has(t)) return SYMBOL_CANONICAL_MAP.get(t);
-  if (t.includes('/')) {
-    const [base, quote] = t.split('/');
-    if (!base) return t;
-    return `${base}/${quote || 'USD'}`;
-  }
-  if (t.includes('-')) {
-    const [base, quote] = t.split('-');
-    if (!base) return t;
-    return `${base}/${quote || 'USD'}`;
-  }
-  if (t.endsWith('USD') && t.length > 3) {
+  if (!t) return t;
+  if (t.includes('/')) return t;
+  if (t.endsWith('USD') && t.length > 3 && !t.includes('-')) {
     return `${t.slice(0, -3)}/USD`;
   }
   return t;
 }
 
-export function alpacaSymbol(pair) {
+export function toAlpacaSymbol(pair) {
   if (!pair) return pair;
   const normalized = normalizePair(pair);
   return normalized ? normalized.replace('/', '') : normalized;
+}
+
+export function alpacaSymbol(pair) {
+  return toAlpacaSymbol(pair);
 }
 
 export function toInternalSymbol(sym) {

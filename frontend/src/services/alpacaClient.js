@@ -568,7 +568,9 @@ export const getAllPositions = async () => {
     return Array.isArray(arr)
       ? arr.map((pos) => ({
         ...pos,
-        symbol: normalizePair(pos.symbol),
+        rawSymbol: pos.rawSymbol ?? pos.symbol,
+        pairSymbol: normalizePair(pos.rawSymbol ?? pos.symbol),
+        symbol: normalizePair(pos.rawSymbol ?? pos.symbol),
       }))
       : [];
   } catch (err) {
@@ -595,7 +597,9 @@ export const getOpenOrders = async () => {
     return Array.isArray(arr)
       ? arr.map((order) => ({
         ...order,
-        symbol: normalizePair(order.symbol),
+        rawSymbol: order.rawSymbol ?? order.symbol,
+        pairSymbol: normalizePair(order.rawSymbol ?? order.symbol),
+        symbol: normalizePair(order.rawSymbol ?? order.symbol),
       }))
       : [];
   } catch (err) {
@@ -670,7 +674,7 @@ export const getUsableBuyingPower = async ({ forCrypto = true } = {}) => {
       const side = String(o.side || '').toLowerCase();
       if (side !== 'buy') continue;
       const sym = o.symbol || '';
-      const isCryptoSym = /USD$/.test(sym);
+      const isCryptoSym = /USD$/.test(normalizePair(sym) || '');
       if (forCrypto !== isCryptoSym) continue;
       const qty = +o.qty || +o.quantity || NaN;
       const lim = +o.limit_price || +o.limitPrice || NaN;
