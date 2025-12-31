@@ -1898,10 +1898,17 @@ const FRIENDLY = {
     msg: (d) => {
       const reason = d?.reason || 'below_min_notional';
       if (reason === 'insufficient_funding') {
-        const bp = Number.isFinite(d?.buyingPower) ? d.buyingPower.toFixed(2) : d?.buyingPower;
+        const bp = Number.isFinite(d?.availableUsd) ? d.availableUsd.toFixed(2)
+          : Number.isFinite(d?.buyingPower) ? d.buyingPower.toFixed(2)
+          : d?.buyingPower;
         const req = Number.isFinite(d?.requiredNotional) ? d.requiredNotional.toFixed(2) : d?.requiredNotional;
         const reserve = Number.isFinite(d?.reserve) ? d.reserve.toFixed(2) : d?.reserve;
-        return `Skip: insufficient_funding (buyingPower=${bp}, requiredNotional=${req}${reserve != null ? `, reserve=${reserve}` : ''})`;
+        const openHold = Number.isFinite(d?.openOrderHold) ? d.openOrderHold.toFixed(2) : d?.openOrderHold;
+        const cash = Number.isFinite(d?.cash) ? d.cash.toFixed(2) : d?.cash;
+        const rawBp = Number.isFinite(d?.buying_power) ? d.buying_power.toFixed(2) : d?.buying_power;
+        const nmbp = Number.isFinite(d?.non_marginable_buying_power) ? d.non_marginable_buying_power.toFixed(2) : d?.non_marginable_buying_power;
+        return `Skip: insufficient_funding (availableUsd=${bp}, requiredNotional=${req}, cash=${cash}, buying_power=${rawBp}, non_marginable_buying_power=${nmbp}` +
+          `${reserve != null ? `, reserve=${reserve}` : ''}${openHold != null ? `, openOrderHold=${openHold}` : ''})`;
       }
       if (reason === 'below_min_notional') {
         const comp = Number.isFinite(d?.computedNotional) ? d.computedNotional.toFixed(2) : d?.computedNotional;
@@ -1917,7 +1924,10 @@ const FRIENDLY = {
       `BUMP_QTY_TO_MIN_NOTIONAL oldQty=${d.oldQty} newQty=${d.newQty} oldNotional=${d.oldNotional} newNotional=${d.newNotional}`,
   },
   entry_skipped: { sev: 'info', msg: (d) => `Skip — ${d.reason}${fmtSkipDetail(d.reason, d)}` },
-  risk_changed: { sev: 'info', msg: (d) => `Risk→${d.level} (spread≤${d.spreadMax}bps)` },
+  risk_changed: {
+    sev: 'info',
+    msg: (d) => `SETTINGS — Risk→${d.level} (source=${d.source || 'UI'}, reason=${d.reason || 'manual'})`,
+  },
   concurrency_guard: { sev: 'warn', msg: (d) => `Concurrency guard: cap ${d.cap} @ avg ${d.avg?.toFixed?.(1) ?? d.avg} bps` },
   skip_blacklist: { sev: 'warn', msg: () => `Skip: blacklisted` },
   coarse_tick_skip: { sev: 'warn', msg: () => `Skip: coarse-tick/sub-$0.05` },
@@ -2718,6 +2728,8 @@ async function getAccountSummaryRaw() {
   const num = (x) => { const n = parseFloat(x); return Number.isFinite(n) ? n : NaN; };
 
   const equity = num(a.equity ?? a.portfolio_value);
+  const portfolioValue = num(a.portfolio_value ?? a.equity);
+  const accountStatus = a.status ?? a.account_status ?? a.accountStatus ?? null;
 
   // Buckets from Alpaca
   const stockBP  = num(a.buying_power);
@@ -2746,13 +2758,17 @@ async function getAccountSummaryRaw() {
 
   return {
     equity,
+    portfolioValue,
     buyingPower: buyingPowerDisplay,
     changeUsd, changePct,
     patternDayTrader, daytradeCount,
     cryptoBuyingPower: cashish,
     stockBuyingPower: Number.isFinite(stockBP) ? stockBP : cashish,
     daytradeBuyingPower: dtbp,
-    cash
+    cash,
+    buyingPowerRaw: stockBP,
+    nonMarginableBuyingPower: nmbp,
+    accountStatus,
   };
 }
 
@@ -4047,6 +4063,7 @@ export default function App() {
   });
 
   const [settings, setSettings] = useState({ ...getEffectiveSettings() });
+  const lastRiskChangeRef = useRef({ ts: 0, source: null, level: null });
   const effectiveSettings = useMemo(() => getEffectiveSettings(settings), [settings]);
   useEffect(() => {
     (async () => {
@@ -4069,8 +4086,37 @@ export default function App() {
   }, [settings]);
   useEffect(() => {
     SETTINGS = { ...settings };
-    logTradeAction('risk_changed', 'SETTINGS', { level: effectiveSettings.riskLevel, spreadMax: effectiveSettings.spreadMaxBps });
   }, [settings]);
+
+  const logRiskChange = ({ level, source, reason, spreadMax }) => {
+    logTradeAction('risk_changed', 'SETTINGS', { level, spreadMax, source, reason });
+    console.log(`SETTINGS — Risk→${level} (source=${source}, reason=${reason})`);
+  };
+
+  const applySettingsUpdate = (updater, { source = 'UI', reason = 'manual' } = {}) => {
+    setSettings((s) => {
+      const next = typeof updater === 'function' ? updater(s) : { ...s, ...updater };
+      if (next.riskLevel !== s.riskLevel) {
+        const now = Date.now();
+        const last = lastRiskChangeRef.current || {};
+        if (last.source && last.source !== source && now - last.ts < 2000) {
+          return s;
+        }
+        lastRiskChangeRef.current = { ts: now, source, level: next.riskLevel };
+        logRiskChange({
+          level: next.riskLevel,
+          source,
+          reason,
+          spreadMax: next.spreadMaxBps ?? s.spreadMaxBps,
+        });
+      }
+      return next;
+    });
+  };
+
+  const setRiskLevel = (level, { source = 'UI', reason = 'manual' } = {}) => {
+    applySettingsUpdate((s) => ({ ...s, riskLevel: level }), { source, reason });
+  };
 
   useEffect(() => {
     SETTINGS_OVERRIDES = { ...overrides };
@@ -4324,7 +4370,7 @@ export default function App() {
     );
   };
 
-  async function computeEntrySignal(asset, d, riskLvl, preQuoteMap = null, preBarsMap = null, batchId = null) {
+  async function computeEntrySignal(asset, d, riskLvl, preQuoteMap = null, preBarsMap = null, batchId = null, fundingCtx = null) {
     let bars1 = [];
     if (effectiveSettings.enforceMomentum) {
       if (preBarsMap && preBarsMap.has(asset.symbol)) {
@@ -4362,6 +4408,23 @@ export default function App() {
       return { entryReady: false, why: 'no_quote', meta: { freshSec: null } };
     }
 
+    const mid = 0.5 * (q.bid + q.ask);
+    const spreadBps = Number.isFinite(q.spreadBps)
+      ? q.spreadBps
+      : ((q.ask - q.bid) / mid) * 10000;
+    const lastSeenMs = getQuoteLastSeenMs(q);
+    const ageMs = Number.isFinite(lastSeenMs) ? Date.now() - lastSeenMs : null;
+    const tsMs = Number.isFinite(q.tsMs) && q.tsMs > 0 ? q.tsMs : lastSeenMs;
+    if (isStaleQuoteEntry(q)) {
+      const bpsText = Number.isFinite(spreadBps) ? spreadBps.toFixed(1) : 'n/a';
+      const ageText = Number.isFinite(ageMs) ? Math.round(ageMs) : 'n/a';
+      const tsText = Number.isFinite(tsMs) ? tsMs : 'n/a';
+      console.warn(`${asset.symbol} — Quote STALE (bps=${bpsText}, ageMs=${ageText}, ts=${tsText})`);
+      logTradeAction('quote_stale', asset.symbol, { spreadBps: +Number(spreadBps || 0).toFixed(1), ageMs, tsMs, batchId });
+      logStaleQuote(asset.symbol, q, { reason: 'stale_quote' });
+      return { entryReady: false, why: 'stale_quote', meta: { lastSeenAgeSec: formatLoggedAgeSeconds(ageMs) } };
+    }
+
     const mm = microMetrics(q);
 
     if (q.bs != null && Number.isFinite(q.bs) && (q.bs * q.bid) < MIN_BID_NOTIONAL_LOOSE_USD) {
@@ -4375,8 +4438,6 @@ export default function App() {
         }
       };
     }
-
-    const mid = 0.5 * (q.bid + q.ask);
     if (BLACKLIST.has(asset.symbol)) {
       logGateFail(asset.symbol, 'blacklist');
       return { entryReady: false, why: 'blacklist', meta: {} };
@@ -4386,13 +4447,48 @@ export default function App() {
       return { entryReady: false, why: 'tiny_price', meta: { mid } };
     }
 
-    const spreadBps = ((q.ask - q.bid) / mid) * 10000;
-    if (isStaleQuoteEntry(q)) {
-      logTradeAction('quote_stale', asset.symbol, { spreadBps: +spreadBps.toFixed(1), batchId });
-      logStaleQuote(asset.symbol, q, { reason: 'stale_quote' });
-      return { entryReady: false, why: 'stale_quote', meta: { lastSeenAgeSec: formatLoggedAgeSeconds(Date.now() - getQuoteLastSeenMs(q)) } };
+    if (fundingCtx && Number.isFinite(fundingCtx.availableUsd)) {
+      const availableUsd = fundingCtx.availableUsd;
+      const minNotional = Number.isFinite(fundingCtx.minNotional) ? fundingCtx.minNotional : MIN_ORDER_NOTIONAL_USD;
+      const targetNotional = Number.isFinite(fundingCtx.targetNotional) ? fundingCtx.targetNotional : null;
+      const requiredNotional = Number.isFinite(targetNotional)
+        ? Math.max(minNotional, Math.min(targetNotional, availableUsd))
+        : minNotional;
+      if (availableUsd < requiredNotional) {
+        const cash = fundingCtx.snapshot?.cash;
+        const rawBuyingPower = fundingCtx.snapshot?.buyingPowerRaw;
+        const nmbp = fundingCtx.snapshot?.nonMarginableBuyingPower;
+        const reserve = fundingCtx.reserveUsd;
+        const openOrderHold = fundingCtx.openOrderHold;
+        const fmtMoney = (value) => (Number.isFinite(value) ? value.toFixed(2) : value);
+        console.warn(
+          `${asset.symbol} — Skip: insufficient_funding (availableUsd=${Number(availableUsd).toFixed(2)}, ` +
+          `requiredNotional=${Number(requiredNotional).toFixed(2)}, cash=${fmtMoney(cash)}, ` +
+          `buying_power=${fmtMoney(rawBuyingPower)}, ` +
+          `non_marginable_buying_power=${fmtMoney(nmbp)}, ` +
+          `reserve=${fmtMoney(reserve)}, openOrderHold=${fmtMoney(openOrderHold)})`
+        );
+        logTradeAction('skip_small_order', asset.symbol, {
+          reason: 'insufficient_funding',
+          availableUsd,
+          requiredNotional,
+          cash,
+          buying_power: rawBuyingPower,
+          non_marginable_buying_power: nmbp,
+          reserve,
+          openOrderHold,
+          batchId,
+        });
+        return {
+          entryReady: false,
+          why: 'insufficient_funding',
+          meta: { availableUsd, requiredNotional, reserve, openOrderHold },
+        };
+      }
     }
-    logTradeAction('quote_ok', asset.symbol, { spreadBps: +spreadBps.toFixed(1), batchId });
+
+    console.log(`${asset.symbol} — Quote OK (bps=${Number.isFinite(spreadBps) ? spreadBps.toFixed(1) : 'n/a'})`);
+    logTradeAction('quote_ok', asset.symbol, { spreadBps: +Number(spreadBps || 0).toFixed(1), batchId });
 
     if (spreadBps > d.spreadMax + SPREAD_EPS_BPS) {
       logTradeAction('skip_wide_spread', asset.symbol, { spreadBps: +spreadBps.toFixed(1) });
@@ -4700,16 +4796,6 @@ export default function App() {
     const notional = Number.isFinite(kellyNotional) && kellyNotional > 0
       ? Math.min(notionalBase, kellyNotional)
       : notionalBase;
-
-    if (sig?.quote) {
-      if (isStaleQuoteEntry(sig.quote)) {
-        const mid = sig.quote.bid && sig.quote.ask ? 0.5 * (sig.quote.bid + sig.quote.ask) : sig.quote.bid;
-        const spreadBps = Number.isFinite(mid) && mid > 0 ? ((sig.quote.ask - sig.quote.bid) / mid) * 10000 : (sig?.spreadBps ?? 0);
-        logTradeAction('quote_stale', normalizedSymbol, { spreadBps: +Number(spreadBps || 0).toFixed(1), batchId: sig?.batchId ?? batchId });
-      } else {
-        logTradeAction('quote_ok', normalizedSymbol, { spreadBps: (sig?.spreadBps ?? 0), bp_base: bpInfo.base, bp_pending: bpInfo.pending, bp_usable: buyingPower, batchId: sig?.batchId ?? batchId });
-      }
-    }
 
     if (!Number.isFinite(entryPx) || entryPx <= 0) entryPx = sig.quote.bid;
 
@@ -5063,6 +5149,44 @@ export default function App() {
       await getAccountSummaryThrottled();
       await preflightAccountCheck();
 
+      const scanBpInfo = await getUsableBuyingPower({ forCrypto: true });
+      const reserveUsd = Number.isFinite(effectiveSettings.reserveUsd) ? effectiveSettings.reserveUsd : 0;
+      const openOrderHold = Number.isFinite(scanBpInfo.pending) ? scanBpInfo.pending : 0;
+      const baseUsd = Number.isFinite(scanBpInfo.base) ? scanBpInfo.base : 0;
+      const computedAvailableUsd = Math.max(0, baseUsd - reserveUsd - openOrderHold);
+      const equityForSizing = Number.isFinite(scanBpInfo.snapshot?.equity)
+        ? scanBpInfo.snapshot.equity
+        : (Number.isFinite(acctSummary.portfolioValue) ? acctSummary.portfolioValue : NaN);
+      const targetNotional = Number.isFinite(equityForSizing)
+        ? Math.min((effectiveSettings.maxPosPctEquity / 100) * equityForSizing, effectiveSettings.absMaxNotionalUSD ?? Infinity)
+        : NaN;
+      console.log('FUNDS', {
+        cash: scanBpInfo.snapshot?.cash ?? null,
+        buying_power: scanBpInfo.snapshot?.buyingPowerRaw ?? null,
+        non_marginable_buying_power: scanBpInfo.snapshot?.nonMarginableBuyingPower ?? null,
+        portfolio_value: scanBpInfo.snapshot?.portfolioValue ?? scanBpInfo.snapshot?.equity ?? null,
+        account_status: scanBpInfo.snapshot?.accountStatus ?? null,
+        computedAvailableUsd,
+        reserve: reserveUsd,
+        openOrderHold,
+        minNotional: MIN_ORDER_NOTIONAL_USD,
+        targetNotional,
+        targetNotionalSettings: {
+          maxPosPctEquity: effectiveSettings.maxPosPctEquity,
+          absMaxNotionalUSD: effectiveSettings.absMaxNotionalUSD,
+          kellyEnabled: effectiveSettings.kellyEnabled,
+          kellyFraction: effectiveSettings.kellyFraction,
+        },
+      });
+      const scanFundingCtx = {
+        availableUsd: computedAvailableUsd,
+        reserveUsd,
+        openOrderHold,
+        snapshot: scanBpInfo.snapshot,
+        minNotional: MIN_ORDER_NOTIONAL_USD,
+        targetNotional,
+      };
+
       const [positions, allOpenOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached()]);
       const posBySym = new Map((positions || []).map((p) => [p.symbol, p]));
       const openCount = (positions || []).filter((p) => {
@@ -5146,7 +5270,7 @@ export default function App() {
           const isHolding = !!(posNow && Number(posNow.qty) > 0);
           tradeStateRef.current[normalizedSymbol] = { ...prevState, wasHolding: isHolding };
 
-          const sig = await computeEntrySignal({ ...asset, symbol: normalizedSymbol }, d, effectiveSettings.riskLevel, batchMap, barsMap, scanBatchId);
+          const sig = await computeEntrySignal({ ...asset, symbol: normalizedSymbol }, d, effectiveSettings.riskLevel, batchMap, barsMap, scanBatchId, scanFundingCtx);
           token.entryReady = sig.entryReady;
 
           if (sig?.quote && sig.quote.bid > 0 && sig.quote.ask > 0) {
@@ -5346,7 +5470,7 @@ export default function App() {
     };
     const p = presets[name];
     if (!p) return;
-    setSettings((s) => ({ ...s, ...p }));
+    applySettingsUpdate((s) => ({ ...s, ...p }), { source: 'UI', reason: `preset:${name}` });
   };
 
   function reasonKeyFromEntry(raw) {
@@ -5438,7 +5562,7 @@ export default function App() {
               {RISK_LEVELS.map((icon, idx) => (
                 <TouchableOpacity
                   key={idx}
-                  onPress={() => setSettings((s) => ({ ...s, riskLevel: idx }))}
+                  onPress={() => setRiskLevel(idx, { source: 'UI', reason: 'tap' })}
                   style={[
                     styles.riskIconWrapper,
                     settings.riskLevel === idx && styles.riskIconWrapperActive,
