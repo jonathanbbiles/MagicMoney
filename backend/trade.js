@@ -371,6 +371,23 @@ function logOrderPayload({ payload }) {
   });
 }
 
+function logOrderIntent({ label, payload, reason }) {
+  if (!payload) return;
+  const symbolRaw = payload.symbol ?? '';
+  const symbol = normalizePair(symbolRaw);
+  console.log('order_intent', {
+    label: label || null,
+    symbol_raw: symbolRaw,
+    symbol,
+    side: payload.side,
+    type: payload.type,
+    tif: payload.time_in_force,
+    qty: payload.qty ?? payload.notional ?? 'NA',
+    limit: payload.limit_price ?? 'NA',
+    reason: reason || null,
+  });
+}
+
 function logOrderResponse({ payload, response, error }) {
   const symbolRaw = payload?.symbol ?? '';
   const symbol = normalizePair(symbolRaw);
@@ -409,6 +426,41 @@ function logOrderResponse({ payload, response, error }) {
       symbol,
     });
   }
+}
+
+async function placeOrderUnified({
+  symbol,
+  url,
+  payload,
+  label,
+  reason,
+  context,
+}) {
+  logOrderIntent({ label, payload, reason });
+  logOrderPayload({ label, payload });
+  let response;
+  try {
+    response = await requestJson({
+      method: 'POST',
+      url,
+      headers: alpacaJsonHeaders(),
+      body: JSON.stringify(payload),
+    });
+    logOrderResponse({ label, payload, response });
+  } catch (err) {
+    logHttpError({ symbol, label: 'orders', url, error: err });
+    logOrderResponse({ label, payload, error: err });
+    if (isNetworkError(err)) {
+      logNetworkError({
+        type: 'order',
+        symbol,
+        attempts: err.attempts ?? 1,
+        context: context || label || null,
+      });
+    }
+    throw err;
+  }
+  return response;
 }
 
 async function requestJson({
@@ -589,6 +641,11 @@ function buildUrlWithParams(baseUrl, params = {}) {
 function buildClientOrderId(symbol, purpose) {
   const normalized = canonicalAsset(symbol) || 'UNKNOWN';
   return `${normalized}-${purpose}-${randomUUID()}`;
+}
+
+function buildExitClientOrderId(symbol) {
+  const normalized = canonicalAsset(symbol) || 'UNKNOWN';
+  return `EXIT-${normalized}-${Date.now()}`;
 }
 
 function logBuyDecision(symbol, computedNotionalUsd, decision) {
@@ -894,34 +951,14 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     limit_price: limitPrice,
     client_order_id: buildClientOrderId(normalizedSymbol, 'limit-buy'),
   };
-  logOrderPayload({ label: 'orders_limit_buy', payload: buyPayload });
-  let buyOrder;
-  try {
-    buyOrder = await requestJson({
-      method: 'POST',
-      url: buyOrderUrl,
-      headers: alpacaJsonHeaders(),
-      body: JSON.stringify(buyPayload),
-    });
-    logOrderResponse({ label: 'orders_limit_buy', payload: buyPayload, response: buyOrder });
-  } catch (err) {
-    logHttpError({
-      symbol: normalizedSymbol,
-      label: 'orders',
-      url: buyOrderUrl,
-      error: err,
-    });
-    logOrderResponse({ label: 'orders_limit_buy', payload: buyPayload, error: err });
-    if (isNetworkError(err)) {
-      logNetworkError({
-        type: 'order',
-        symbol: normalizedSymbol,
-        attempts: err.attempts ?? 1,
-        context: 'limit_buy',
-      });
-    }
-    throw err;
-  }
+  const buyOrder = await placeOrderUnified({
+    symbol: normalizedSymbol,
+    url: buyOrderUrl,
+    payload: buyPayload,
+    label: 'orders_limit_buy',
+    reason: 'limit_buy',
+    context: 'limit_buy',
+  });
 
  
 
@@ -1660,33 +1697,18 @@ async function submitLimitSell({
     qty: finalQty,
     side: 'sell',
     type: 'limit',
-    time_in_force: 'gtc',
+    time_in_force: isCryptoSymbol(symbol) ? 'ioc' : 'gtc',
     limit_price: limitPrice,
-    client_order_id: buildClientOrderId(symbol, 'limit-sell'),
+    client_order_id: buildExitClientOrderId(symbol),
   };
-  logOrderPayload({ label: 'orders_limit_sell', payload });
-  let response;
-  try {
-    response = await requestJson({
-      method: 'POST',
-      url,
-      headers: alpacaJsonHeaders(),
-      body: JSON.stringify(payload),
-    });
-    logOrderResponse({ label: 'orders_limit_sell', payload, response });
-  } catch (err) {
-    logHttpError({ symbol, label: 'orders', url, error: err });
-    logOrderResponse({ label: 'orders_limit_sell', payload, error: err });
-    if (isNetworkError(err)) {
-      logNetworkError({
-        type: 'order',
-        symbol,
-        attempts: err.attempts ?? 1,
-        context: 'limit_sell',
-      });
-    }
-    throw err;
-  }
+  const response = await placeOrderUnified({
+    symbol,
+    url,
+    payload,
+    label: 'orders_limit_sell',
+    reason,
+    context: 'limit_sell',
+  });
 
   console.log('submit_limit_sell', { symbol, qty, limitPrice, reason, orderId: response?.id });
 
@@ -1729,32 +1751,17 @@ async function submitMarketSell({
     qty: finalQty,
     side: 'sell',
     type: 'market',
-    time_in_force: 'gtc',
-    client_order_id: buildClientOrderId(symbol, 'market-sell'),
+    time_in_force: isCryptoSymbol(symbol) ? 'ioc' : 'gtc',
+    client_order_id: buildExitClientOrderId(symbol),
   };
-  logOrderPayload({ label: 'orders_market_sell', payload });
-  let response;
-  try {
-    response = await requestJson({
-      method: 'POST',
-      url,
-      headers: alpacaJsonHeaders(),
-      body: JSON.stringify(payload),
-    });
-    logOrderResponse({ label: 'orders_market_sell', payload, response });
-  } catch (err) {
-    logHttpError({ symbol, label: 'orders', url, error: err });
-    logOrderResponse({ label: 'orders_market_sell', payload, error: err });
-    if (isNetworkError(err)) {
-      logNetworkError({
-        type: 'order',
-        symbol,
-        attempts: err.attempts ?? 1,
-        context: 'market_sell',
-      });
-    }
-    throw err;
-  }
+  const response = await placeOrderUnified({
+    symbol,
+    url,
+    payload,
+    label: 'orders_market_sell',
+    reason,
+    context: 'market_sell',
+  });
 
   console.log('submit_market_sell', { symbol, qty, reason, orderId: response?.id });
 
@@ -2231,26 +2238,14 @@ async function placeMarketBuyThenSell(symbol) {
     time_in_force: 'gtc',
     client_order_id: buildClientOrderId(normalizedSymbol, 'market-buy'),
   };
-  logOrderPayload({ label: 'orders_market_buy', payload: buyPayload });
-  let buyOrder;
-  try {
-    buyOrder = await requestJson({
-      method: 'POST',
-      url: buyOrderUrl,
-      headers: alpacaJsonHeaders(),
-      body: JSON.stringify(buyPayload),
-    });
-    logOrderResponse({ label: 'orders_market_buy', payload: buyPayload, response: buyOrder });
-  } catch (err) {
-    logHttpError({
-      symbol: normalizedSymbol,
-      label: 'orders',
-      url: buyOrderUrl,
-      error: err,
-    });
-    logOrderResponse({ label: 'orders_market_buy', payload: buyPayload, error: err });
-    throw err;
-  }
+  const buyOrder = await placeOrderUnified({
+    symbol: normalizedSymbol,
+    url: buyOrderUrl,
+    payload: buyPayload,
+    label: 'orders_market_buy',
+    reason: 'market_buy',
+    context: 'market_buy',
+  });
 
  
 
@@ -2356,6 +2351,10 @@ async function submitOrder(order = {}) {
 
     notional,
 
+    client_order_id,
+
+    reason,
+
   } = order;
 
   const normalizedSymbol = normalizeSymbol(rawSymbol);
@@ -2366,7 +2365,8 @@ async function submitOrder(order = {}) {
   const finalType = isCrypto && !allowedCryptoTypes.has(typeLower) ? 'market' : (typeLower || 'market');
   const rawTif = String(time_in_force || '').toLowerCase();
   const allowedCryptoTifs = new Set(['gtc', 'ioc', 'fok']);
-  const finalTif = isCrypto ? (allowedCryptoTifs.has(rawTif) ? rawTif : 'gtc') : (rawTif || time_in_force);
+  const defaultCryptoTif = sideLower === 'sell' ? 'ioc' : 'gtc';
+  const finalTif = isCrypto ? (allowedCryptoTifs.has(rawTif) ? rawTif : defaultCryptoTif) : (rawTif || time_in_force);
   let qtyNum = Number(qty);
   const limitPriceNum = Number(limit_price);
 
@@ -2462,33 +2462,16 @@ async function submitOrder(order = {}) {
     limit_price: Number.isFinite(limitPriceNum) ? limitPriceNum : undefined,
     qty: useQty ? finalQty : undefined,
     notional: useNotional ? finalNotional : undefined,
-    client_order_id: buildClientOrderId(normalizedSymbol, 'order'),
+    client_order_id: client_order_id || buildClientOrderId(normalizedSymbol, 'order'),
   };
-  logOrderPayload({ label: 'orders_submit', payload });
-  let response;
-  try {
-    response = await requestJson({
-      method: 'POST',
-      url,
-      headers: alpacaJsonHeaders(),
-      body: JSON.stringify(payload),
-    });
-    logOrderResponse({ label: 'orders_submit', payload, response });
-  } catch (err) {
-    logHttpError({ symbol: normalizedSymbol, label: 'orders', url, error: err });
-    logOrderResponse({ label: 'orders_submit', payload, error: err });
-    if (isNetworkError(err)) {
-      logNetworkError({
-        type: 'order',
-        symbol: normalizedSymbol,
-        attempts: err.attempts ?? 1,
-        context: 'submit_order',
-      });
-    }
-    throw err;
-  }
-
-  return response;
+  return placeOrderUnified({
+    symbol: normalizedSymbol,
+    url,
+    payload,
+    label: 'orders_submit',
+    reason,
+    context: 'submit_order',
+  });
 
 }
 
