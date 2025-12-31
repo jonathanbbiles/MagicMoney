@@ -2,6 +2,7 @@ import React, { useCallback, useRef, useState } from 'react';
 import { ActivityIndicator, Text, TextInput, TouchableOpacity, View } from 'react-native';
 
 import { getActivities } from '../services/alpacaClient';
+import { normalizePair } from '../utils/symbols';
 
 export const TxnHistoryCSVViewer = ({ styles }) => {
   const [busy, setBusy] = useState(false);
@@ -36,7 +37,7 @@ export const TxnHistoryCSVViewer = ({ styles }) => {
       const dtISO = r.transaction_time || r.date || '';
       const local = dtISO ? new Date(dtISO).toLocaleString() : '';
       const side = r.side || '';
-      const symbol = r.symbol || '';
+      const symbol = normalizePair(r.symbol || '');
       const qty = r.qty || r.cum_qty || '';
       const price = r.price || '';
       let cash = '';

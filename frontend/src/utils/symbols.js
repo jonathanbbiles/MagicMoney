@@ -1,60 +1,71 @@
 const SYMBOL_CANONICAL_MAP = new Map([
-  ['BCH/USD', 'BCHUSD'],
-  ['BCH-USD', 'BCHUSD'],
-  ['UNI/USD', 'UNIUSD'],
-  ['UNI-USD', 'UNIUSD'],
-  ['LTC/USD', 'LTCUSD'],
-  ['LTC-USD', 'LTCUSD'],
-  ['XRP/USD', 'XRPUSD'],
-  ['XRP-USD', 'XRPUSD'],
-  ['BTC/USD', 'BTCUSD'],
-  ['BTC-USD', 'BTCUSD'],
-  ['ETH/USD', 'ETHUSD'],
-  ['ETH-USD', 'ETHUSD'],
-  ['SOL/USD', 'SOLUSD'],
-  ['SOL-USD', 'SOLUSD'],
-  ['AAVE/USD', 'AAVEUSD'],
-  ['AAVE-USD', 'AAVEUSD'],
+  ['BCH/USD', 'BCH/USD'],
+  ['BCH-USD', 'BCH/USD'],
+  ['UNI/USD', 'UNI/USD'],
+  ['UNI-USD', 'UNI/USD'],
+  ['LTC/USD', 'LTC/USD'],
+  ['LTC-USD', 'LTC/USD'],
+  ['XRP/USD', 'XRP/USD'],
+  ['XRP-USD', 'XRP/USD'],
+  ['BTC/USD', 'BTC/USD'],
+  ['BTC-USD', 'BTC/USD'],
+  ['ETH/USD', 'ETH/USD'],
+  ['ETH-USD', 'ETH/USD'],
+  ['SOL/USD', 'SOL/USD'],
+  ['SOL-USD', 'SOL/USD'],
+  ['AAVE/USD', 'AAVE/USD'],
+  ['AAVE-USD', 'AAVE/USD'],
 ]);
 
-export function toInternalSymbol(sym) {
+export function normalizePair(sym) {
   if (!sym) return sym;
   const t = String(sym).trim().toUpperCase();
   if (SYMBOL_CANONICAL_MAP.has(t)) return SYMBOL_CANONICAL_MAP.get(t);
-  if (t.includes('/')) return t.replace(/\//g, '');
-  if (t.endsWith('-USD')) return t.replace(/-USD$/, 'USD');
-  if (t.endsWith('/USD')) return t.replace(/\/USD$/, 'USD');
+  if (t.includes('/')) {
+    const [base, quote] = t.split('/');
+    if (!base) return t;
+    return `${base}/${quote || 'USD'}`;
+  }
+  if (t.includes('-')) {
+    const [base, quote] = t.split('-');
+    if (!base) return t;
+    return `${base}/${quote || 'USD'}`;
+  }
+  if (t.endsWith('USD') && t.length > 3) {
+    return `${t.slice(0, -3)}/USD`;
+  }
   return t;
 }
 
+export function alpacaSymbol(pair) {
+  if (!pair) return pair;
+  const normalized = normalizePair(pair);
+  return normalized ? normalized.replace('/', '') : normalized;
+}
+
+export function toInternalSymbol(sym) {
+  return normalizePair(sym);
+}
+
 export function toAlpacaCryptoSymbol(sym) {
-  if (!sym) return sym;
-  const internal = toInternalSymbol(sym);
-  if (internal.includes('/')) return internal;
-  if (internal.endsWith('USD')) {
-    const base = internal.slice(0, -3);
-    if (!base || base.toUpperCase().endsWith('USD')) return `${internal}/USD`;
-    return `${base}/USD`;
-  }
-  return internal;
+  return normalizePair(sym);
 }
 
 export function normalizeCryptoSymbol(sym) {
-  if (!sym) return sym;
-  return toAlpacaCryptoSymbol(sym);
+  return normalizePair(sym);
 }
 
 export function toTradeSymbol(sym) {
-  return toInternalSymbol(sym);
+  return alpacaSymbol(sym);
 }
 
 export function toDataSymbol(sym) {
-  return toAlpacaCryptoSymbol(sym);
+  return normalizePair(sym);
 }
 
 export function isCrypto(sym) {
-  const normalized = toInternalSymbol(sym);
-  return /USD$/.test(normalized || '');
+  const normalized = normalizePair(sym);
+  return /\/USD$/.test(normalized || '');
 }
 
 export function isStock(sym) {
