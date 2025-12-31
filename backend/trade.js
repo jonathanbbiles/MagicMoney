@@ -9,7 +9,7 @@ const {
   normalizeQuoteAgeMs,
   isStaleQuoteAge,
 } = require('./quoteUtils');
-const { canonicalPair, canonicalAsset } = require('./symbolUtils');
+const { canonicalAsset, normalizePair, alpacaSymbol } = require('./symbolUtils');
 
 const RAW_TRADE_BASE = process.env.TRADE_BASE || process.env.ALPACA_API_BASE || 'https://api.alpaca.markets';
 const RAW_DATA_BASE = process.env.DATA_BASE || 'https://data.alpaca.markets';
@@ -205,11 +205,11 @@ function buildAlpacaUrl({ baseUrl, path, params, label }) {
 }
 
 function toTradeSymbol(rawSymbol) {
-  return canonicalPair(rawSymbol);
+  return alpacaSymbol(rawSymbol);
 }
 
 function toDataSymbol(rawSymbol) {
-  return canonicalPair(rawSymbol);
+  return normalizePair(rawSymbol);
 }
 
 const supportedCryptoPairsState = {
@@ -350,24 +350,49 @@ function logHttpError({ symbol, label, url, error }) {
 
 function logOrderPayload({ payload }) {
   if (!payload) return;
-  const symbol = normalizeSymbol(payload.symbol);
-  const notional = payload.notional ?? 'NA';
+  const symbolRaw = payload.symbol ?? '';
+  const symbol = normalizePair(symbolRaw);
   const qty = payload.qty ?? 'NA';
   const limit = payload.limit_price ?? 'NA';
-  console.log(
-    `ORDER_SUBMIT symbol=${symbol} side=${payload.side} type=${payload.type} tif=${payload.time_in_force} notional=${notional} qty=${qty} limit=${limit}`
-  );
+  let notional = payload.notional ?? null;
+  if (!Number.isFinite(Number(notional)) && Number.isFinite(Number(qty)) && Number.isFinite(Number(limit))) {
+    notional = Number(qty) * Number(limit);
+  }
+  const notionalLogged = notional ?? 'NA';
+  console.log('order_submit', {
+    symbol_raw: symbolRaw,
+    symbol,
+    side: payload.side,
+    type: payload.type,
+    tif: payload.time_in_force,
+    qty,
+    notional: notionalLogged,
+    limit,
+  });
 }
 
 function logOrderResponse({ payload, response, error }) {
-  const symbol = normalizeSymbol(payload?.symbol || '');
+  const symbolRaw = payload?.symbol ?? '';
+  const symbol = normalizePair(symbolRaw);
   if (response?.id) {
-    console.log(`ORDER_OK id=${response.id} status=${response.status || response.order_status || 'accepted'} symbol=${symbol}`);
+    console.log('order_ok', {
+      id: response.id,
+      status: response.status || response.order_status || 'accepted',
+      symbol_raw: symbolRaw,
+      symbol,
+    });
     return;
   }
   if (response) {
     const body = JSON.stringify(response);
-    console.warn(`ORDER_FAIL http=NA code=NA message=invalid_order_response body=${body}`);
+    console.warn('order_fail', {
+      http: 'NA',
+      code: 'NA',
+      message: 'invalid_order_response',
+      body,
+      symbol_raw: symbolRaw,
+      symbol,
+    });
     return;
   }
   if (error) {
@@ -375,7 +400,14 @@ function logOrderResponse({ payload, response, error }) {
     const code = error?.errorCode ?? 'NA';
     const message = error?.errorMessage || error?.message || 'Unknown error';
     const body = error?.responseSnippet200 || error?.responseSnippet || '';
-    console.warn(`ORDER_FAIL http=${httpStatus} code=${code} message=${message} body=${body}`);
+    console.warn('order_fail', {
+      http: httpStatus,
+      code,
+      message,
+      body,
+      symbol_raw: symbolRaw,
+      symbol,
+    });
   }
 }
 
@@ -523,11 +555,8 @@ function isDustQty(qty) {
 }
 
 function normalizeSymbol(rawSymbol) {
-
   if (!rawSymbol) return rawSymbol;
-
-  return canonicalPair(rawSymbol);
-
+  return normalizePair(rawSymbol);
 }
 
 function logQuoteTimestampDebug({ symbol, rawTs, source }) {
@@ -846,7 +875,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
   if (sizeGuard.skip) {
     return { skipped: true, reason: 'below_min_trade', notionalUsd: sizeGuard.notional };
   }
-  const finalQty = sizeGuard.qty ?? qty;
+  const finalQty = sizeGuard.qty ?? adjustedQty;
 
   // submit the limit buy order
 
@@ -975,9 +1004,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 // Fetch latest trade price for a symbol
 
 function isCryptoSymbol(symbol) {
-
-  return Boolean(symbol && canonicalPair(symbol).endsWith('/USD'));
-
+  return Boolean(symbol && normalizePair(symbol).endsWith('/USD'));
 }
 
 async function getLatestPrice(symbol) {
@@ -1122,11 +1149,16 @@ async function fetchClock() {
 
 async function fetchPositions() {
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions' });
-  return requestJson({
+  const res = await requestJson({
     method: 'GET',
     url,
     headers: alpacaHeaders(),
   });
+  const positions = Array.isArray(res) ? res : [];
+  return positions.map((pos) => ({
+    ...pos,
+    symbol: normalizeSymbol(pos.symbol),
+  }));
 }
 
 async function fetchPosition(symbol) {
@@ -1157,6 +1189,17 @@ async function fetchAsset(symbol) {
   });
 }
 
+async function getAvailablePositionQty(symbol) {
+  try {
+    const pos = await fetchPosition(symbol);
+    const qty = Number(pos?.qty_available ?? pos?.available ?? pos?.qty ?? pos?.quantity ?? 0);
+    return Number.isFinite(qty) ? qty : 0;
+  } catch (err) {
+    if (err?.statusCode === 404) return 0;
+    throw err;
+  }
+}
+
  
 
 // Round quantities to Alpaca's supported crypto precision
@@ -1182,7 +1225,8 @@ function guardTradeSize({ symbol, qty, notional, price, side, context }) {
   }
 
   if (Number.isFinite(roundedQty) && roundedQty > 0 && roundedQty < MIN_TRADE_QTY) {
-    logSkip('below_min_trade', {
+    const reason = String(side || '').toLowerCase() === 'sell' ? 'below_min_order_size' : 'below_min_trade';
+    logSkip(reason, {
       symbol,
       side,
       qty: roundedQty,
@@ -1193,7 +1237,8 @@ function guardTradeSize({ symbol, qty, notional, price, side, context }) {
   }
 
   if (Number.isFinite(computedNotional) && computedNotional < MIN_ORDER_NOTIONAL_USD) {
-    logSkip('below_min_trade', {
+    const reason = String(side || '').toLowerCase() === 'sell' ? 'below_min_order_size' : 'below_min_trade';
+    logSkip(reason, {
       symbol,
       side,
       notionalUsd: computedNotional,
@@ -1214,6 +1259,12 @@ function roundPrice(price) {
 
   return parseFloat(Number(price).toFixed(2));
 
+}
+
+function roundToTick(price, tick = PRICE_TICK) {
+  if (!Number.isFinite(price)) return price;
+  const tickSize = Number.isFinite(tick) && tick > 0 ? tick : 0.01;
+  return Math.ceil(price / tickSize) * tickSize;
 }
 
 async function fetchFallbackTradeQuote(symbol, nowMs) {
@@ -1581,9 +1632,17 @@ async function submitLimitSell({
 
 }) {
 
+  const availableQty = await getAvailablePositionQty(symbol);
+  if (!(availableQty > 0)) {
+    logSkip('no_position_qty', { symbol, qty, availableQty, context: 'limit_sell' });
+    return { skipped: true, reason: 'no_position_qty' };
+  }
+  const qtyNum = Number(qty);
+  const adjustedQty = Number.isFinite(qtyNum) && qtyNum > 0 ? Math.min(qtyNum, availableQty) : availableQty;
+
   const sizeGuard = guardTradeSize({
     symbol,
-    qty,
+    qty: adjustedQty,
     price: Number(limitPrice),
     side: 'sell',
     context: 'limit_sell',
@@ -1643,16 +1702,24 @@ async function submitMarketSell({
 
 }) {
 
+  const availableQty = await getAvailablePositionQty(symbol);
+  if (!(availableQty > 0)) {
+    logSkip('no_position_qty', { symbol, qty, availableQty, context: 'market_sell' });
+    return { skipped: true, reason: 'no_position_qty' };
+  }
+  const qtyNum = Number(qty);
+  const adjustedQty = Number.isFinite(qtyNum) && qtyNum > 0 ? Math.min(qtyNum, availableQty) : availableQty;
+
   const sizeGuard = guardTradeSize({
     symbol,
-    qty,
+    qty: adjustedQty,
     side: 'sell',
     context: 'market_sell',
   });
   if (sizeGuard.skip) {
     return { skipped: true, reason: 'below_min_trade' };
   }
-  const finalQty = sizeGuard.qty ?? qty;
+  const finalQty = sizeGuard.qty ?? adjustedQty;
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_market_sell' });
   const payload = {
@@ -1713,7 +1780,7 @@ async function handleBuyFill({
 
   const minNetProfitBps = await feeAwareMinProfitBps(symbol, notionalUsd);
 
-  const targetPrice = roundPrice(entryPriceNum * (1 + minNetProfitBps / 10000));
+  const targetPrice = roundToTick(entryPriceNum * (1 + minNetProfitBps / 10000));
 
   const sellOrder = await submitLimitSell({
 
@@ -1977,7 +2044,7 @@ async function manageExitStates() {
 
             await cancelOrderSafe(state.sellOrderId);
 
-            const newLimit = roundPrice(Math.max(state.targetPrice, ask - PRICE_TICK));
+            const newLimit = roundToTick(Math.max(state.targetPrice, ask - PRICE_TICK));
 
             const replacement = await submitLimitSell({
 
@@ -2298,7 +2365,7 @@ async function submitOrder(order = {}) {
   const rawTif = String(time_in_force || '').toLowerCase();
   const allowedCryptoTifs = new Set(['gtc', 'ioc', 'fok']);
   const finalTif = isCrypto ? (allowedCryptoTifs.has(rawTif) ? rawTif : 'gtc') : (rawTif || time_in_force);
-  const qtyNum = Number(qty);
+  let qtyNum = Number(qty);
   const limitPriceNum = Number(limit_price);
 
   let computedNotionalUsd = Number(notional);
@@ -2317,6 +2384,27 @@ async function submitOrder(order = {}) {
 
     }
 
+  }
+
+  if (sideLower === 'sell') {
+    const availableQty = await getAvailablePositionQty(normalizedSymbol);
+    if (!(availableQty > 0)) {
+      logSkip('no_position_qty', {
+        symbol: normalizedSymbol,
+        qty: qtyNum,
+        availableQty,
+        context: 'submit_order',
+      });
+      return { skipped: true, reason: 'no_position_qty' };
+    }
+    if (!Number.isFinite(qtyNum) || qtyNum <= 0) {
+      qtyNum = availableQty;
+    } else {
+      qtyNum = Math.min(qtyNum, availableQty);
+    }
+    if (Number.isFinite(qtyNum) && qtyNum > 0 && Number.isFinite(limitPriceNum) && limitPriceNum > 0) {
+      computedNotionalUsd = qtyNum * limitPriceNum;
+    }
   }
 
   if (sideLower === 'buy') {
@@ -2356,7 +2444,7 @@ async function submitOrder(order = {}) {
   if (sizeGuard.skip) {
     return { skipped: true, reason: 'below_min_trade', notionalUsd: sizeGuard.notional };
   }
-  const finalQty = sizeGuard.qty ?? qty;
+  const finalQty = sizeGuard.qty ?? qtyNum ?? qty;
   const finalNotional = sizeGuard.notional ?? notional;
   const hasQty = Number.isFinite(Number(finalQty)) && Number(finalQty) > 0;
   const hasNotional = Number.isFinite(Number(finalNotional)) && Number(finalNotional) > 0;
@@ -2403,10 +2491,14 @@ async function submitOrder(order = {}) {
 }
 
 async function fetchOrders(params = {}) {
+  const resolvedParams = { ...(params || {}) };
+  if (String(resolvedParams.status || '').toLowerCase() === 'open') {
+    delete resolvedParams.symbol;
+  }
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
     path: 'orders',
-    params,
+    params: resolvedParams,
     label: 'orders_list',
   });
   let response;

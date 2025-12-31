@@ -8,7 +8,7 @@ import {
 import { getSettings } from '../state/settingsStore';
 import { isoDaysAgo, isFresh, parseTsMs } from '../utils/format';
 import { rateLimitedFetch as fetchWithBudget, sleep } from '../utils/network';
-import { isStock, toAlpacaCryptoSymbol, toInternalSymbol } from '../utils/symbols';
+import { isStock, normalizePair, toAlpacaCryptoSymbol, toInternalSymbol } from '../utils/symbols';
 
 let logHandler = () => {};
 export const registerAlpacaLogger = (fn) => {
@@ -565,7 +565,12 @@ export const getAllPositions = async () => {
     const res = await fetchWithBudget(`${ALPACA_BASE_URL}/positions`, { headers: HEADERS });
     if (!res.ok) return [];
     const arr = await res.json();
-    return Array.isArray(arr) ? arr : [];
+    return Array.isArray(arr)
+      ? arr.map((pos) => ({
+        ...pos,
+        symbol: normalizePair(pos.symbol),
+      }))
+      : [];
   } catch (err) {
     log('positions_error', 'POSITIONS', { message: err?.message });
     return [];
@@ -587,7 +592,12 @@ export const getOpenOrders = async () => {
     });
     if (!res.ok) return [];
     const arr = await res.json();
-    return Array.isArray(arr) ? arr : [];
+    return Array.isArray(arr)
+      ? arr.map((order) => ({
+        ...order,
+        symbol: normalizePair(order.symbol),
+      }))
+      : [];
   } catch (err) {
     log('orders_error', 'ORDERS', { message: err?.message });
     return [];
@@ -604,9 +614,12 @@ export const getOpenOrdersCached = async (ttlMs = 2000) => {
 
 export const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
   try {
+    const normalizedSymbol = normalizePair(symbol);
     const open = await getOpenOrdersCached();
     const targets = (open || []).filter(
-      (o) => o.symbol === symbol && (!side || (o.side || '').toLowerCase() === String(side).toLowerCase())
+      (o) =>
+        normalizePair(o.symbol) === normalizedSymbol &&
+        (!side || (o.side || '').toLowerCase() === String(side).toLowerCase())
     );
     await Promise.all(
       targets.map((o) =>

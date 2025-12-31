@@ -1,4 +1,4 @@
-function canonicalPair(rawSymbol) {
+function normalizePair(rawSymbol) {
   if (!rawSymbol) return rawSymbol;
   const symbol = String(rawSymbol).trim().toUpperCase();
   if (!symbol) return symbol;
@@ -18,14 +18,23 @@ function canonicalPair(rawSymbol) {
   return symbol;
 }
 
-function canonicalAsset(rawSymbol) {
-  if (!rawSymbol) return rawSymbol;
-  const pair = canonicalPair(rawSymbol);
+function alpacaSymbol(pair) {
   if (!pair) return pair;
-  return pair.replace('/', '');
+  const normalized = normalizePair(pair);
+  return normalized ? normalized.replace('/', '') : normalized;
+}
+
+function canonicalPair(rawSymbol) {
+  return normalizePair(rawSymbol);
+}
+
+function canonicalAsset(rawSymbol) {
+  return alpacaSymbol(rawSymbol);
 }
 
 module.exports = {
   canonicalPair,
   canonicalAsset,
+  normalizePair,
+  alpacaSymbol,
 };

@@ -18,7 +18,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
-const canonicalPair = (sym) => {
+const normalizePair = (sym) => {
   if (!sym) return '';
   const raw = String(sym).trim().toUpperCase();
   if (!raw) return '';
@@ -38,16 +38,18 @@ const canonicalPair = (sym) => {
   return raw;
 };
 
-const canonicalAsset = (sym) => {
+const alpacaSymbol = (sym) => {
   if (!sym) return '';
-  const pair = canonicalPair(sym);
+  const pair = normalizePair(sym);
   return pair ? pair.replace('/', '') : pair;
 };
 
-const toInternalSymbol = (sym) => canonicalPair(sym);
-const toAlpacaCryptoSymbol = (sym) => canonicalPair(sym);
-const normalizeCryptoSymbol = (sym) => canonicalPair(sym);
-const isCrypto = (sym) => canonicalPair(sym).endsWith('/USD');
+const canonicalAsset = (sym) => alpacaSymbol(sym);
+
+const toInternalSymbol = (sym) => normalizePair(sym);
+const toAlpacaCryptoSymbol = (sym) => normalizePair(sym);
+const normalizeCryptoSymbol = (sym) => normalizePair(sym);
+const isCrypto = (sym) => normalizePair(sym).endsWith('/USD');
 const isStock = (sym) => !isCrypto(sym);
 
 // SAFETY PATCH NOTES:
@@ -1319,7 +1321,7 @@ const barsCacheTTL = 30000; // 30 seconds
 
 /* ─────────────────────────────── 12) CRYPTO DATA API ─────────────────────────────── */
 const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
-  const normalized = symbols.map((s) => canonicalPair(s)).join(',');
+  const normalized = symbols.map((s) => normalizePair(s)).join(',');
   return buildBackendUrl({
     path: `market/crypto/${what}`,
     params: { symbols: normalized, location: loc, ...params },
@@ -1330,7 +1332,7 @@ const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
 async function getCryptoQuotesBatch(symbols = []) {
   const internalSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
   if (!internalSymbols.length) return new Map();
-  const dataSymbols = internalSymbols.map((s) => canonicalPair(s));
+  const dataSymbols = internalSymbols.map((s) => normalizePair(s));
   const now = Date.now();
   for (const loc of DATA_LOCATIONS) {
     try {
@@ -1339,7 +1341,7 @@ async function getCryptoQuotesBatch(symbols = []) {
       const raw = j?.quotes || {};
       const out = new Map();
       for (const symbol of internalSymbols) {
-        const dataSymbol = canonicalPair(symbol);
+        const dataSymbol = normalizePair(symbol);
         const q = Array.isArray(raw[dataSymbol]) ? raw[dataSymbol][0] : raw[dataSymbol];
         if (!q) {
           console.warn(`NO_QUOTE symbol=${symbol}`);
@@ -1406,7 +1408,7 @@ async function getCryptoQuotesBatch(symbols = []) {
 async function getCryptoTradesBatch(symbols = []) {
   const internalSymbols = symbols.map((s) => toInternalSymbol(s)).filter(Boolean);
   if (!internalSymbols.length) return new Map();
-  const dataSymbols = internalSymbols.map((s) => canonicalPair(s));
+  const dataSymbols = internalSymbols.map((s) => normalizePair(s));
   for (const loc of DATA_LOCATIONS) {
     try {
       const url = buildURLCrypto(loc, 'trades', dataSymbols);
@@ -1414,7 +1416,7 @@ async function getCryptoTradesBatch(symbols = []) {
       const raw = j?.trades || {};
       const out = new Map();
       for (const symbol of internalSymbols) {
-        const dataSymbol = canonicalPair(symbol);
+        const dataSymbol = normalizePair(symbol);
         const t = Array.isArray(raw[dataSymbol]) ? raw[dataSymbol][0] : raw[dataSymbol];
         const p = Number(t?.p ?? t?.price);
         const tms = parseQuoteTimestampMs({ symbol, rawFields: t, source: 'crypto_trade' });
@@ -1432,7 +1434,7 @@ async function getCryptoTradesBatch(symbols = []) {
 }
 async function getCryptoBars1m(symbol, limit = 6) {
   const internalSymbol = toInternalSymbol(symbol);
-  const dataSymbol = canonicalPair(internalSymbol);
+  const dataSymbol = normalizePair(internalSymbol);
   const cached = barsCache.get(internalSymbol);
   const now = Date.now();
   if (cached && (now - cached.ts) < barsCacheTTL) {
@@ -1471,7 +1473,7 @@ async function getCryptoBars1m(symbol, limit = 6) {
 async function getCryptoBars1mBatch(symbols = [], limit = 6) {
   const uniqSyms = Array.from(new Set(symbols.map((s) => toInternalSymbol(s)).filter(Boolean)));
   if (!uniqSyms.length) return new Map();
-  const dsymList = uniqSyms.map((s) => canonicalPair(s));
+  const dsymList = uniqSyms.map((s) => normalizePair(s));
   const out = new Map();
   const now = Date.now();
 
@@ -1490,13 +1492,13 @@ async function getCryptoBars1mBatch(symbols = [], limit = 6) {
     try {
       const url = buildBackendUrl({
         path: 'market/crypto/bars',
-        params: { timeframe: '1Min', limit: String(limit), symbols: missing.map((s) => canonicalPair(s)).join(','), location: loc },
+        params: { timeframe: '1Min', limit: String(limit), symbols: missing.map((s) => normalizePair(s)).join(','), location: loc },
         label: 'crypto_bars_batch',
       });
       const j = await fetchMarketData('BARS', url, { headers: BACKEND_HEADERS });
       const raw = j?.bars || {};
       for (const symbol of missing) {
-        const dataSymbol = canonicalPair(symbol);
+        const dataSymbol = normalizePair(symbol);
         const arr = raw[dataSymbol];
         if (Array.isArray(arr) && arr.length) {
           const bars = arr.map((b) => ({
@@ -1607,7 +1609,7 @@ async function cryptoDailyBars(symbols = [], limit = 10) {
   const out = new Map();
   for (const loc of DATA_LOCATIONS) {
     try {
-      const ds = uniq.map((s) => canonicalPair(s)).join(',');
+      const ds = uniq.map((s) => normalizePair(s)).join(',');
       const url = buildBackendUrl({
         path: 'market/crypto/bars',
         params: { timeframe: '1Day', limit: String(limit), symbols: ds, location: loc },
@@ -1616,7 +1618,7 @@ async function cryptoDailyBars(symbols = [], limit = 10) {
       const j = await fetchMarketData('BARS', url, { headers: BACKEND_HEADERS });
       const raw = j?.bars || {};
       for (const sym of uniq) {
-        const dataSymbol = canonicalPair(sym);
+        const dataSymbol = normalizePair(sym);
         const arr = raw[dataSymbol];
         if (Array.isArray(arr) && arr.length) {
           out.set(sym, arr.map(b => ({
@@ -1873,6 +1875,7 @@ const logTradeAction = async (type, symbol, details = {}) => {
 };
 const FRIENDLY = {
   quote_ok: { sev: 'info', msg: (d) => `Quote OK (${(d.spreadBps ?? 0).toFixed(1)} bps)` },
+  ev_debug: { sev: 'info', msg: (d) => `EV debug (ev=${d.evBps ?? 'n/a'}bps, tp=${d.tpBps ?? 'n/a'}bps)` },
   quote_stale: { sev: 'warn', msg: (d) => `Quote STALE (${(d.spreadBps ?? 0).toFixed(1)} bps)` },
   quote_http_error: { sev: 'warn', msg: (d) => `Alpaca ${d.symbol || 'quotes'} ${d.status}${d.loc ? ' • ' + d.loc : ''}${d.body ? ' • ' + d.body : ''}` },
   quote_exception:  { sev: 'error', msg: (d) => `Quote/Order exception: ${d?.error ?? ''}` },
@@ -2427,7 +2430,7 @@ const getAllPositions = async () => {
     return Array.isArray(arr)
       ? arr.map((pos) => ({
         ...pos,
-        symbol: canonicalPair(pos.symbol),
+        symbol: normalizePair(pos.symbol),
       }))
       : [];
   } catch { return []; }
@@ -2440,7 +2443,7 @@ const getOrdersByStatus = async (status = 'open') => {
     return Array.isArray(arr)
       ? arr.map((order) => ({
         ...order,
-        symbol: canonicalPair(order.symbol),
+        symbol: normalizePair(order.symbol),
       }))
       : [];
   } catch { return []; }
@@ -2543,7 +2546,7 @@ async function getUsableBuyingPower({ forCrypto = true } = {}) {
       if (side !== 'buy') continue;
 
       const sym = o.symbol || '';
-      const isCryptoSym = canonicalPair(sym).endsWith('/USD');
+      const isCryptoSym = normalizePair(sym).endsWith('/USD');
       if (forCrypto !== isCryptoSym) continue;
 
       const qty  = +o.qty || +o.quantity || NaN;
@@ -2587,7 +2590,16 @@ const cancelAllOrders = async () => {
 
 async function getOpenSellOrderBySymbol(symbol, cached = null) {
   const open = cached || (await getOpenOrdersCached());
-  return (open || []).find((o) => (o.side || '').toLowerCase() === 'sell' && o.symbol === symbol) || null;
+  const normalizedSymbol = normalizePair(symbol);
+  return (
+    (open || []).find((o) => {
+      const side = (o.side || '').toLowerCase();
+      if (side !== 'sell') return false;
+      const orderSymbol = normalizePair(o.symbol);
+      if (orderSymbol !== normalizedSymbol) return false;
+      return true;
+    }) || null
+  );
 }
 
 async function cancelOrder(orderId) {
@@ -3286,6 +3298,7 @@ function validateOrderCandidate({
   quantizeQty,
   autoBumpMinNotional = AUTO_BUMP_MIN_NOTIONAL,
 }) {
+  const sideLower = String(side || '').toLowerCase();
   const resolvedMinNotional = Number.isFinite(minNotional) && minNotional > 0 ? minNotional : MIN_ORDER_NOTIONAL_USD;
   let resolvedNotional = Number.isFinite(computedNotional) ? computedNotional : null;
   if (!Number.isFinite(resolvedNotional) && Number.isFinite(qty) && qty > 0 && Number.isFinite(price) && price > 0) {
@@ -3295,26 +3308,28 @@ function validateOrderCandidate({
   const fundingNotional = Number.isFinite(resolvedNotional)
     ? Math.max(resolvedNotional, resolvedMinNotional)
     : resolvedMinNotional;
-  const hasFunding = Number.isFinite(buyingPower)
-    ? (Number.isFinite(fundingNotional) ? buyingPower >= fundingNotional : buyingPower > 0)
-    : true;
+  if (sideLower === 'buy') {
+    const hasFunding = Number.isFinite(buyingPower)
+      ? (Number.isFinite(fundingNotional) ? buyingPower >= fundingNotional : buyingPower > 0)
+      : true;
 
-  if (!hasFunding) {
-    logTradeAction('skip_small_order', symbol, {
-      reason: 'insufficient_funding',
-      buyingPower,
-      cash,
-      requiredNotional: fundingNotional,
-      reserve,
-    });
-    console.log(`${symbol} — Skip: insufficient_funding`, { buyingPower, requiredNotional: fundingNotional, reserve });
-    return {
-      decision: 'SKIP_insufficient_funding',
-      reason: 'insufficient_funding',
-      qty,
-      computedNotional: resolvedNotional,
-      minNotional: resolvedMinNotional,
-    };
+    if (!hasFunding) {
+      logTradeAction('skip_small_order', symbol, {
+        reason: 'insufficient_funding',
+        buyingPower,
+        cash,
+        requiredNotional: fundingNotional,
+        reserve,
+      });
+      console.log(`${symbol} — Skip: insufficient_funding`, { buyingPower, requiredNotional: fundingNotional, reserve });
+      return {
+        decision: 'SKIP_insufficient_funding',
+        reason: 'insufficient_funding',
+        qty,
+        computedNotional: resolvedNotional,
+        minNotional: resolvedMinNotional,
+      };
+    }
   }
 
   if (Number.isFinite(requiredNotional) && requiredNotional < resolvedMinNotional) {
@@ -3828,42 +3843,48 @@ const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
  * Fee-aware TP posting + taker touch exit using *dynamic buy bps* (maker/taker).
  */
 const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, openSellBySym, pos } = {}) => {
+  const normalizedSymbol = normalizePair(symbol);
   const posInfo = pos ?? await getPositionInfo(symbol);
   if (!posInfo || posInfo.available <= 0) return;
 
-  const state = (tradeStateRef?.current?.[symbol]) || {};
+  const state = (tradeStateRef?.current?.[normalizedSymbol]) || {};
   const entryPx = state.entry ?? posInfo.basis ?? posInfo.mark ?? 0;
   const qty = Number(posInfo.available ?? 0);
   if (!(entryPx > 0) || !(qty > 0)) return;
 
-  const riskExited = await ensureRiskExits(symbol, { tradeStateRef, pos: posInfo });
+  const riskExited = await ensureRiskExits(normalizedSymbol, { tradeStateRef, pos: posInfo });
   if (riskExited) return;
 
   const heldMinutes = (Date.now() - (state.entryTs || 0)) / 60000;
   if (Number.isFinite(heldMinutes) && heldMinutes >= SETTINGS.maxHoldMin) {
     try {
-      const q = await getQuoteSmart(symbol);
+      const q = await getQuoteSmart(normalizedSymbol);
       if (q && q.bid > 0) {
         const net = projectedNetPnlUSDWithBuy({
-          symbol, entryPx, qty, sellPx: q.bid, buyBpsOverride: state.buyBpsApplied
+          symbol: normalizedSymbol, entryPx, qty, sellPx: q.bid, buyBpsOverride: state.buyBpsApplied
         });
         const feeFloor = minExitPriceFeeAwareDynamic({
-          symbol, entryPx, qty, buyBpsOverride: state.buyBpsApplied
+          symbol: normalizedSymbol, entryPx, qty, buyBpsOverride: state.buyBpsApplied
         });
         const tick = isStock(symbol) ? 0.01 : 1e-5;
         const nearFeeFloor = q.bid >= (feeFloor - (2 * tick)); // prefer scratch
         if (net >= 0 || (nearFeeFloor && net >= -Math.abs(SETTINGS.netMinProfitUSD)) || net >= -Math.abs(SETTINGS.maxTimeLossUSD)) {
           try {
             const open = await getOpenOrdersCached();
-            const ex = open.find((o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol);
+            const ex = open.find(
+              (o) =>
+                (o.side || '').toLowerCase() === 'sell' &&
+                (o.type || '').toLowerCase() === 'limit' &&
+                normalizePair(o.symbol) === normalizedSymbol
+            );
             if (ex) {
               await f(`${BACKEND_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null);
               __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
-          const mkt = await marketSell(symbol, qty);
+          const mkt = await marketSell(normalizedSymbol, qty);
           if (mkt) {
-            logTradeAction('tp_limit_set', symbol, { limit: `TIME_EXIT@~${q.bid.toFixed(isStock(symbol) ? 2 : 5)}` });
+            logTradeAction('tp_limit_set', normalizedSymbol, { limit: `TIME_EXIT@~${q.bid.toFixed(isStock(symbol) ? 2 : 5)}` });
             return;
           }
         }
@@ -3872,22 +3893,24 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
   }
 
   const feeFloor = minExitPriceFeeAwareDynamic({
-    symbol, entryPx, qty, buyBpsOverride: state.buyBpsApplied
+    symbol: normalizedSymbol, entryPx, qty, buyBpsOverride: state.buyBpsApplied
   });
   let finalLimit = Math.max(limitPrice, feeFloor);
+  const tickSize = isStock(symbol) ? 0.01 : 1e-5;
+  finalLimit = roundToTick(finalLimit, tickSize);
   if (finalLimit > limitPrice + 1e-12) {
-    logTradeAction('tp_fee_floor', symbol, { limit: finalLimit.toFixed(isStock(symbol) ? 2 : 5) });
+    logTradeAction('tp_fee_floor', normalizedSymbol, { limit: finalLimit.toFixed(isStock(symbol) ? 2 : 5) });
   }
 
   if (SETTINGS.takerExitOnTouch) {
-    const q = await getQuoteSmart(symbol);
-    const memo = (touchMemoRef.current[symbol]) || (touchMemoRef.current[symbol] = { count: 0, lastTs: 0, firstTouchTs: 0 });
+    const q = await getQuoteSmart(normalizedSymbol);
+    const memo = (touchMemoRef.current[normalizedSymbol]) || (touchMemoRef.current[normalizedSymbol] = { count: 0, lastTs: 0, firstTouchTs: 0 });
     if (q && q.bid > 0) {
       const tick = isStock(symbol) ? 0.01 : 1e-5;
-      const barsE = await getCryptoBars1m(symbol, 8);
+      const barsE = await getCryptoBars1m(normalizedSymbol, 8);
       const closesE = Array.isArray(barsE) ? barsE.map((b) => b.close) : [];
       const { sigmaBps: sigmaBpsE } = ewmaSigmaFromCloses(closesE.slice(-8), SETTINGS.volHalfLifeMin);
-      const epsBps = dynamicSellEpsBps({ symbol, price: entryPx, tick, sigmaBps: sigmaBpsE, settings: SETTINGS });
+      const epsBps = dynamicSellEpsBps({ symbol: normalizedSymbol, price: entryPx, tick, sigmaBps: sigmaBpsE, settings: SETTINGS });
       const touchPx = finalLimit * (1 - epsBps / 10000);
       const touching = q.bid >= touchPx;
 
@@ -3897,11 +3920,11 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
         memo.lastTs = now;
         if (!memo.firstTouchTs) memo.firstTouchTs = now;
         const ageSec = (now - memo.firstTouchTs) / 1000;
-        logTradeAction('tp_touch_tick', symbol, { count: memo.count, bid: q.bid });
+        logTradeAction('tp_touch_tick', normalizedSymbol, { count: memo.count, bid: q.bid });
 
         const guard = String(SETTINGS.takerExitGuard || 'fee').toLowerCase();
         const okByMin = meetsMinProfitWithBuy({
-          symbol, entryPx, qty, sellPx: q.bid, buyBpsOverride: state.buyBpsApplied
+          symbol: normalizedSymbol, entryPx, qty, sellPx: q.bid, buyBpsOverride: state.buyBpsApplied
         });
         const okByFee = q.bid >= feeFloor * (1 - 1e-6);
         const okProfit = guard === 'min' ? okByMin : okByFee;
@@ -3910,22 +3933,27 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
         if ((memo.count >= SETTINGS.touchTicksRequired && okProfit) || timedForce) {
           try {
             const open = await getOpenOrdersCached();
-            const ex = open.find((o) => (o.side || '').toLowerCase() === 'sell' && (o.type || '').toLowerCase() === 'limit' && o.symbol === symbol);
+            const ex = open.find(
+              (o) =>
+                (o.side || '').toLowerCase() === 'sell' &&
+                (o.type || '').toLowerCase() === 'limit' &&
+                normalizePair(o.symbol) === normalizedSymbol
+            );
             if (ex) {
               await f(`${BACKEND_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null);
               __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
-          const mkt = await marketSell(symbol, qty);
+          const mkt = await marketSell(normalizedSymbol, qty);
           if (mkt) {
-            touchMemoRef.current[symbol] = { count: 0, lastTs: 0, firstTouchTs: 0 };
-            logTradeAction(timedForce ? 'taker_force_flip' : 'tp_limit_set', symbol, {
+            touchMemoRef.current[normalizedSymbol] = { count: 0, lastTs: 0, firstTouchTs: 0 };
+            logTradeAction(timedForce ? 'taker_force_flip' : 'tp_limit_set', normalizedSymbol, {
               limit: timedForce ? `FORCE@~${q.bid.toFixed?.(5) ?? q.bid}` : `TAKER@~${q.bid.toFixed?.(5) ?? q.bid}`
             });
             return;
           }
         } else if (memo.count >= SETTINGS.touchTicksRequired && !okProfit) {
-          logTradeAction('taker_blocked_fee', symbol, {});
+          logTradeAction('taker_blocked_fee', normalizedSymbol, {});
         }
       } else {
         memo.count = 0;
@@ -3936,7 +3964,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
   }
 
   const limitTIF = isStock(symbol) ? 'day' : 'gtc';
-  let existing = openSellBySym?.get?.(symbol) || null;
+  let existing = openSellBySym?.get?.(normalizedSymbol) || null;
   if (existing && (existing.type || '').toLowerCase() !== 'limit') existing = null;
   const now = Date.now();
   const lastTs = state.lastLimitPostTs || 0;
@@ -3949,15 +3977,22 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
 
   try {
     const decimals = isStock(symbol) ? 2 : 5;
-    const order = { symbol: toInternalSymbol(symbol), qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit.toFixed(decimals) };
+    const order = {
+      symbol: toInternalSymbol(normalizedSymbol),
+      qty,
+      side: 'sell',
+      type: 'limit',
+      time_in_force: limitTIF,
+      limit_price: finalLimit.toFixed(decimals),
+    };
     logOrderPayload('sell_limit', order);
     const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     logOrderResponse('sell_limit', order, res, data);
     if (res.ok && data?.ok && data?.orderId) {
-      tradeStateRef.current[symbol] = { ...(state || {}), lastLimitPostTs: now };
+      tradeStateRef.current[normalizedSymbol] = { ...(state || {}), lastLimitPostTs: now };
       if (existing) { await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null); }
-      logTradeAction('tp_limit_set', symbol, { id: data.orderId, limit: order.limit_price });
+      logTradeAction('tp_limit_set', normalizedSymbol, { id: data.orderId, limit: order.limit_price });
     } else {
       const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
       logOrderFailure({
@@ -3966,13 +4001,13 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
         status: res.status,
         body: msg,
       });
-      logTradeAction('tp_limit_error', symbol, { error: `POST ${res.status} ${msg}` });
+      logTradeAction('tp_limit_error', normalizedSymbol, { error: `POST ${res.status} ${msg}` });
     }
   } catch (e) {
-    logOrderError('sell_limit', { symbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit }, e);
-    logTradeAction('tp_limit_error', symbol, { error: e.message });
+    logOrderError('sell_limit', { symbol: normalizedSymbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit }, e);
+    logTradeAction('tp_limit_error', normalizedSymbol, { error: e.message });
     logOrderFailure({
-      order: { symbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit },
+      order: { symbol: normalizedSymbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit },
       endpoint: `${BACKEND_BASE_URL}/orders`,
       status: null,
       body: e?.message || null,
@@ -4487,9 +4522,6 @@ export default function App() {
       }
     }
 
-    console.log(`${asset.symbol} — Quote OK (bps=${Number.isFinite(spreadBps) ? spreadBps.toFixed(1) : 'n/a'})`);
-    logTradeAction('quote_ok', asset.symbol, { spreadBps: +Number(spreadBps || 0).toFixed(1), batchId });
-
     if (spreadBps > d.spreadMax + SPREAD_EPS_BPS) {
       logTradeAction('skip_wide_spread', asset.symbol, { spreadBps: +spreadBps.toFixed(1) });
       logGateFail(
@@ -4583,7 +4615,7 @@ export default function App() {
       const evUsd = (evBps / 10000) * q.bid; // per 1 unit; order sizing handled later
 
       if (effectiveSettings.evShowDebug && !isStaleQuoteEntry(q)) {
-        logTradeAction('quote_ok', asset.symbol, { evBps: Number(evBps?.toFixed?.(2)), tpBps: Number(needBpsCapped?.toFixed?.(1)), batchId });
+        logTradeAction('ev_debug', asset.symbol, { evBps: Number(evBps?.toFixed?.(2)), tpBps: Number(needBpsCapped?.toFixed?.(1)), batchId });
       }
 
       if (!(evBps >= (effectiveSettings.evMinBps ?? -1) || evUsd >= (effectiveSettings.evMinUSD ?? -0.02))) {
@@ -4596,6 +4628,9 @@ export default function App() {
       }
     }
     // If EV guard is disabled → proceed (classic gates already passed)
+
+    console.log(`${asset.symbol} — Quote OK (bps=${Number.isFinite(spreadBps) ? spreadBps.toFixed(1) : 'n/a'})`);
+    logTradeAction('quote_ok', asset.symbol, { spreadBps: +Number(spreadBps || 0).toFixed(1), batchId });
 
     return {
       entryReady: true,
@@ -4971,7 +5006,7 @@ export default function App() {
         const openSellBySym = new Map(
           (openOrders || [])
             .filter((o) => (o.side || '').toLowerCase() === 'sell')
-            .map((o) => [o.symbol, o])
+            .map((o) => [normalizePair(o.symbol), o])
         );
         for (const p of positions || []) {
           const symbol = p.symbol;
@@ -5023,7 +5058,7 @@ export default function App() {
         const openSellBySym = new Map(
           (openOrders || [])
             .filter((o) => (o.side || '').toLowerCase() === 'sell')
-            .map((o) => [o.symbol, o])
+            .map((o) => [normalizePair(o.symbol), o])
         );
         for (const p of positions || []) {
           const sym = p.symbol;
