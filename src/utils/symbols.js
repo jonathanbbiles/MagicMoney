@@ -1,18 +1,30 @@
+export function normalizePair(sym) {
+  if (!sym) return sym;
+  const t = String(sym).trim().toUpperCase();
+  if (!t) return t;
+  if (t.includes("/")) return t;
+  if (t.endsWith("USD") && t.length > 3 && !t.includes("-")) {
+    return `${t.slice(0, -3)}/USD`;
+  }
+  return t;
+}
+
+export function toAlpacaSymbol(pair) {
+  if (!pair) return pair;
+  const normalized = normalizePair(pair);
+  return normalized ? normalized.replace("/", "") : normalized;
+}
+
 export function toInternalSymbol(sym) {
-  if (!sym) return "";
-  return String(sym).replace("/", "").toUpperCase().trim();
+  return normalizePair(sym);
 }
 
 export function toAlpacaCryptoSymbol(sym) {
-  const s = toInternalSymbol(sym);
-  if (s.length <= 3) return String(sym || "");
-  const base = s.slice(0, s.length - 3);
-  const quote = s.slice(-3);
-  return `${base}/${quote}`;
+  return normalizePair(sym);
 }
 
 export function normalizeCryptoSymbol(sym) {
-  return toAlpacaCryptoSymbol(sym);
+  return normalizePair(sym);
 }
 
 export function isCrypto(sym) {

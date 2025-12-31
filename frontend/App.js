@@ -22,29 +22,20 @@ const normalizePair = (sym) => {
   if (!sym) return '';
   const raw = String(sym).trim().toUpperCase();
   if (!raw) return '';
-  if (raw.includes('/')) {
-    const [base, quote] = raw.split('/');
-    if (!base) return raw;
-    return `${base}/${quote || 'USD'}`;
-  }
-  if (raw.includes('-')) {
-    const [base, quote] = raw.split('-');
-    if (!base) return raw;
-    return `${base}/${quote || 'USD'}`;
-  }
-  if (raw.endsWith('USD') && raw.length > 3) {
+  if (raw.includes('/')) return raw;
+  if (raw.endsWith('USD') && raw.length > 3 && !raw.includes('-')) {
     return `${raw.slice(0, -3)}/USD`;
   }
   return raw;
 };
 
-const alpacaSymbol = (sym) => {
+const toAlpacaSymbol = (sym) => {
   if (!sym) return '';
   const pair = normalizePair(sym);
   return pair ? pair.replace('/', '') : pair;
 };
 
-const canonicalAsset = (sym) => alpacaSymbol(sym);
+const canonicalAsset = (sym) => toAlpacaSymbol(sym);
 
 const toInternalSymbol = (sym) => normalizePair(sym);
 const toAlpacaCryptoSymbol = (sym) => normalizePair(sym);
@@ -2430,7 +2421,9 @@ const getAllPositions = async () => {
     return Array.isArray(arr)
       ? arr.map((pos) => ({
         ...pos,
-        symbol: normalizePair(pos.symbol),
+        rawSymbol: pos.rawSymbol ?? pos.symbol,
+        pairSymbol: normalizePair(pos.rawSymbol ?? pos.symbol),
+        symbol: normalizePair(pos.rawSymbol ?? pos.symbol),
       }))
       : [];
   } catch { return []; }
@@ -2443,7 +2436,9 @@ const getOrdersByStatus = async (status = 'open') => {
     return Array.isArray(arr)
       ? arr.map((order) => ({
         ...order,
-        symbol: normalizePair(order.symbol),
+        rawSymbol: order.rawSymbol ?? order.symbol,
+        pairSymbol: normalizePair(order.rawSymbol ?? order.symbol),
+        symbol: normalizePair(order.rawSymbol ?? order.symbol),
       }))
       : [];
   } catch { return []; }
@@ -2569,8 +2564,11 @@ async function getUsableBuyingPower({ forCrypto = true } = {}) {
 const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
   try {
     const open = await getOpenOrdersCached();
+    const normalizedSymbol = normalizePair(symbol);
     const targets = (open || []).filter(
-      (o) => o.symbol === symbol && (!side || (o.side || '').toLowerCase() === String(side).toLowerCase())
+      (o) =>
+        (o.pairSymbol ?? normalizePair(o.symbol)) === normalizedSymbol &&
+        (!side || (o.side || '').toLowerCase() === String(side).toLowerCase())
     );
     await Promise.all(
       targets.map((o) =>
@@ -2595,7 +2593,7 @@ async function getOpenSellOrderBySymbol(symbol, cached = null) {
     (open || []).find((o) => {
       const side = (o.side || '').toLowerCase();
       if (side !== 'sell') return false;
-      const orderSymbol = normalizePair(o.symbol);
+      const orderSymbol = o.pairSymbol ?? normalizePair(o.symbol);
       if (orderSymbol !== normalizedSymbol) return false;
       return true;
     }) || null
@@ -3147,7 +3145,7 @@ const DailyPortfolioValueChart = ({ acctSummary }) => {
 const HoldingsChangeBarChart = () => {
   const [rows, setRows] = useState([]);
   const [lastAt, setLastAt] = useState(null);
-  const [totalLossUSD, setTotalLossUSD] = useState(0);
+  const [totalValueUSD, setTotalValueUSD] = useState(0);
 
   // Palette pulled from existing app colors to keep style cohesion.
   const ACCENT_COLORS = ['#7fd180', '#f7b801', '#9f8ed7', '#b29cd4', '#355070', '#f37b7b', '#c5dbee', '#ead5ff', '#dcd3f7'];
@@ -3162,32 +3160,21 @@ const HoldingsChangeBarChart = () => {
     const poll = async () => {
       try {
         const positions = await getAllPositionsCached();
-        const base = (positions || [])
-          .filter((p) => {
-            const qty = +p.qty || 0;
-            const mv  = +(p.market_value ?? p.marketValue ?? 0);
-            return qty > 0 && mv >= (SETTINGS.dustFlattenMaxUsd || 0.75) && !STABLES.has(p.symbol);
-          })
-          .map((p) => {
-            const symbol = p.symbol;
-            const qty    = +p.qty || 0;
-            const basis  = +(p.avg_entry_price ?? p.basis ?? NaN);
-            const mv     = +(p.market_value ?? p.marketValue ?? NaN);
-            const curRaw = +(p.current_price ?? p.asset_current_price ?? NaN);
-            const mark   = Number.isFinite(curRaw) ? curRaw : (Number.isFinite(mv) && qty > 0 ? mv / qty : NaN);
-            const cost   = (Number.isFinite(basis) && qty > 0) ? basis * qty : NaN;
-            const mval   = (Number.isFinite(mark)  && qty > 0) ? mark  * qty : NaN;
-            const lossUSD = (Number.isFinite(cost) && Number.isFinite(mval) && cost > mval) ? (cost - mval) : 0;
-            return { symbol, lossUSD, basis, mark };
-          });
+        const totalsBySymbol = new Map();
+        for (const p of positions || []) {
+          const symbol = p.pairSymbol ?? normalizePair(p.symbol);
+          const qty = +p.qty || 0;
+          const mv = +(p.market_value ?? p.marketValue ?? 0);
+          if (!(qty > 0) || !(mv > 0)) continue;
+          totalsBySymbol.set(symbol, (totalsBySymbol.get(symbol) || 0) + mv);
+        }
 
-        const totLoss = base.reduce((s, r) => s + (r.lossUSD > 0 ? r.lossUSD : 0), 0);
-        const rowsOut = base
-          .filter((r) => r.lossUSD > 0)
-          .map((r) => ({ ...r, pct: totLoss > 0 ? (r.lossUSD / totLoss) * 100 : 0, color: colorFor(r.symbol) }))
+        const totalValue = Array.from(totalsBySymbol.values()).reduce((s, v) => s + v, 0);
+        const rowsOut = Array.from(totalsBySymbol.entries())
+          .map(([symbol, mv]) => ({ symbol, mv, pct: totalValue > 0 ? (mv / totalValue) * 100 : 0, color: colorFor(symbol) }))
           .sort((a, b) => (b.pct - a.pct));
 
-        setTotalLossUSD(totLoss);
+        setTotalValueUSD(totalValue);
         setRows(rowsOut);
         setLastAt(new Date().toISOString());
       } catch {}
@@ -3201,7 +3188,7 @@ const HoldingsChangeBarChart = () => {
     return (
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Holdings Percentage</Text>
-        <Text style={styles.subtle}>No current unrealized losses detected.</Text>
+        <Text style={styles.subtle}>No current holdings detected.</Text>
       </View>
     );
   }
@@ -3230,7 +3217,7 @@ const HoldingsChangeBarChart = () => {
       </View>
       {!!lastAt && (
         <View style={styles.legendRow}>
-          <Text style={styles.subtle}>Total loss: {fmtUSD(totalLossUSD)}</Text>
+          <Text style={styles.subtle}>Total holdings: {fmtUSD(totalValueUSD)}</Text>
           <Text style={styles.subtle}>{new Date(lastAt).toLocaleTimeString()}</Text>
         </View>
       )}
@@ -4016,6 +4003,75 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
   }
 };
 
+const reconcileExits = async ({
+  positions,
+  openOrders,
+  autoTrade,
+  tradeStateRef,
+  touchMemoRef,
+  settings,
+}) => {
+  const openSellBySym = new Map(
+    (openOrders || [])
+      .filter((o) => (o.side || '').toLowerCase() === 'sell')
+      .map((o) => [o.pairSymbol ?? normalizePair(o.symbol), o])
+  );
+
+  for (const pos of positions || []) {
+    const symbol = pos.pairSymbol ?? normalizePair(pos.symbol);
+    const qty = Number(pos.qty ?? pos.quantity ?? 0);
+    const hasOpenSell = openSellBySym.has(symbol);
+    console.log('EXIT_CHECK', { symbol, hasOpenSell });
+
+    if (!autoTrade || hasOpenSell) continue;
+    if (!(qty > 0)) continue;
+
+    const meta = await fetchAssetMeta(symbol);
+    const quantizeQty = createQtyQuantizer(symbol, meta);
+    const plannedQty = quantizeQty(qty);
+    if (!(plannedQty > 0) || plannedQty < MIN_TRADE_QTY) {
+      console.warn('exit_reconcile_skip', { symbol, qty: plannedQty, reason: 'below_min_trade' });
+      continue;
+    }
+    const minNotional = meta?._min_notional > 0 ? meta._min_notional : MIN_ORDER_NOTIONAL_USD;
+    const state = tradeStateRef?.current?.[symbol] || {};
+    const entryBase = Number(state.entry ?? pos.avg_entry_price ?? pos.basis ?? pos.mark ?? 0);
+    if (!(entryBase > 0)) {
+      console.warn('exit_reconcile_skip', { symbol, qty: plannedQty, reason: 'missing_entry' });
+      continue;
+    }
+    const slipEw = symStats[symbol]?.slipEwmaBps ?? (settings?.slipBpsByRisk?.[settings?.riskLevel ?? SETTINGS.riskLevel] ?? 1);
+    const needAdj = Math.max(
+      requiredProfitBpsForSymbol(symbol, settings?.riskLevel ?? SETTINGS.riskLevel),
+      exitFloorBps(symbol) + 0.5 + slipEw,
+      eff(symbol, 'netMinProfitBps')
+    );
+    const tpBase = entryBase * (1 + needAdj / 10000);
+    const feeFloor = minExitPriceFeeAwareDynamic({
+      symbol,
+      entryPx: entryBase,
+      qty: plannedQty,
+      buyBpsOverride: state.buyBpsApplied,
+    });
+    const tp = Math.max(tpBase, feeFloor);
+    const sizingCheck = validateOrderCandidate({
+      symbol,
+      side: 'sell',
+      qty: plannedQty,
+      price: tp,
+      computedNotional: plannedQty * tp,
+      minNotional,
+      quantizeQty,
+      autoBumpMinNotional: false,
+    });
+    if (sizingCheck.decision !== 'ATTEMPT') {
+      console.warn('exit_reconcile_skip', { symbol, qty: plannedQty, reason: sizingCheck.reason });
+      continue;
+    }
+    await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos });
+  }
+};
+
 /* ───────────────────────── 25) CONCURRENCY / PDT ───────────────────────────── */
 function __recentHitRate() {
   let h = 0, t = 0;
@@ -4629,9 +4685,6 @@ export default function App() {
     }
     // If EV guard is disabled → proceed (classic gates already passed)
 
-    console.log(`${asset.symbol} — Quote OK (bps=${Number.isFinite(spreadBps) ? spreadBps.toFixed(1) : 'n/a'})`);
-    logTradeAction('quote_ok', asset.symbol, { spreadBps: +Number(spreadBps || 0).toFixed(1), batchId });
-
     return {
       entryReady: true,
       spreadBps,
@@ -5006,7 +5059,7 @@ export default function App() {
         const openSellBySym = new Map(
           (openOrders || [])
             .filter((o) => (o.side || '').toLowerCase() === 'sell')
-            .map((o) => [normalizePair(o.symbol), o])
+            .map((o) => [o.pairSymbol ?? normalizePair(o.symbol), o])
         );
         for (const p of positions || []) {
           const symbol = p.symbol;
@@ -5058,7 +5111,7 @@ export default function App() {
         const openSellBySym = new Map(
           (openOrders || [])
             .filter((o) => (o.side || '').toLowerCase() === 'sell')
-            .map((o) => [normalizePair(o.symbol), o])
+            .map((o) => [o.pairSymbol ?? normalizePair(o.symbol), o])
         );
         for (const p of positions || []) {
           const sym = p.symbol;
@@ -5223,6 +5276,17 @@ export default function App() {
       };
 
       const [positions, allOpenOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached()]);
+      console.log('ACCOUNT', scanBpInfo.snapshot ?? null);
+      console.log('POSITIONS_RAW', positions);
+      console.log('OPEN_ORDERS_RAW', allOpenOrders);
+      await reconcileExits({
+        positions,
+        openOrders: allOpenOrders,
+        autoTrade,
+        tradeStateRef,
+        touchMemoRef,
+        settings: effectiveSettings,
+      });
       const posBySym = new Map((positions || []).map((p) => [p.symbol, p]));
       const openCount = (positions || []).filter((p) => {
         const sym = p.symbol;
@@ -5311,6 +5375,11 @@ export default function App() {
           if (sig?.quote && sig.quote.bid > 0 && sig.quote.ask > 0) {
             const mid2 = 0.5 * (sig.quote.bid + sig.quote.ask);
             spreadSamples.push(((sig.quote.ask - sig.quote.bid) / mid2) * 10000);
+          }
+
+          if (sig.entryReady) {
+            console.log(`${normalizedSymbol} — Quote OK (bps=${Number.isFinite(sig.spreadBps) ? sig.spreadBps.toFixed(1) : 'n/a'})`);
+            logTradeAction('quote_ok', normalizedSymbol, { spreadBps: +Number(sig.spreadBps || 0).toFixed(1), batchId: scanBatchId });
           }
 
           const forceTest = FORCE_ONE_TEST_BUY && !forceTestBuyUsed && autoTrade;

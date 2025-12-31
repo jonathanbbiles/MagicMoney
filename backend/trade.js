@@ -1157,6 +1157,8 @@ async function fetchPositions() {
   const positions = Array.isArray(res) ? res : [];
   return positions.map((pos) => ({
     ...pos,
+    rawSymbol: pos.symbol,
+    pairSymbol: normalizeSymbol(pos.symbol),
     symbol: normalizeSymbol(pos.symbol),
   }));
 }
@@ -2519,6 +2521,8 @@ async function fetchOrders(params = {}) {
 
       ...order,
 
+      rawSymbol: order.symbol,
+      pairSymbol: normalizeSymbol(order.symbol),
       symbol: normalizeSymbol(order.symbol),
 
     }));
@@ -2546,8 +2550,11 @@ async function fetchOpenPositions() {
   return positions
     .map((pos) => {
       const qty = Number(pos.qty ?? pos.quantity ?? 0);
+      const pairSymbol = normalizeSymbol(pos.symbol);
       return {
-        symbol: normalizeSymbol(pos.symbol),
+        rawSymbol: pos.symbol,
+        pairSymbol,
+        symbol: pairSymbol,
         qty,
         isDust: isDustQty(qty),
       };
@@ -2560,6 +2567,8 @@ async function fetchOpenOrders() {
   const list = Array.isArray(orders) ? orders : [];
   return list
     .map((order) => ({
+      rawSymbol: order.symbol,
+      pairSymbol: normalizeSymbol(order.symbol),
       symbol: normalizeSymbol(order.symbol),
       side: order.side,
       status: order.status,

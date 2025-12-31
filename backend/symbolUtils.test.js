@@ -4,11 +4,11 @@ const { canonicalPair, canonicalAsset, normalizePair, alpacaSymbol } = require('
 
 assert.equal(canonicalPair('BTCUSD'), 'BTC/USD');
 assert.equal(canonicalPair('btc/usd'), 'BTC/USD');
-assert.equal(canonicalPair('eth-usd'), 'ETH/USD');
+assert.equal(canonicalPair('eth-usd'), 'ETH-USD');
 assert.equal(canonicalPair('LINK'), 'LINK');
 
 assert.equal(canonicalAsset('BTC/USD'), 'BTCUSD');
-assert.equal(canonicalAsset('btc-usd'), 'BTCUSD');
+assert.equal(canonicalAsset('btc-usd'), 'BTC-USD');
 assert.equal(canonicalAsset('AAPL'), 'AAPL');
 assert.equal(normalizePair('BTCUSD'), 'BTC/USD');
 assert.equal(normalizePair('ETH/USD'), 'ETH/USD');
