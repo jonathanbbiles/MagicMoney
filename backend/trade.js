@@ -1258,33 +1258,48 @@ function guardTradeSize({ symbol, qty, notional, price, side, context }) {
   const notionalNum = Number(notional);
   const roundedQty = Number.isFinite(qtyNum) ? roundQty(qtyNum) : null;
   const roundedNotional = Number.isFinite(notionalNum) ? roundNotional(notionalNum) : null;
+  const sideLower = String(side || '').toLowerCase();
   let computedNotional = roundedNotional;
   if (!Number.isFinite(computedNotional) && Number.isFinite(roundedQty) && Number.isFinite(price)) {
     computedNotional = roundNotional(roundedQty * price);
   }
 
   if (Number.isFinite(roundedQty) && roundedQty > 0 && roundedQty < MIN_TRADE_QTY) {
-    const reason = String(side || '').toLowerCase() === 'sell' ? 'below_min_order_size' : 'below_min_trade';
-    logSkip(reason, {
-      symbol,
-      side,
-      qty: roundedQty,
-      minQty: MIN_TRADE_QTY,
-      context,
-    });
-    return { skip: true, qty: roundedQty, notional: computedNotional };
+    if (sideLower === 'sell') {
+      console.log(`${symbol} — Sell allowed despite below_min_order_size`, {
+        qty: roundedQty,
+        minQty: MIN_TRADE_QTY,
+        context,
+      });
+    } else {
+      logSkip('below_min_trade', {
+        symbol,
+        side,
+        qty: roundedQty,
+        minQty: MIN_TRADE_QTY,
+        context,
+      });
+      return { skip: true, qty: roundedQty, notional: computedNotional };
+    }
   }
 
   if (Number.isFinite(computedNotional) && computedNotional < MIN_ORDER_NOTIONAL_USD) {
-    const reason = String(side || '').toLowerCase() === 'sell' ? 'below_min_order_size' : 'below_min_trade';
-    logSkip(reason, {
-      symbol,
-      side,
-      notionalUsd: computedNotional,
-      minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
-      context,
-    });
-    return { skip: true, qty: roundedQty, notional: computedNotional };
+    if (sideLower === 'sell') {
+      console.log(`${symbol} — Sell allowed despite below_min_notional`, {
+        notionalUsd: computedNotional,
+        minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
+        context,
+      });
+    } else {
+      logSkip('below_min_trade', {
+        symbol,
+        side,
+        notionalUsd: computedNotional,
+        minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
+        context,
+      });
+      return { skip: true, qty: roundedQty, notional: computedNotional };
+    }
   }
 
   return { skip: false, qty: roundedQty ?? qty, notional: roundedNotional ?? notional, computedNotional };
