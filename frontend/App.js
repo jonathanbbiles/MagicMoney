@@ -1200,17 +1200,25 @@ const getQuoteLastSeenMs = (quote) => {
   const recvMs = Number(quote?.receivedAtMs ?? 0);
   return Math.max(tsMs || 0, recvMs || 0);
 };
-const isStaleQuoteEntry = (quote) => {
+const assessQuoteFreshness = (quote, nowMs = Date.now()) => {
   const lastSeenMs = getQuoteLastSeenMs(quote);
-  if (!Number.isFinite(lastSeenMs) || lastSeenMs <= 0) return true;
-  return (Date.now() - lastSeenMs) > MAX_QUOTE_AGE_MS;
+  const tsMs = Number.isFinite(quote?.tsMs) && quote.tsMs > 0 ? quote.tsMs : lastSeenMs;
+  const ageMs = Number.isFinite(lastSeenMs) && lastSeenMs > 0 ? nowMs - lastSeenMs : null;
+  const ok = Number.isFinite(ageMs) && ageMs <= MAX_QUOTE_AGE_MS;
+  return { ok, ageMs, tsMs };
 };
-const logStaleQuote = (symbol, quote, context = {}) => {
+const isStaleQuoteEntry = (quote, nowMs = Date.now()) => {
+  const { ok } = assessQuoteFreshness(quote, nowMs);
+  return !ok;
+};
+const logStaleQuote = (symbol, quote, context = {}, nowMs = Date.now()) => {
+  const { ageMs, tsMs } = assessQuoteFreshness(quote, nowMs);
   const lastSeenMs = getQuoteLastSeenMs(quote);
   const lastSeenIso = Number.isFinite(lastSeenMs) && lastSeenMs > 0 ? new Date(lastSeenMs).toISOString() : null;
-  const ageMs = Number.isFinite(lastSeenMs) && lastSeenMs > 0 ? Date.now() - lastSeenMs : null;
   const ageSec = Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : 'NA';
-  console.warn(`QUOTE_STALE symbol=${symbol} age_s=${ageSec}`);
+  const ageText = Number.isFinite(ageMs) ? Math.round(ageMs) : 'n/a';
+  const tsText = Number.isFinite(tsMs) ? tsMs : 'n/a';
+  console.warn(`stale_quote ${symbol} (ageMs=${ageText}, maxAgeMs=${MAX_QUOTE_AGE_MS}, quoteTs=${tsText})`);
   logTradeAction('stale_quote', symbol, {
     lastSeenIso,
     lastSeenAgeSec: formatLoggedAgeSeconds(ageMs),
@@ -2084,9 +2092,10 @@ async function getQuotesBatch(symbols) {
         quoteCache.delete(symbol);
         continue;
       }
-      if (isStaleQuoteEntry(q)) {
+      const freshness = assessQuoteFreshness(q, now);
+      if (!freshness.ok) {
         missing.push(symbol);
-        logStaleQuote(symbol, q, { reason: 'stale_quote' });
+        logStaleQuote(symbol, q, { reason: 'stale_quote', ageMs: freshness.ageMs, tsMs: freshness.tsMs }, now);
         quoteCache.delete(symbol);
         continue;
       }
@@ -2115,13 +2124,15 @@ async function getQuoteSmart(symbol, preloadedMap = null) {
     // This build is crypto-first. Do not hit crypto data API with equities.
     if (isStock(normalizedSymbol)) { markUnsupported(normalizedSymbol, 60); return null; }
     if (isUnsupportedLocal(normalizedSymbol)) return null;
+    const nowMs = Date.now();
 
     // Always use cached real quotes if within staleness window
     {
       const c = quoteCache.get(normalizedSymbol);
-      if (c && !isStaleQuoteEntry(c)) return c;
-      if (c && isStaleQuoteEntry(c)) {
-        logStaleQuote(normalizedSymbol, c, { reason: 'stale_quote' });
+      if (c) {
+        const cachedFreshness = assessQuoteFreshness(c, nowMs);
+        if (cachedFreshness.ok) return c;
+        logStaleQuote(normalizedSymbol, c, { reason: 'stale_quote', ageMs: cachedFreshness.ageMs, tsMs: cachedFreshness.tsMs }, nowMs);
         quoteCache.delete(normalizedSymbol);
       }
     }
@@ -2129,12 +2140,13 @@ async function getQuoteSmart(symbol, preloadedMap = null) {
     // Use preloaded map if available and fresh
     if (preloadedMap && preloadedMap.has(normalizedSymbol)) {
       const q = preloadedMap.get(normalizedSymbol);
-      if (q && !isStaleQuoteEntry(q)) {
-        quoteCache.set(normalizedSymbol, q);
-        return q;
-      }
-      if (q && isStaleQuoteEntry(q)) {
-        logStaleQuote(normalizedSymbol, q, { reason: 'stale_quote' });
+      if (q) {
+        const preFreshness = assessQuoteFreshness(q, nowMs);
+        if (preFreshness.ok) {
+          quoteCache.set(normalizedSymbol, q);
+          return q;
+        }
+        logStaleQuote(normalizedSymbol, q, { reason: 'stale_quote', ageMs: preFreshness.ageMs, tsMs: preFreshness.tsMs }, nowMs);
         quoteCache.delete(normalizedSymbol);
       }
     }
@@ -2142,12 +2154,13 @@ async function getQuoteSmart(symbol, preloadedMap = null) {
     // Try to fetch a real quote
     const m = await getCryptoQuotesBatch([normalizedSymbol]);
     const q0 = m.get(normalizedSymbol);
-    if (q0 && !isStaleQuoteEntry(q0)) {
-      quoteCache.set(normalizedSymbol, q0);
-      return q0;
-    }
-    if (q0 && isStaleQuoteEntry(q0)) {
-      logStaleQuote(normalizedSymbol, q0, { reason: 'stale_quote' });
+    if (q0) {
+      const batchFreshness = assessQuoteFreshness(q0, nowMs);
+      if (batchFreshness.ok) {
+        quoteCache.set(normalizedSymbol, q0);
+        return q0;
+      }
+      logStaleQuote(normalizedSymbol, q0, { reason: 'stale_quote', ageMs: batchFreshness.ageMs, tsMs: batchFreshness.tsMs }, nowMs);
       quoteCache.delete(normalizedSymbol);
     }
     if (!q0) {
@@ -3371,6 +3384,19 @@ function validateOrderCandidate({
   }
 
   if (Number.isFinite(requiredNotional) && requiredNotional < resolvedMinNotional) {
+    if (sideLower === 'sell') {
+      console.log(`${symbol} — Sell allowed despite below_min_notional`, {
+        computedNotional: requiredNotional,
+        minNotional: resolvedMinNotional,
+      });
+      return {
+        decision: 'ATTEMPT',
+        reason: null,
+        qty,
+        computedNotional: requiredNotional,
+        minNotional: resolvedMinNotional,
+      };
+    }
     const canBump =
       autoBumpMinNotional &&
       typeof quantizeQty === 'function' &&
@@ -3771,15 +3797,21 @@ async function marketSell(symbol, qty) {
       __openOrdersCache = { ts: 0, items: [] };
       return data;
     }
+    const notional = Number(latest?.marketValue ?? latest?.market_value ?? NaN);
+    const errMsg = data?.error?.message || data?.message || data?.raw || raw?.slice?.(0, 200) || '';
+    console.log(`${normalizedSymbol} — SELL attempt failed (error=${errMsg}, qty=${usableQty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
     logOrderFailure({
       order: mkt,
       endpoint: `${BACKEND_BASE_URL}/orders`,
       status: res.status,
-      body: data?.error?.message || data?.message || data?.raw || raw?.slice?.(0, 200) || '',
+      body: errMsg,
     });
-    logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt ${res.status} ${data?.error?.message || data?.message || data?.raw?.slice?.(0, 120) || ''}` });
+    logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt ${res.status} ${errMsg}` });
     return null;
   } catch (e) {
+    const notional = Number(latest?.marketValue ?? latest?.market_value ?? NaN);
+    const errMsg = e?.message || 'unknown';
+    console.log(`${normalizedSymbol} — SELL attempt failed (error=${errMsg}, qty=${usableQty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
     logOrderError('sell_market', mkt, e);
     logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt exception ${e.message}` });
     logOrderFailure({
@@ -4047,8 +4079,16 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       if (existing) { await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null); }
       logTradeAction('tp_limit_set', normalizedSymbol, { id: data.orderId, limit: order.limit_price });
       logTradeAction('sell_resting', normalizedSymbol, { limit: order.limit_price });
+      console.log(`${normalizedSymbol} — SELL attempt sent (qty=${qty}, type=limit, limit=${order.limit_price}, reason=tp_hit)`);
     } else {
       const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
+      const notional = Number(order.limit_price) * qty;
+      const msgLower = String(msg || '').toLowerCase();
+      if (msgLower.includes('min notional') || msgLower.includes('minimum notional') || msgLower.includes('min order') || msgLower.includes('minimum order') || msgLower.includes('order size')) {
+        console.log(`${normalizedSymbol} — Skip: dust_position`, { qty, notional });
+        tradeStateRef.current[normalizedSymbol] = { ...(state || {}), dust: true };
+      }
+      console.log(`${normalizedSymbol} — SELL attempt failed (error=${msg}, qty=${qty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
       logOrderFailure({
         order,
         endpoint: `${BACKEND_BASE_URL}/orders`,
@@ -4058,6 +4098,14 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       logTradeAction('tp_limit_error', normalizedSymbol, { error: `POST ${res.status} ${msg}` });
     }
   } catch (e) {
+    const notional = Number(finalLimit) * qty;
+    const errMsg = e?.message || 'unknown';
+    const msgLower = String(errMsg || '').toLowerCase();
+    if (msgLower.includes('min notional') || msgLower.includes('minimum notional') || msgLower.includes('min order') || msgLower.includes('minimum order') || msgLower.includes('order size')) {
+      console.log(`${normalizedSymbol} — Skip: dust_position`, { qty, notional });
+      tradeStateRef.current[normalizedSymbol] = { ...(state || {}), dust: true };
+    }
+    console.log(`${normalizedSymbol} — SELL attempt failed (error=${errMsg}, qty=${qty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
     logOrderError('sell_limit', { symbol: normalizedSymbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit }, e);
     logTradeAction('tp_limit_error', normalizedSymbol, { error: e.message });
     logOrderFailure({
@@ -4128,7 +4176,6 @@ const reconcileExits = async ({
     const qty = Number(pos.qty ?? pos.quantity ?? 0);
     const sellOrders = openSellOrdersBySym.get(symbol) || [];
     const hasOpenSell = sellOrders.length > 0;
-    console.log('EXIT_CHECK', { symbol, hasOpenSell });
 
     if (!(qty > 0)) {
       if (sellOrders.length) {
@@ -4172,37 +4219,81 @@ const reconcileExits = async ({
       existing = null;
     }
 
-    if (!autoTrade || existing) continue;
-    if (isSellReplaceCooldownActive(symbol, now)) continue;
-
     const meta = await fetchAssetMeta(symbol);
     const quantizeQty = createQtyQuantizer(symbol, meta);
     const plannedQty = quantizeQty(qty);
-    if (!(plannedQty > 0) || plannedQty < MIN_TRADE_QTY) {
-      console.warn('exit_reconcile_skip', { symbol, qty: plannedQty, reason: 'below_min_trade' });
-      continue;
+    if (plannedQty > 0 && plannedQty < MIN_TRADE_QTY) {
+      console.log(`${symbol} — Sell allowed despite below_min_order_size`, { qty: plannedQty, minQty: MIN_TRADE_QTY });
     }
     const minNotional = meta?._min_notional > 0 ? meta._min_notional : MIN_ORDER_NOTIONAL_USD;
     const state = tradeStateRef?.current?.[symbol] || {};
     const entryBase = Number(state.entry ?? pos.avg_entry_price ?? pos.basis ?? pos.mark ?? 0);
-    if (!(entryBase > 0)) {
-      console.warn('exit_reconcile_skip', { symbol, qty: plannedQty, reason: 'missing_entry' });
-      continue;
-    }
     const slipEw = symStats[symbol]?.slipEwmaBps ?? (settings?.slipBpsByRisk?.[settings?.riskLevel ?? SETTINGS.riskLevel] ?? 1);
     const needAdj = Math.max(
       requiredProfitBpsForSymbol(symbol, settings?.riskLevel ?? SETTINGS.riskLevel),
       exitFloorBps(symbol) + 0.5 + slipEw,
       eff(symbol, 'netMinProfitBps')
     );
-    const tpBase = entryBase * (1 + needAdj / 10000);
-    const feeFloor = minExitPriceFeeAwareDynamic({
-      symbol,
-      entryPx: entryBase,
-      qty: plannedQty,
-      buyBpsOverride: state.buyBpsApplied,
+    const tpBase = entryBase > 0 ? entryBase * (1 + needAdj / 10000) : null;
+    const feeFloor = entryBase > 0 && plannedQty > 0
+      ? minExitPriceFeeAwareDynamic({
+        symbol,
+        entryPx: entryBase,
+        qty: plannedQty,
+        buyBpsOverride: state.buyBpsApplied,
+      })
+      : null;
+    const tp = Number.isFinite(tpBase) && Number.isFinite(feeFloor) ? Math.max(tpBase, feeFloor) : tpBase;
+    const quote = await getQuoteSmart(symbol);
+    const quoteFreshness = quote ? assessQuoteFreshness(quote, now) : { ok: false, ageMs: null, tsMs: null };
+    const currentBid = quoteFreshness.ok ? quote.bid : null;
+    const currentAsk = quoteFreshness.ok ? quote.ask : null;
+    const breakevenPrice = Number.isFinite(feeFloor) ? feeFloor : (entryBase > 0 ? entryBase : null);
+    const targetPrice = Number.isFinite(tp) ? tp : null;
+    const unrealizedBps = (Number.isFinite(currentBid) && Number.isFinite(breakevenPrice) && breakevenPrice > 0)
+      ? ((currentBid - breakevenPrice) / breakevenPrice) * 10000
+      : null;
+    let reasonNoSell = 'other:unknown';
+    let sellEligible = false;
+    if (state.dust) {
+      reasonNoSell = 'dust_position';
+    } else if (!autoTrade) {
+      reasonNoSell = 'other:auto_off';
+    } else if (hasOpenSell) {
+      reasonNoSell = 'open_order_exists';
+    } else if (isSellReplaceCooldownActive(symbol, now)) {
+      reasonNoSell = 'cooldown_active';
+    } else if (!(plannedQty > 0)) {
+      reasonNoSell = 'other:invalid_qty';
+    } else if (!(entryBase > 0)) {
+      reasonNoSell = 'other:missing_entry';
+    } else if (!quote) {
+      reasonNoSell = 'no_quote';
+    } else if (!quoteFreshness.ok) {
+      reasonNoSell = 'quote_stale';
+    } else {
+      sellEligible = true;
+      reasonNoSell = 'other:attempting_sell';
+    }
+    console.log(`${symbol} — Held`, {
+      qtyHeld: plannedQty,
+      avgEntry: entryBase,
+      breakevenPrice,
+      targetPrice,
+      currentBid,
+      currentAsk,
+      unrealizedBps,
+      sellEligible,
+      reason_no_sell: reasonNoSell,
+      quoteAgeMs: quoteFreshness.ageMs,
+      quoteStale: quote ? !quoteFreshness.ok : true,
     });
-    const tp = Math.max(tpBase, feeFloor);
+
+    if (state.dust) continue;
+    if (!autoTrade || existing) continue;
+    if (isSellReplaceCooldownActive(symbol, now)) continue;
+    if (!(plannedQty > 0)) continue;
+    if (!(entryBase > 0)) continue;
     const sizingCheck = validateOrderCandidate({
       symbol,
       side: 'sell',
@@ -4634,6 +4725,7 @@ export default function App() {
     symEntry.sigmaEwmaBps = ewma(symEntry.sigmaEwmaBps, sigmaBps, 0.2);
     const sigmaBpsEff = symEntry.sigmaEwmaBps ?? sigmaBps;
 
+    const nowMs = Date.now();
     const q = await getQuoteSmart(asset.symbol, preQuoteMap);
     if (!q || !(q.bid > 0 && q.ask > 0)) {
       const normalized = toInternalSymbol(asset.symbol);
@@ -4642,8 +4734,11 @@ export default function App() {
         return { entryReady: false, why: 'no_quote', meta: { freshSec: null, lastSeenAgeSec: null } };
       }
       const cached = quoteCache.get(normalized);
-      if (cached && isStaleQuoteEntry(cached)) {
-        logStaleQuote(normalized, cached, { reason: 'stale_quote' });
+      if (cached) {
+        const cachedFreshness = assessQuoteFreshness(cached, nowMs);
+        if (!cachedFreshness.ok) {
+          logStaleQuote(normalized, cached, { reason: 'stale_quote', ageMs: cachedFreshness.ageMs, tsMs: cachedFreshness.tsMs }, nowMs);
+        }
         const lastSeenMs = getQuoteLastSeenMs(cached);
         const ageMs = Number.isFinite(lastSeenMs) ? Date.now() - lastSeenMs : null;
         return {
@@ -4659,17 +4754,11 @@ export default function App() {
     const spreadBps = Number.isFinite(q.spreadBps)
       ? q.spreadBps
       : ((q.ask - q.bid) / mid) * 10000;
-    const lastSeenMs = getQuoteLastSeenMs(q);
-    const ageMs = Number.isFinite(lastSeenMs) ? Date.now() - lastSeenMs : null;
-    const tsMs = Number.isFinite(q.tsMs) && q.tsMs > 0 ? q.tsMs : lastSeenMs;
-    if (isStaleQuoteEntry(q)) {
-      const bpsText = Number.isFinite(spreadBps) ? spreadBps.toFixed(1) : 'n/a';
-      const ageText = Number.isFinite(ageMs) ? Math.round(ageMs) : 'n/a';
-      const tsText = Number.isFinite(tsMs) ? tsMs : 'n/a';
-      console.warn(`${asset.symbol} — Quote STALE (bps=${bpsText}, ageMs=${ageText}, ts=${tsText})`);
-      logTradeAction('quote_stale', asset.symbol, { spreadBps: +Number(spreadBps || 0).toFixed(1), ageMs, tsMs, batchId });
-      logStaleQuote(asset.symbol, q, { reason: 'stale_quote' });
-      return { entryReady: false, why: 'stale_quote', meta: { lastSeenAgeSec: formatLoggedAgeSeconds(ageMs) } };
+    const freshness = assessQuoteFreshness(q, nowMs);
+    if (!freshness.ok) {
+      logTradeAction('quote_stale', asset.symbol, { spreadBps: +Number(spreadBps || 0).toFixed(1), ageMs: freshness.ageMs, tsMs: freshness.tsMs, batchId });
+      logStaleQuote(asset.symbol, q, { reason: 'stale_quote', ageMs: freshness.ageMs, tsMs: freshness.tsMs }, nowMs);
+      return { entryReady: false, why: 'stale_quote', meta: { lastSeenAgeSec: formatLoggedAgeSeconds(freshness.ageMs) } };
     }
 
     const mm = microMetrics(q);
