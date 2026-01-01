@@ -1808,6 +1808,33 @@ const RISK_LEVELS = ['🐢','🐇','🦊','🦺','🦁'];
 function fmtSkipDetail(reason, d = {}) {
   try {
     switch (reason) {
+      case 'held_in_position': {
+        const parts = [];
+        if (typeof d.exit_not_met === 'boolean') parts.push(d.exit_not_met ? 'exit_not_met' : 'exit_met');
+        if (Number.isFinite(d.pnl_bps)) parts.push(`pnl_bps=${Number(d.pnl_bps).toFixed(1)}`);
+        if (Number.isFinite(d.tp_bps)) parts.push(`tp_bps=${Number(d.tp_bps).toFixed(1)}`);
+        if (Number.isFinite(d.sl_bps)) parts.push(`sl_bps=${Number(d.sl_bps).toFixed(1)}`);
+        if (Number.isFinite(d.age_s)) parts.push(`age_s=${Number(d.age_s).toFixed(0)}`);
+        return parts.length ? ` (${parts.join(', ')})` : '';
+      }
+      case 'held_order_in_flight': {
+        const parts = [];
+        if (d.order_id) parts.push(`order_id=${d.order_id}`);
+        if (d.side) parts.push(`side=${d.side}`);
+        if (Number.isFinite(d.age_s)) parts.push(`age_s=${Number(d.age_s).toFixed(0)}`);
+        return parts.length ? ` (${parts.join(', ')})` : '';
+      }
+      case 'held_cooldown': {
+        if (Number.isFinite(d.remaining_s)) return ` (remaining_s=${Number(d.remaining_s).toFixed(0)})`;
+        return '';
+      }
+      case 'exit_auto_off': {
+        return ' (auto_trade=off)';
+      }
+      case 'exit_quote_stale': {
+        if (Number.isFinite(d.quote_age_s)) return ` (age_s=${Number(d.quote_age_s).toFixed(0)})`;
+        return '';
+      }
       case 'no_quote': {
         return ' (fresh=NA)';
       }
@@ -1930,6 +1957,16 @@ const FRIENDLY = {
       `BUMP_QTY_TO_MIN_NOTIONAL oldQty=${d.oldQty} newQty=${d.newQty} oldNotional=${d.oldNotional} newNotional=${d.newNotional}`,
   },
   entry_skipped: { sev: 'info', msg: (d) => `Skip — ${d.reason}${fmtSkipDetail(d.reason, d)}` },
+  exit_skipped: { sev: 'info', msg: (d) => `Skip — ${d.reason}${fmtSkipDetail(d.reason, d)}` },
+  exit_submit: {
+    sev: 'success',
+    msg: (d) =>
+      `SELL — submit (reason=${d.reason || 'unknown'}, qty=${d.qty ?? 'n/a'}${d.limit ? `, limit=${d.limit}` : ''})`,
+  },
+  recover_stuck_order: {
+    sev: 'warn',
+    msg: (d) => `recover_stuck_order (side=${d.side || 'n/a'}, age_s=${d.age_s ?? 'n/a'})`,
+  },
   risk_changed: {
     sev: 'info',
     msg: (d) => `SETTINGS — Risk→${d.level} (source=${d.source || 'UI'}, reason=${d.reason || 'manual'})`,
@@ -2758,7 +2795,7 @@ async function ensureRiskExitsForPosition(pos, ctx = {}) {
   );
 
   try {
-    if (!DRY_RUN_STOPS) await marketSell(symbol, qtyAvailable);
+    if (!DRY_RUN_STOPS) await marketSell(symbol, qtyAvailable, { reason: 'stop_loss' });
     recentRiskExitRef.current.set(symbol, Date.now());
     riskState.delete(symbol);
     return true;
@@ -3762,7 +3799,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount };
 }
 
-async function marketSell(symbol, qty) {
+async function marketSell(symbol, qty, options = {}) {
   const normalizedSymbol = toInternalSymbol(symbol);
   try { await cancelOpenOrdersForSymbol(normalizedSymbol, 'sell'); } catch {}
   // Re-check availability right before selling to avoid 403s
@@ -3789,6 +3826,12 @@ async function marketSell(symbol, qty) {
   }
   try {
     logOrderPayload('sell_market', mkt);
+    options?.onAttempt?.();
+    logTradeAction('exit_submit', normalizedSymbol, {
+      reason: options?.reason || 'exit_market',
+      qty: usableQty,
+      limit: null,
+    });
     const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(mkt) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     logOrderResponse('sell_market', mkt, res, data);
@@ -3797,6 +3840,7 @@ async function marketSell(symbol, qty) {
       __openOrdersCache = { ts: 0, items: [] };
       return data;
     }
+    options?.onFailed?.();
     const notional = Number(latest?.marketValue ?? latest?.market_value ?? NaN);
     const errMsg = data?.error?.message || data?.message || data?.raw || raw?.slice?.(0, 200) || '';
     console.log(`${normalizedSymbol} — SELL attempt failed (error=${errMsg}, qty=${usableQty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
@@ -3809,6 +3853,7 @@ async function marketSell(symbol, qty) {
     logTradeAction('tp_limit_error', normalizedSymbol, { error: `SELL mkt ${res.status} ${errMsg}` });
     return null;
   } catch (e) {
+    options?.onFailed?.();
     const notional = Number(latest?.marketValue ?? latest?.market_value ?? NaN);
     const errMsg = e?.message || 'unknown';
     console.log(`${normalizedSymbol} — SELL attempt failed (error=${errMsg}, qty=${usableQty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
@@ -3825,6 +3870,7 @@ async function marketSell(symbol, qty) {
   }
 }
 
+const ORDER_IN_FLIGHT_TTL_MS = 120000;
 const SELL_ORDER_TTL_MS = 60000;
 const SELL_ORDER_REPLACE_COOLDOWN_MS = 15000;
 const sellReplaceCooldownBySymbol = new Map();
@@ -3882,7 +3928,7 @@ const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
   if (ageSec < Math.max(0, SETTINGS.stopGraceSec || 0)) return false;
 
   if (bid <= (state.hardStopPx ?? 0)) {
-    const res = await marketSell(symbol, qty);
+    const res = await marketSell(symbol, qty, { reason: 'stop_loss' });
     if (res) return true;
   }
 
@@ -3907,14 +3953,14 @@ const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
       state.stopPx = Math.max(state.stopPx ?? 0, trailStop);
       logTradeAction('stop_update', symbol, { stopPx: state.stopPx });
       if (bid <= trailStop) {
-        const res = await marketSell(symbol, qty);
+        const res = await marketSell(symbol, qty, { reason: 'stop_loss' });
         if (res) return true;
       }
     }
   }
 
   if (bid <= (state.stopPx ?? 0)) {
-    const res = await marketSell(symbol, qty);
+    const res = await marketSell(symbol, qty, { reason: 'stop_loss' });
     if (res) return true;
   }
   return false;
@@ -3924,20 +3970,23 @@ const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
  * Fee-aware TP posting + taker touch exit using *dynamic buy bps* (maker/taker).
  */
 const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, openSellBySym, pos } = {}) => {
+  let attemptsSent = 0;
+  let attemptsFailed = 0;
+  let attempted = false;
   const normalizedSymbol = normalizePair(symbol);
   const posInfo = pos ?? await getPositionInfo(symbol);
-  if (!posInfo || posInfo.available <= 0) return;
+  if (!posInfo || posInfo.available <= 0) return { attemptsSent, attemptsFailed, attempted };
 
   const state = (tradeStateRef?.current?.[normalizedSymbol]) || {};
   const entryPx = state.entry ?? posInfo.basis ?? posInfo.mark ?? 0;
   const qty = Number(posInfo.available ?? 0);
-  if (!(entryPx > 0) || !(qty > 0)) return;
+  if (!(entryPx > 0) || !(qty > 0)) return { attemptsSent, attemptsFailed, attempted };
 
   const now = Date.now();
-  if (isSellReplaceCooldownActive(normalizedSymbol, now)) return;
+  if (isSellReplaceCooldownActive(normalizedSymbol, now)) return { attemptsSent, attemptsFailed, attempted };
 
   const riskExited = await ensureRiskExits(normalizedSymbol, { tradeStateRef, pos: posInfo });
-  if (riskExited) return;
+  if (riskExited) return { attemptsSent, attemptsFailed, attempted };
 
   const heldMinutes = (Date.now() - (state.entryTs || 0)) / 60000;
   if (Number.isFinite(heldMinutes) && heldMinutes >= SETTINGS.maxHoldMin) {
@@ -3966,10 +4015,19 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
               __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
-          const mkt = await marketSell(normalizedSymbol, qty);
+          const mkt = await marketSell(normalizedSymbol, qty, {
+            reason: 'time_exit',
+            onAttempt: () => {
+              attemptsSent += 1;
+              attempted = true;
+            },
+            onFailed: () => {
+              attemptsFailed += 1;
+            },
+          });
           if (mkt) {
             logTradeAction('tp_limit_set', normalizedSymbol, { limit: `TIME_EXIT@~${q.bid.toFixed(isStock(symbol) ? 2 : 5)}` });
-            return;
+            return { attemptsSent, attemptsFailed, attempted };
           }
         }
       }
@@ -4028,13 +4086,22 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
               __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
-          const mkt = await marketSell(normalizedSymbol, qty);
+          const mkt = await marketSell(normalizedSymbol, qty, {
+            reason: timedForce ? 'time_exit' : 'take_profit',
+            onAttempt: () => {
+              attemptsSent += 1;
+              attempted = true;
+            },
+            onFailed: () => {
+              attemptsFailed += 1;
+            },
+          });
           if (mkt) {
             touchMemoRef.current[normalizedSymbol] = { count: 0, lastTs: 0, firstTouchTs: 0 };
             logTradeAction(timedForce ? 'taker_force_flip' : 'tp_limit_set', normalizedSymbol, {
               limit: timedForce ? `FORCE@~${q.bid.toFixed?.(5) ?? q.bid}` : `TAKER@~${q.bid.toFixed?.(5) ?? q.bid}`
             });
-            return;
+            return { attemptsSent, attemptsFailed, attempted };
           }
         } else if (memo.count >= SETTINGS.touchTicksRequired && !okProfit) {
           logTradeAction('taker_blocked_fee', normalizedSymbol, {});
@@ -4056,7 +4123,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     ? Math.abs(existingLimit - finalLimit) / Math.max(1, finalLimit)
     : Infinity;
   const needsPost = !existing || priceDrift > 0.001 || now - lastTs > 1000 * 10;
-  if (!needsPost) return;
+  if (!needsPost) return { attemptsSent, attemptsFailed, attempted };
 
   try {
     const decimals = isStock(symbol) ? 2 : 5;
@@ -4071,6 +4138,13 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       reason: 'exit_tp_limit',
     };
     logOrderPayload('sell_limit', order);
+    attemptsSent += 1;
+    attempted = true;
+    logTradeAction('exit_submit', normalizedSymbol, {
+      reason: 'take_profit',
+      qty,
+      limit: order.limit_price,
+    });
     const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     logOrderResponse('sell_limit', order, res, data);
@@ -4081,6 +4155,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       logTradeAction('sell_resting', normalizedSymbol, { limit: order.limit_price });
       console.log(`${normalizedSymbol} — SELL attempt sent (qty=${qty}, type=limit, limit=${order.limit_price}, reason=tp_hit)`);
     } else {
+      attemptsFailed += 1;
       const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
       const notional = Number(order.limit_price) * qty;
       const msgLower = String(msg || '').toLowerCase();
@@ -4098,6 +4173,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       logTradeAction('tp_limit_error', normalizedSymbol, { error: `POST ${res.status} ${msg}` });
     }
   } catch (e) {
+    attemptsFailed += 1;
     const notional = Number(finalLimit) * qty;
     const errMsg = e?.message || 'unknown';
     const msgLower = String(errMsg || '').toLowerCase();
@@ -4116,6 +4192,54 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       error: e,
     });
   }
+  return { attemptsSent, attemptsFailed, attempted };
+};
+
+const reconcileLocalState = async ({ positions, openOrders, tradeStateRef, touchMemoRef, riskTrailStateRef, recentRiskExitRef }) => {
+  const positionSymbols = new Set();
+  for (const pos of positions || []) {
+    const symbol = pos.pairSymbol ?? normalizePair(pos.symbol);
+    const qty = Number(pos.qty ?? pos.quantity ?? 0);
+    const mv = Number(pos.market_value ?? pos.marketValue ?? 0);
+    if (qty > 0 || mv > 0) {
+      positionSymbols.add(symbol);
+    }
+  }
+
+  const openOrderSymbols = new Set();
+  for (const order of openOrders || []) {
+    const sym = order.pairSymbol ?? normalizePair(order.symbol);
+    if (sym) openOrderSymbols.add(sym);
+  }
+
+  const localState = tradeStateRef?.current || {};
+  for (const symbol of Object.keys(localState)) {
+    if (!positionSymbols.has(symbol) && !openOrderSymbols.has(symbol)) {
+      delete localState[symbol];
+      if (touchMemoRef?.current) delete touchMemoRef.current[symbol];
+      riskTrailStateRef?.current?.delete(symbol);
+      recentRiskExitRef?.current?.delete(symbol);
+    }
+  }
+
+  const now = Date.now();
+  for (const order of openOrders || []) {
+    const side = String(order?.side || '').toLowerCase();
+    if (side === 'sell') continue;
+    const ageMs = getOrderAgeMs(order, now);
+    if (Number.isFinite(ageMs) && ageMs >= ORDER_IN_FLIGHT_TTL_MS) {
+      const symbol = order.pairSymbol ?? normalizePair(order.symbol);
+      const ok = await cancelOrder(order.id);
+      if (ok) {
+        logTradeAction('recover_stuck_order', symbol, {
+          side,
+          order_id: order.id,
+          age_s: ageMs / 1000,
+          reason: 'ttl',
+        });
+      }
+    }
+  }
 };
 
 const reconcileExits = async ({
@@ -4129,6 +4253,8 @@ const reconcileExits = async ({
   const openSellOrdersBySym = new Map();
   let openBuyCount = 0;
   let openSellCount = 0;
+  let attemptsSent = 0;
+  let attemptsFailed = 0;
   for (const order of openOrders || []) {
     const side = String(order?.side || '').toLowerCase();
     if (side === 'buy') openBuyCount += 1;
@@ -4166,6 +4292,14 @@ const reconcileExits = async ({
           orderId: order.id,
           reason,
         });
+        if (reason === 'ttl') {
+          logTradeAction('recover_stuck_order', order.pairSymbol ?? normalizePair(order.symbol), {
+            side: 'sell',
+            order_id: order.id,
+            age_s: Number.isFinite(getOrderAgeMs(order, now)) ? getOrderAgeMs(order, now) / 1000 : null,
+            reason,
+          });
+        }
       }
     }
     return ok;
@@ -4254,27 +4388,51 @@ const reconcileExits = async ({
       ? ((currentBid - breakevenPrice) / breakevenPrice) * 10000
       : null;
     let reasonNoSell = 'other:unknown';
+    let skipReason = null;
     let sellEligible = false;
     if (state.dust) {
       reasonNoSell = 'dust_position';
+      skipReason = 'held_in_position';
     } else if (!autoTrade) {
       reasonNoSell = 'other:auto_off';
+      skipReason = 'exit_auto_off';
     } else if (hasOpenSell) {
       reasonNoSell = 'open_order_exists';
+      skipReason = 'held_order_in_flight';
     } else if (isSellReplaceCooldownActive(symbol, now)) {
       reasonNoSell = 'cooldown_active';
+      skipReason = 'held_cooldown';
     } else if (!(plannedQty > 0)) {
       reasonNoSell = 'other:invalid_qty';
+      skipReason = 'exit_invalid_qty';
     } else if (!(entryBase > 0)) {
       reasonNoSell = 'other:missing_entry';
+      skipReason = 'exit_missing_entry';
     } else if (!quote) {
       reasonNoSell = 'no_quote';
+      skipReason = 'exit_no_quote';
     } else if (!quoteFreshness.ok) {
       reasonNoSell = 'quote_stale';
+      skipReason = 'exit_quote_stale';
     } else {
       sellEligible = true;
       reasonNoSell = 'other:attempting_sell';
     }
+    const tpBps = Number.isFinite(entryBase) && entryBase > 0 && Number.isFinite(targetPrice)
+      ? ((targetPrice - entryBase) / entryBase) * 10000
+      : null;
+    const exitAgeSec = Number.isFinite(state.entryTs) ? Math.max(0, (now - state.entryTs) / 1000) : null;
+    const exitNotMet = Number.isFinite(currentBid) && Number.isFinite(targetPrice)
+      ? currentBid < targetPrice
+      : null;
+    const baseExitDetails = {
+      pnl_bps: Number.isFinite(unrealizedBps) ? unrealizedBps : null,
+      tp_bps: tpBps,
+      sl_bps: Number.isFinite(eff(symbol, 'stopLossBps')) ? eff(symbol, 'stopLossBps') : null,
+      age_s: exitAgeSec,
+      exit_not_met: exitNotMet,
+      quote_age_s: Number.isFinite(quoteFreshness.ageMs) ? quoteFreshness.ageMs / 1000 : null,
+    };
     console.log(`${symbol} — Held`, {
       qtyHeld: plannedQty,
       avgEntry: entryBase,
@@ -4288,6 +4446,21 @@ const reconcileExits = async ({
       quoteAgeMs: quoteFreshness.ageMs,
       quoteStale: quote ? !quoteFreshness.ok : true,
     });
+    if (skipReason) {
+      const openOrder = hasOpenSell ? (sellOrders[0] || existing) : null;
+      const orderAgeMs = openOrder ? getOrderAgeMs(openOrder, now) : null;
+      const remainingMs = isSellReplaceCooldownActive(symbol, now)
+        ? Math.max(0, SELL_ORDER_REPLACE_COOLDOWN_MS - (now - (sellReplaceCooldownBySymbol.get(symbol) || 0)))
+        : null;
+      logTradeAction('exit_skipped', symbol, {
+        reason: skipReason,
+        ...baseExitDetails,
+        order_id: openOrder?.id,
+        side: openOrder?.side,
+        age_s: Number.isFinite(orderAgeMs) ? orderAgeMs / 1000 : baseExitDetails.age_s,
+        remaining_s: Number.isFinite(remainingMs) ? remainingMs / 1000 : null,
+      });
+    }
 
     if (state.dust) continue;
     if (!autoTrade || existing) continue;
@@ -4306,9 +4479,19 @@ const reconcileExits = async ({
     });
     if (sizingCheck.decision !== 'ATTEMPT') {
       console.warn('exit_reconcile_skip', { symbol, qty: plannedQty, reason: sizingCheck.reason });
+      logTradeAction('exit_skipped', symbol, {
+        reason: 'exit_size_guard',
+        pnl_bps: Number.isFinite(unrealizedBps) ? unrealizedBps : null,
+        tp_bps: tpBps,
+        sl_bps: Number.isFinite(eff(symbol, 'stopLossBps')) ? eff(symbol, 'stopLossBps') : null,
+        age_s: Number.isFinite(exitAgeSec) ? exitAgeSec : null,
+        exit_not_met: exitNotMet,
+      });
       continue;
     }
-    await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos });
+    const exitResult = await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos });
+    attemptsSent += exitResult?.attemptsSent || 0;
+    attemptsFailed += exitResult?.attemptsFailed || 0;
   }
 
   return {
@@ -4316,6 +4499,8 @@ const reconcileExits = async ({
     openSellCount,
     cancelsCount,
     ttlCancelsCount,
+    attemptsSent,
+    attemptsFailed,
   };
 };
 
@@ -4964,8 +5149,8 @@ export default function App() {
       const notional = Math.max(1, Math.min(5, FORCE_ONE_TEST_BUY_NOTIONAL || 2));
       const order = { symbol: normalizedSymbol, notional, side: 'buy', type: 'market', time_in_force: 'gtc' };
       console.warn('FORCE_ONE_TEST_BUY', { symbol: normalizedSymbol, notional });
-      let attemptsSent = 0;
-      let attemptsFailed = 0;
+      let attemptsSent = exitMetrics?.attemptsSent || 0;
+      let attemptsFailed = exitMetrics?.attemptsFailed || 0;
       let ordersOpen = 0;
       let fillsCount = 0;
       try {
@@ -5036,14 +5221,44 @@ export default function App() {
       }
     } catch {}
 
-    const held = await getPositionInfo(normalizedSymbol);
-    const avail = Number(held?.available ?? 0);
-    const mv    = Number(held?.marketValue ?? 0);
-    const trulyHeld = avail > 0 || mv >= effectiveSettings.dustFlattenMaxUsd;
+    const posSnapshot = refs?.positionsBySymbol?.get?.(normalizedSymbol) || null;
+    let avail = Number(posSnapshot?.qty_available ?? posSnapshot?.available ?? posSnapshot?.qty ?? 0);
+    let mv = Number(posSnapshot?.market_value ?? posSnapshot?.marketValue ?? 0);
+    let trulyHeld = Number.isFinite(avail) ? avail > 0 : false;
+    if (!trulyHeld && Number.isFinite(mv)) {
+      trulyHeld = mv >= effectiveSettings.dustFlattenMaxUsd;
+    }
+    if (!posSnapshot) {
+      const held = await getPositionInfo(normalizedSymbol);
+      avail = Number(held?.available ?? avail ?? 0);
+      mv = Number(held?.marketValue ?? mv ?? 0);
+      if (!(trulyHeld)) {
+        trulyHeld = avail > 0 || mv >= effectiveSettings.dustFlattenMaxUsd;
+      }
+    }
+    const openOrders = refs?.openOrders || [];
+    const openOrder = (openOrders || []).find((o) => normalizePair(o.symbol) === normalizedSymbol);
+    const openOrderAgeMs = openOrder ? getOrderAgeMs(openOrder) : null;
     if (trulyHeld) {
-      logTradeAction('entry_skipped', normalizedSymbol, { entryReady: false, reason: 'held' });
+      logTradeAction('entry_skipped', normalizedSymbol, {
+        entryReady: false,
+        reason: 'held_in_position',
+        qty: avail,
+        market_value: mv,
+      });
       logGateFail(normalizedSymbol, 'held');
-      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'held' };
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'held_in_position' };
+    }
+    if (openOrder) {
+      logTradeAction('entry_skipped', normalizedSymbol, {
+        entryReady: false,
+        reason: 'held_order_in_flight',
+        order_id: openOrder.id,
+        side: openOrder.side,
+        age_s: Number.isFinite(openOrderAgeMs) ? openOrderAgeMs / 1000 : null,
+      });
+      logGateFail(normalizedSymbol, 'held');
+      return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'held_order_in_flight' };
     }
 
     const sig = sigPre || (await computeEntrySignal({ symbol: normalizedSymbol, cc: ccSymbol }, d, effectiveSettings.riskLevel, preQuoteMap, null, batchId));
@@ -5524,6 +5739,14 @@ export default function App() {
       console.log('ACCOUNT', scanBpInfo.snapshot ?? null);
       console.log('POSITIONS_RAW', positions);
       console.log('OPEN_ORDERS_RAW', allOpenOrders);
+      await reconcileLocalState({
+        positions,
+        openOrders: allOpenOrders,
+        tradeStateRef,
+        touchMemoRef,
+        riskTrailStateRef,
+        recentRiskExitRef,
+      });
       const exitMetrics = await reconcileExits({
         positions,
         openOrders: allOpenOrders,
@@ -5640,7 +5863,15 @@ export default function App() {
                 decisionReason = 'duplicate_suppress';
               } else {
                 submittedThisBatch.add(normalizedSymbol);
-                const result = await placeOrder(normalizedSymbol, asset.cc, d, sig, batchMap, { tradeStateRef, touchMemoRef }, scanBatchId);
+                const result = await placeOrder(
+                  normalizedSymbol,
+                  asset.cc,
+                  d,
+                  sig,
+                  batchMap,
+                  { tradeStateRef, touchMemoRef, positionsBySymbol: posBySym, openOrders: allOpenOrders },
+                  scanBatchId
+                );
                 attemptsSent += result?.attemptsSent || 0;
                 attemptsFailed += result?.attemptsFailed || 0;
                 ordersOpen += result?.ordersOpen || 0;
