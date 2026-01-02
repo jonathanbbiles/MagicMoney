@@ -1,4 +1,13 @@
 const LEVELS = ['ERROR', 'WARN', 'INFO', 'DEBUG'];
+const LEVEL_RANK = {
+  ERROR: 0,
+  WARN: 1,
+  INFO: 2,
+  DEBUG: 3,
+};
+
+let logLevel = 'INFO';
+let debugEnabled = false;
 
 const cleanValue = (value) => {
   if (value == null) return null;
@@ -19,6 +28,34 @@ const formatFields = (fields = {}) => {
     parts.push(`${key}=${val}`);
   }
   return parts.join(' ');
+};
+
+const shouldPrint = (level) => {
+  if (level === 'DEBUG') return debugEnabled;
+  const rank = LEVEL_RANK[level] ?? LEVEL_RANK.INFO;
+  const minRank = LEVEL_RANK[logLevel] ?? LEVEL_RANK.INFO;
+  return rank <= minRank;
+};
+
+const logWithLevel = (level, ...args) => {
+  if (!shouldPrint(level)) return;
+  console.log(`[${level}]`, ...args);
+};
+
+export const setLogLevel = (level = 'INFO') => {
+  const upper = String(level).toUpperCase();
+  logLevel = LEVELS.includes(upper) ? upper : 'INFO';
+};
+
+export const setDebugEnabled = (enabled = false) => {
+  debugEnabled = Boolean(enabled);
+};
+
+export const LiveLog = {
+  info: (...args) => logWithLevel('INFO', ...args),
+  warn: (...args) => logWithLevel('WARN', ...args),
+  error: (...args) => logWithLevel('ERROR', ...args),
+  debug: (...args) => logWithLevel('DEBUG', ...args),
 };
 
 export const createLogger = ({
