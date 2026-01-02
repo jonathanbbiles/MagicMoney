@@ -95,6 +95,7 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
           method,
           statusCode: response.status,
           errorMessage: `HTTP ${response.status} ${response.statusText}`,
+          message: `HTTP ${response.status} ${response.statusText}`,
           responseSnippet200: snippet,
           isTimeout: false,
           isNetworkError: false,
@@ -142,6 +143,7 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
           method,
           statusCode: response.status,
           errorMessage: 'parse_error',
+          message: 'parse_error',
           responseSnippet200: snippet,
           isTimeout: false,
           isNetworkError: false,
@@ -169,6 +171,7 @@ async function executeFetch({ method, url, headers, body, timeoutMs }) {
         method,
         statusCode: null,
         errorMessage: message,
+        message,
         responseSnippet200: '',
         isTimeout,
         isNetworkError: !isTimeout,
@@ -211,6 +214,9 @@ async function httpJson({
     }
 
     result.error.attempts = attempt + 1;
+    if (!result.error.message) {
+      result.error.message = result.error.errorMessage || 'HTTP request failed';
+    }
     return result;
   }
 
