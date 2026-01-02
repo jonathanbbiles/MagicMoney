@@ -19,6 +19,7 @@ Copy .env.example to .env.local
 Start backend (Node.js Express server)
 
 Run: npm start (Expo)
+Restart Metro with cache clear if needed: npx expo start -c
 
 The app shows temporary trade messages using a built-in overlay notification.
 
