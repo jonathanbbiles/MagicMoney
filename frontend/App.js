@@ -18,7 +18,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
-import { createLogger } from './src/utils/liveLogger.js';
+import { LiveLog, setDebugEnabled, setLogLevel } from './src/utils/liveLogger';
 const normalizePair = (sym) => {
   if (!sym) return '';
   const raw = String(sym).trim().toUpperCase();
@@ -1807,11 +1807,35 @@ const MAX_LOGS = 5000;
 const RISK_LEVELS = ['🐢','🐇','🦊','🦺','🦁'];
 let currentScanId = 0;
 let debugLogEnabled = LOG_DEBUG;
-const liveLogger = createLogger({
-  getScanId: () => currentScanId,
-  getDebugEnabled: () => debugLogEnabled,
-  throttleMs: 4000,
-});
+setLogLevel('INFO');
+setDebugEnabled(debugLogEnabled);
+const liveLogger = {
+  log: ({ level = 'INFO', event, symbol, fields }) => {
+    const normalizedLevel = String(level || 'INFO').toUpperCase();
+    const entry = {
+      ts: new Date().toISOString(),
+      level: normalizedLevel,
+      event,
+      symbol,
+      fields,
+      scan_id: currentScanId,
+    };
+    switch (normalizedLevel) {
+      case 'ERROR':
+        LiveLog.error(event, fields);
+        break;
+      case 'WARN':
+        LiveLog.warn(event, fields);
+        break;
+      case 'DEBUG':
+        LiveLog.debug(event, fields);
+        break;
+      default:
+        LiveLog.info(event, fields);
+    }
+    return entry;
+  },
+};
 const decisionLogMap = new Map();
 const markDecisionLogged = (scanId, symbol) => {
   if (!scanId || !symbol) return;
