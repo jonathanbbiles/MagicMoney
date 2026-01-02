@@ -18,6 +18,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
+import { createLogger } from './src/utils/liveLogger';
 const normalizePair = (sym) => {
   if (!sym) return '';
   const raw = String(sym).trim().toUpperCase();
@@ -53,6 +54,7 @@ const isStock = (sym) => !isCrypto(sym);
 /* ──────────────────────────────── 1) VERSION / CONFIG ──────────────────────────────── */
 const VERSION = 'v1';
 const EX = Constants?.expoConfig?.extra || Constants?.manifest?.extra || {};
+const LOG_DEBUG = ['1', 'true', 'yes'].includes(String(EX.LOG_DEBUG || '').toLowerCase());
 
 const RENDER_BACKEND_URL = 'https://magicmoney.onrender.com';
 // Dev-only override for physical devices: set to your LAN IP (e.g., 'http://192.168.x.x:10000').
@@ -240,6 +242,7 @@ const DEFAULT_SETTINGS = {
   evMinBps: -1.0,              // allow slightly negative EV in bps
   evMinUSD: -0.02,             // allow tiny negative EV per trade in USD
   evShowDebug: true,           // log EV math to Live logs
+  logDebug: LOG_DEBUG,         // toggle DEBUG log lines
 
   volHalfLifeMin: 10,          // EWMA half-life (minutes) for realized vol on 1m bars
   tpVolScale: 1.0,             // kTP: target scales with σ (in bps)
@@ -883,10 +886,7 @@ const LiveLogsCopyViewer = ({ logs = [] }) => {
       setStatus('Building snapshot…');
       setTxt('');
       setCollapsed(false);
-      const lines = (logs || []).map((l) => {
-        const ts = new Date(l.ts).toLocaleString();
-        return `${ts} • ${l.text}`;
-      });
+      const lines = (logs || []).map((l) => l.text);
       const out = lines.join('\n');
       setTxt(out);
       setStatus(`Built ${lines.length} lines. Tap the box → Select All → Copy.`);
@@ -1220,6 +1220,7 @@ const logStaleQuote = (symbol, quote, context = {}, nowMs = Date.now()) => {
   const tsText = Number.isFinite(tsMs) ? tsMs : 'n/a';
   console.warn(`stale_quote ${symbol} (ageMs=${ageText}, maxAgeMs=${MAX_QUOTE_AGE_MS}, quoteTs=${tsText})`);
   logTradeAction('stale_quote', symbol, {
+    ageMs,
     lastSeenIso,
     lastSeenAgeSec: formatLoggedAgeSeconds(ageMs),
     lastError: quote?.lastError ?? null,
@@ -1804,6 +1805,28 @@ function meetsMinProfit({ symbol, entryPx, qty, sellPx }) {
 let logSubscriber = null, logBuffer = [];
 const MAX_LOGS = 5000;
 const RISK_LEVELS = ['🐢','🐇','🦊','🦺','🦁'];
+let currentScanId = 0;
+let debugLogEnabled = LOG_DEBUG;
+const liveLogger = createLogger({
+  getScanId: () => currentScanId,
+  getDebugEnabled: () => debugLogEnabled,
+  throttleMs: 4000,
+});
+const decisionLogMap = new Map();
+const markDecisionLogged = (scanId, symbol) => {
+  if (!scanId || !symbol) return;
+  decisionLogMap.set(`${scanId}:${symbol}`, true);
+};
+const isDecisionLogged = (scanId, symbol) => decisionLogMap.has(`${scanId}:${symbol}`);
+const levelToSev = (level = 'INFO') => {
+  switch (String(level || '').toUpperCase()) {
+    case 'ERROR': return 'error';
+    case 'WARN': return 'warn';
+    case 'DEBUG': return 'info';
+    default: return 'info';
+  }
+};
+const shortId = (id) => (id ? String(id).slice(0, 6) : null);
 
 function fmtSkipDetail(reason, d = {}) {
   try {
@@ -1880,23 +1903,162 @@ function fmtSkipDetail(reason, d = {}) {
 
 export const registerLogSubscriber = (fn) => { logSubscriber = fn; };
 
-const lastLogTimestamps = new Map();
-
 const logTradeAction = async (type, symbol, details = {}) => {
-  const now = Date.now();
-  if (type === 'quote_ok') {
-    const batchId = details?.batchId ?? details?.batch ?? 'na';
-    const key = `${symbol || ''}|${type}|${batchId}`;
-    const last = lastLogTimestamps.get(key) || 0;
-    if (now - last < 250) return;
-    lastLogTimestamps.set(key, now);
+  const eventType = String(type || 'event');
+  const normalizedSymbol = symbol || 'GLOBAL';
+  let level = 'INFO';
+  let event = eventType.toUpperCase();
+  let fields = {};
+  let throttleOverride = null;
+
+  switch (eventType) {
+    case 'scan_start':
+      event = 'SCAN_START';
+      fields = { mode: details.mode || 'LIVE', universe: details.universe ?? details.batch };
+      break;
+    case 'scan_summary':
+      event = 'SCAN_SUMMARY';
+      fields = details;
+      break;
+    case 'scan_error':
+      event = 'SCAN_ERROR';
+      level = 'ERROR';
+      fields = { error: details.error || details.message || 'unknown' };
+      break;
+    case 'quote_ok':
+      event = 'QUOTE_OK';
+      level = 'DEBUG';
+      throttleOverride = 1500;
+      fields = {
+        mid: details.mid,
+        spread_bps: details.spreadBps,
+        age_ms: details.ageMs,
+      };
+      break;
+    case 'quote_stale':
+    case 'stale_quote':
+      event = 'QUOTE_BAD';
+      level = 'WARN';
+      fields = {
+        reason: 'stale',
+        age_ms: details.ageMs ?? details.ageMsRaw ?? details.age_ms ?? null,
+        age_s: details.ageSec ?? details.lastSeenAgeSec ?? null,
+      };
+      break;
+    case 'skip_wide_spread':
+      event = 'QUOTE_BAD';
+      level = 'WARN';
+      fields = {
+        reason: 'spread',
+        bps: details.spreadBps,
+        limit_bps: details.max ?? details.spreadMax,
+      };
+      break;
+    case 'entry_skipped':
+      event = 'DECISION';
+      fields = {
+        state: 'FLAT',
+        action: details.action || 'SKIP',
+        reason: details.reason || 'entry_signal_false',
+        signal_summary: details.signal_summary,
+        pos_qty: details.pos_qty,
+        pos_avg_entry: details.pos_avg_entry,
+        open_buy_orders: details.open_buy_orders,
+        open_sell_orders: details.open_sell_orders,
+        held_state: details.held_state,
+        held_reason: details.held_reason,
+        tp_max_bps: details.tp_max_bps,
+        tp_min_bps: details.tp_min_bps,
+        current_tp_bps: details.current_tp_bps,
+        next_limit: details.next_limit,
+        last_reprice_s: details.last_reprice_s,
+        age_s: details.age_s,
+      };
+      break;
+    case 'exit_skipped':
+      event = 'DECISION';
+      fields = {
+        state: 'IN_POS',
+        action: details.action || 'HOLD',
+        reason: details.reason || 'exit_not_met',
+        pnl_bps: details.pnl_bps,
+        target_bps: details.tp_bps ?? details.target_bps,
+        floor_bps: details.tp_min_bps ?? details.floor_bps ?? details.sl_bps,
+        limit_price: details.limit_price ?? details.next_limit,
+        remaining_qty: details.remaining_qty,
+        open_sell_id: shortId(details.order_id || details.open_sell_id),
+        next_reprice_s: details.remaining_s ?? details.next_reprice_s,
+        pos_qty: details.pos_qty,
+        pos_avg_entry: details.pos_avg_entry,
+        open_buy_orders: details.open_buy_orders,
+        open_sell_orders: details.open_sell_orders,
+        held_state: details.held_state,
+        held_reason: details.held_reason,
+        tp_max_bps: details.tp_max_bps,
+        tp_min_bps: details.tp_min_bps,
+        current_tp_bps: details.current_tp_bps,
+        next_limit: details.next_limit,
+        last_reprice_s: details.last_reprice_s,
+        age_s: details.age_s,
+      };
+      break;
+    case 'decision':
+      event = 'DECISION';
+      fields = details;
+      break;
+    case 'order_submit':
+      event = 'ORDER_SUBMIT';
+      fields = details;
+      break;
+    case 'order_replace':
+      event = 'ORDER_REPLACE';
+      fields = details;
+      break;
+    case 'order_cancel':
+      event = 'ORDER_CANCEL';
+      fields = details;
+      break;
+    case 'order_error':
+      event = 'ORDER_ERROR';
+      level = 'ERROR';
+      fields = details;
+      break;
+    case 'rate_limit':
+      event = 'RATE_LIMIT';
+      level = 'WARN';
+      fields = details;
+      break;
+    case 'buy_success':
+      event = 'FILL';
+      fields = { side: 'BUY', ...details };
+      break;
+    case 'fill':
+      event = 'FILL';
+      fields = details;
+      break;
+    default:
+      fields = details;
   }
-  const timestamp = new Date(now).toISOString();
-  const entry = { timestamp, type, symbol, ...details };
-  logBuffer.push(entry);
+
+  if (event === 'DECISION' && isDecisionLogged(currentScanId, normalizedSymbol)) {
+    return;
+  }
+  const entry = liveLogger.log({
+    level,
+    event,
+    symbol: normalizedSymbol,
+    fields,
+    throttleOverride,
+  });
+  if (!entry) return;
+  if (event === 'DECISION') {
+    markDecisionLogged(entry.scan_id, entry.symbol);
+  }
+  const payload = { ...entry, type: eventType, ...details };
+  logBuffer.push(payload);
   if (logBuffer.length > MAX_LOGS) logBuffer.shift();
   if (typeof logSubscriber === 'function') {
-    try { logSubscriber(entry); } catch {}
+    try { logSubscriber(payload); } catch {}
   }
 };
 const FRIENDLY = {
@@ -2094,12 +2256,69 @@ const GATE_HELP = {
   },
 };
 function friendlyLog(entry) {
+  if (entry?.text) {
+    return { sev: levelToSev(entry.level), text: entry.text, hint: null };
+  }
   const meta = FRIENDLY[entry.type];
-  if (!meta)
+  if (!meta) {
     return { sev: 'info', text: `${entry.type}${entry.symbol ? ' ' + entry.symbol : ''}`, hint: null };
+  }
   const text = typeof meta.msg === 'function' ? meta.msg(entry) : meta.msg;
   return { sev: meta.sev, text: `${entry.symbol ? entry.symbol + ' — ' : ''}${text}`, hint: null };
 }
+
+const buildExitPlanFields = (symbol, tradeStateRef, now = Date.now()) => {
+  const state = tradeStateRef?.current?.[symbol];
+  if (!state) return {};
+  const entry = Number(state.entry ?? 0);
+  const tp = Number(state.tp ?? NaN);
+  const feeFloor = Number(state.feeFloor ?? NaN);
+  const tpMaxBps = Number.isFinite(state.runway) && entry > 0 ? (state.runway / entry) * 10000 : null;
+  const tpMinBps = Number.isFinite(feeFloor) && entry > 0 ? ((feeFloor - entry) / entry) * 10000 : null;
+  const currentTpBps = Number.isFinite(tp) && entry > 0 ? ((tp - entry) / entry) * 10000 : null;
+  const lastRepriceSec = Number.isFinite(state.lastLimitPostTs) && state.lastLimitPostTs > 0
+    ? Math.max(0, (now - state.lastLimitPostTs) / 1000)
+    : null;
+  const ageSec = Number.isFinite(state.entryTs) && state.entryTs > 0
+    ? Math.max(0, (now - state.entryTs) / 1000)
+    : null;
+  return {
+    tp_max_bps: tpMaxBps,
+    tp_min_bps: tpMinBps,
+    current_tp_bps: currentTpBps,
+    next_limit: Number.isFinite(tp) ? tp : null,
+    last_reprice_s: lastRepriceSec,
+    age_s: ageSec,
+  };
+};
+
+const buildDecisionBaseFields = ({ symbol, pos, openOrders, tradeStateRef, heldState, heldReason }) => {
+  const posQty = Number(pos?.qty ?? pos?.quantity ?? pos?.available ?? 0);
+  const posAvgEntry = Number(pos?.avg_entry_price ?? pos?.basis ?? pos?.mark ?? 0);
+  const open = Array.isArray(openOrders)
+    ? openOrders.filter((o) => normalizePair(o.symbol) === symbol || o.pairSymbol === symbol)
+    : [];
+  const openBuyOrders = open.filter((o) => String(o.side || '').toLowerCase() === 'buy').length;
+  const openSellOrders = open.filter((o) => String(o.side || '').toLowerCase() === 'sell').length;
+  return {
+    pos_qty: Number.isFinite(posQty) ? posQty : null,
+    pos_avg_entry: Number.isFinite(posAvgEntry) ? posAvgEntry : null,
+    open_buy_orders: openBuyOrders,
+    open_sell_orders: openSellOrders,
+    held_state: heldState || null,
+    held_reason: heldReason || null,
+    ...buildExitPlanFields(symbol, tradeStateRef),
+  };
+};
+
+const buildSignalSummary = (sig = {}) => {
+  const parts = [];
+  if (Number.isFinite(sig?.tpBps)) parts.push(`tp=${Number(sig.tpBps).toFixed(1)}bps`);
+  if (Number.isFinite(sig?.sigmaBps)) parts.push(`sigma=${Number(sig.sigmaBps).toFixed(1)}bps`);
+  if (Number.isFinite(sig?.spreadBps)) parts.push(`spread=${Number(sig.spreadBps).toFixed(1)}bps`);
+  if (sig?.mode) parts.push(`mode=${sig.mode}`);
+  return parts.join(',');
+};
 
 /* ─────────────────────────── 16) QUOTES / BATCHING (LIVE) ─────────────────────────── */
 const PRICE_HIST = new Map();
@@ -2346,23 +2565,37 @@ const logOrderPayload = (context, order) => {
   const notional = order.notional ?? 'NA';
   const qty = order.qty ?? 'NA';
   const limit = order.limit_price ?? 'NA';
-  console.log(
-    `ORDER_SUBMIT symbol=${symbol} side=${order.side} type=${order.type} tif=${order.time_in_force} notional=${notional} qty=${qty} limit=${limit}`
-  );
+  logTradeAction('order_submit', symbol, {
+    side: String(order.side || '').toUpperCase(),
+    qty,
+    type: order.type,
+    limit,
+    tif: order.time_in_force,
+    client_id: order.client_order_id || order.clientId,
+    notional,
+    context,
+  });
 };
 
 const logOrderResponse = (context, order, res, data) => {
   const ok = Boolean(res?.ok && data?.ok && data?.orderId);
   const symbol = toInternalSymbol(order?.symbol);
   if (ok) {
-    console.log(`ORDER_OK id=${data.orderId} status=${data.status || 'accepted'} symbol=${symbol}`);
     return { ok: true, orderId: data.orderId, status: data.status || 'accepted', err: 'NA' };
   }
   const httpStatus = res?.status ?? 'NA';
   const code = data?.error?.code ?? data?.error?.status ?? data?.code ?? 'NA';
   const message = data?.error?.message || data?.error || data?.message || 'unknown_error';
   const body = data?.raw || data?.error?.raw || JSON.stringify(data || {});
-  console.warn(`ORDER_FAIL http=${httpStatus} code=${code} message=${message} body=${body}`);
+  logTradeAction('order_error', symbol, {
+    side: String(order?.side || '').toUpperCase(),
+    op: 'submit',
+    code,
+    status: httpStatus,
+    message,
+    context,
+    body,
+  });
   return { ok: false, orderId: 'NA', status: 'NA', err: message };
 };
 
@@ -2371,7 +2604,16 @@ const logOrderError = (context, order, error = null, res = null, data = null) =>
   const code = error?.code || error?.status || 'NA';
   const message = data?.message || data?.error || error?.message || error?.name || 'unknown_error';
   const body = data?.raw || error?.message || '';
-  console.warn(`ORDER_FAIL http=${httpStatus} code=${code} message=${message} body=${body}`);
+  const symbol = toInternalSymbol(order?.symbol);
+  logTradeAction('order_error', symbol, {
+    side: String(order?.side || '').toUpperCase(),
+    op: 'submit',
+    code,
+    status: httpStatus,
+    message,
+    context,
+    body,
+  });
 };
 
 const orderFailureEvents = [];
@@ -2415,6 +2657,9 @@ const logOrderFailure = ({ order, endpoint, status, body, error }) => {
     error_code: code,
   };
   console.warn('order_submit_failed', payload);
+  if (status === 429) {
+    logTradeAction('rate_limit', 'GLOBAL', { op: 'orders', status: 429, backoff_s: null });
+  }
   recordOrderFailure(code);
 };
 
@@ -2556,6 +2801,15 @@ async function pollRecentOrderStates() {
     if ((filledQty > 0 || status === 'filled') && !order.countedFill) {
       fillsCount += 1;
       order.countedFill = true;
+      const fillPx = Number(resolvedOrder?.filled_avg_price ?? resolvedOrder?.filled_avg_price ?? resolvedOrder?.filled_avg_price ?? resolvedOrder?.avg_fill_price ?? resolvedOrder?.avg_fill_price ?? resolvedOrder?.filled_avg_price);
+      const qtyFilled = Number.isFinite(filledQty) && filledQty > 0 ? filledQty : Number(order.qty ?? 0);
+      const notional = Number.isFinite(fillPx) && Number.isFinite(qtyFilled) ? fillPx * qtyFilled : null;
+      logTradeAction('fill', order.symbol, {
+        side: String(resolvedOrder?.side || order.side || '').toUpperCase(),
+        qty: qtyFilled,
+        price: Number.isFinite(fillPx) ? fillPx : null,
+        notional,
+      });
     }
 
     if (status === 'rejected' && !order.countedReject) {
@@ -2626,7 +2880,15 @@ const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
     );
     await Promise.all(
       targets.map((o) =>
-        f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)
+        f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS })
+          .then(() => {
+            logTradeAction('order_cancel', normalizedSymbol, {
+              order: o.id,
+              side: (o.side || '').toUpperCase(),
+              reason: 'cleanup',
+            });
+          })
+          .catch(() => null)
       )
     );
     __openOrdersCache = { ts: 0, items: [] };
@@ -2635,7 +2897,13 @@ const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
 const cancelAllOrders = async () => {
   try {
     const orders = await getOpenOrdersCached();
-    await Promise.all((orders || []).map((o) => f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)));
+    await Promise.all((orders || []).map((o) =>
+      cancelOrder(o.id, {
+        symbol: o.pairSymbol ?? normalizePair(o.symbol),
+        side: o.side,
+        reason: 'bulk_cancel',
+      })
+    ));
     __openOrdersCache = { ts: 0, items: [] };
   } catch {}
 };
@@ -2654,10 +2922,15 @@ async function getOpenSellOrderBySymbol(symbol, cached = null) {
   );
 }
 
-async function cancelOrder(orderId) {
+async function cancelOrder(orderId, meta = {}) {
   if (!orderId) return false;
   try {
     await f(`${BACKEND_BASE_URL}/orders/${orderId}`, { method: 'DELETE', headers: BACKEND_HEADERS });
+    logTradeAction('order_cancel', meta.symbol || 'GLOBAL', {
+      order: orderId,
+      side: meta.side ? String(meta.side).toUpperCase() : null,
+      reason: meta.reason || 'cleanup',
+    });
     __openOrdersCache = { ts: 0, items: [] };
     return true;
   } catch (err) {
@@ -2776,7 +3049,7 @@ async function ensureRiskExitsForPosition(pos, ctx = {}) {
   if (!decision.trigger) return false;
 
   const openSell = await getOpenSellOrderBySymbol(symbol, ctx.openOrders);
-  if (openSell) await cancelOrder(openSell.id);
+  if (openSell) await cancelOrder(openSell.id, { symbol, side: 'sell', reason: 'risk_exit' });
 
   const payload = {
     qty: qtyAvailable,
@@ -2943,7 +3216,11 @@ async function cleanupStaleBuyOrders(maxAgeSec = 30) {
     );
     await Promise.all(
       stale.map(async (o) => {
-        await f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null);
+        await cancelOrder(o.id, {
+          symbol: o.pairSymbol ?? normalizePair(o.symbol),
+          side: o.side,
+          reason: 'cleanup',
+        });
       })
     );
     if (stale.length) {
@@ -3615,7 +3892,9 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     const needReplace = !lastOrderId || ticksDrift >= 2 || join < (placedLimit - TICK);
     if (needReplace && (nowTs - lastReplaceAt) > 1800) {
       if (lastOrderId) {
-        try { await f(`${BACKEND_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: BACKEND_HEADERS }); } catch {}
+        try {
+          await cancelOrder(lastOrderId, { symbol: normalizedSymbol, side: 'buy', reason: 'replace' });
+        } catch {}
         __openOrdersCache = { ts: 0, items: [] };
       }
       const order = {
@@ -3673,11 +3952,16 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
     const pos = await getPositionInfo(normalizedSymbol);
     if (pos && pos.qty > 0) {
       if (lastOrderId) {
-        try { await f(`${BACKEND_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: BACKEND_HEADERS }); } catch {}
+        try {
+          await cancelOrder(lastOrderId, { symbol: normalizedSymbol, side: 'buy', reason: 'filled_cleanup' });
+        } catch {}
         __openOrdersCache = { ts: 0, items: [] };
       }
       logTradeAction('buy_success', normalizedSymbol, {
-        qty: pos.qty, limit: placedLimit != null ? formatLimit(placedLimit) : placedLimit,
+        qty: pos.qty,
+        price: pos.basis ?? placedLimit,
+        notional: Number.isFinite(pos.basis) ? pos.qty * pos.basis : null,
+        limit: placedLimit != null ? formatLimit(placedLimit) : placedLimit,
       });
       __positionsCache = { ts: 0, items: [] };
       __openOrdersCache = { ts: 0, items: [] };
@@ -3688,7 +3972,9 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   }
 
   if (lastOrderId) {
-    try { await f(`${BACKEND_BASE_URL}/orders/${lastOrderId}`, { method: 'DELETE', headers: BACKEND_HEADERS }); } catch {}
+    try {
+      await cancelOrder(lastOrderId, { symbol: normalizedSymbol, side: 'buy', reason: 'unfilled' });
+    } catch {}
     __openOrdersCache = { ts: 0, items: [] };
     logTradeAction('buy_unfilled_canceled', normalizedSymbol, {});
   }
@@ -3761,7 +4047,12 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
           });
         }
         if (orderOk) {
-          logTradeAction('buy_success', normalizedSymbol, { qty: mQty, limit: 'mkt' });
+          logTradeAction('buy_success', normalizedSymbol, {
+            qty: mQty,
+            price: q.ask,
+            notional: Number.isFinite(q.ask) ? mQty * q.ask : null,
+            limit: 'mkt',
+          });
           __positionsCache = { ts: 0, items: [] };
           __openOrdersCache = { ts: 0, items: [] };
           if (fillsCount === 0) fillsCount = 1;
@@ -4011,7 +4302,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
                 normalizePair(o.symbol) === normalizedSymbol
             );
             if (ex) {
-              await f(`${BACKEND_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null);
+              await cancelOrder(ex.id, { symbol: normalizedSymbol, side: 'sell', reason: 'time_exit' });
               __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
@@ -4082,7 +4373,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
                 normalizePair(o.symbol) === normalizedSymbol
             );
             if (ex) {
-              await f(`${BACKEND_BASE_URL}/orders/${ex.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null);
+              await cancelOrder(ex.id, { symbol: normalizedSymbol, side: 'sell', reason: 'taker_exit' });
               __openOrdersCache = { ts: 0, items: [] };
             }
           } catch {}
@@ -4150,7 +4441,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     logOrderResponse('sell_limit', order, res, data);
     if (res.ok && data?.ok && data?.orderId) {
       tradeStateRef.current[normalizedSymbol] = { ...(state || {}), lastLimitPostTs: now };
-      if (existing) { await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null); }
+      if (existing) { await cancelOrder(existing.id, { symbol: normalizedSymbol, side: 'sell', reason: 'reprice' }); }
       logTradeAction('tp_limit_set', normalizedSymbol, { id: data.orderId, limit: order.limit_price });
       logTradeAction('sell_resting', normalizedSymbol, { limit: order.limit_price });
       console.log(`${normalizedSymbol} — SELL attempt sent (qty=${qty}, type=limit, limit=${order.limit_price}, reason=tp_hit)`);
@@ -4229,7 +4520,7 @@ const reconcileLocalState = async ({ positions, openOrders, tradeStateRef, touch
     const ageMs = getOrderAgeMs(order, now);
     if (Number.isFinite(ageMs) && ageMs >= ORDER_IN_FLIGHT_TTL_MS) {
       const symbol = order.pairSymbol ?? normalizePair(order.symbol);
-      const ok = await cancelOrder(order.id);
+      const ok = await cancelOrder(order.id, { symbol, side, reason: 'ttl' });
       if (ok) {
         logTradeAction('recover_stuck_order', symbol, {
           side,
@@ -4282,18 +4573,19 @@ const reconcileExits = async ({
 
   const cancelSellOrder = async (order, reason) => {
     if (!order?.id) return false;
-    const ok = await cancelOrder(order.id);
+    const symbol = order.pairSymbol ?? normalizePair(order.symbol);
+    const ok = await cancelOrder(order.id, { symbol, side: order.side, reason });
     if (ok) {
       cancelsCount += 1;
       if (reason === 'ttl') ttlCancelsCount += 1;
       if (reason) {
         console.log('sell_order_cancel', {
-          symbol: order.pairSymbol ?? normalizePair(order.symbol),
+          symbol,
           orderId: order.id,
           reason,
         });
         if (reason === 'ttl') {
-          logTradeAction('recover_stuck_order', order.pairSymbol ?? normalizePair(order.symbol), {
+          logTradeAction('recover_stuck_order', symbol, {
             side: 'sell',
             order_id: order.id,
             age_s: Number.isFinite(getOrderAgeMs(order, now)) ? getOrderAgeMs(order, now) / 1000 : null,
@@ -4421,17 +4713,31 @@ const reconcileExits = async ({
     const tpBps = Number.isFinite(entryBase) && entryBase > 0 && Number.isFinite(targetPrice)
       ? ((targetPrice - entryBase) / entryBase) * 10000
       : null;
+    const tpMinBps = Number.isFinite(entryBase) && entryBase > 0 && Number.isFinite(feeFloor)
+      ? ((feeFloor - entryBase) / entryBase) * 10000
+      : null;
     const exitAgeSec = Number.isFinite(state.entryTs) ? Math.max(0, (now - state.entryTs) / 1000) : null;
     const exitNotMet = Number.isFinite(currentBid) && Number.isFinite(targetPrice)
       ? currentBid < targetPrice
       : null;
+    const decisionBase = buildDecisionBaseFields({
+      symbol,
+      pos,
+      openOrders,
+      tradeStateRef,
+      heldState: 'IN_POS',
+      heldReason: skipReason || reasonNoSell,
+    });
     const baseExitDetails = {
       pnl_bps: Number.isFinite(unrealizedBps) ? unrealizedBps : null,
       tp_bps: tpBps,
+      tp_min_bps: tpMinBps,
       sl_bps: Number.isFinite(eff(symbol, 'stopLossBps')) ? eff(symbol, 'stopLossBps') : null,
       age_s: exitAgeSec,
       exit_not_met: exitNotMet,
       quote_age_s: Number.isFinite(quoteFreshness.ageMs) ? quoteFreshness.ageMs / 1000 : null,
+      limit_price: Number.isFinite(tp) ? tp : null,
+      remaining_qty: plannedQty,
     };
     console.log(`${symbol} — Held`, {
       qtyHeld: plannedQty,
@@ -4455,6 +4761,7 @@ const reconcileExits = async ({
       logTradeAction('exit_skipped', symbol, {
         reason: skipReason,
         ...baseExitDetails,
+        ...decisionBase,
         order_id: openOrder?.id,
         side: openOrder?.side,
         age_s: Number.isFinite(orderAgeMs) ? orderAgeMs / 1000 : baseExitDetails.age_s,
@@ -4483,9 +4790,13 @@ const reconcileExits = async ({
         reason: 'exit_size_guard',
         pnl_bps: Number.isFinite(unrealizedBps) ? unrealizedBps : null,
         tp_bps: tpBps,
+        tp_min_bps: tpMinBps,
         sl_bps: Number.isFinite(eff(symbol, 'stopLossBps')) ? eff(symbol, 'stopLossBps') : null,
         age_s: Number.isFinite(exitAgeSec) ? exitAgeSec : null,
         exit_not_met: exitNotMet,
+        limit_price: Number.isFinite(tp) ? tp : null,
+        remaining_qty: plannedQty,
+        ...decisionBase,
       });
       continue;
     }
@@ -4729,7 +5040,7 @@ export default function App() {
 
       let skipsChanged = false;
       for (const entry of buffer) {
-        if (entry?.type === 'entry_skipped' && entry?.symbol) {
+        if (entry?.event === 'DECISION' && entry?.action === 'SKIP' && entry?.symbol) {
           lastSkipsRef.current[entry.symbol] = entry;
           skipsChanged = true;
           if (!overrideSymRef.current) setOverrideSym(entry.symbol);
@@ -4738,10 +5049,10 @@ export default function App() {
           arr.push({
             ts: Date.now(),
             reason: entry.reason,
-            spreadBps: entry.spreadBps,
+            spreadBps: entry.spread_bps ?? entry.spreadBps,
             feeBps: entry.feeBps,
             mid: entry.mid,
-            tpBps: entry.tpBps,
+            tpBps: entry.tpBps ?? entry.target_bps ?? entry.tp_bps,
           });
           if (arr.length > 100) arr.splice(0, arr.length - 100);
           skipHistoryRef.current.set(sym, arr);
@@ -4769,7 +5080,6 @@ export default function App() {
       setTracked(cryptoOnly);
       setUnivUpdatedAt(new Date().toISOString());
       setOpenMeta((m) => ({ ...m, universe: cryptoOnly.length, allowed: cryptoOnly.length }));
-      logTradeAction('scan_start', 'UNIVERSE', { batch: cryptoOnly.length, stocks: 0, cryptos: cryptoOnly.length });
       await loadData();
     })();
   }, []);
@@ -5009,7 +5319,7 @@ export default function App() {
     }
 
     if (spreadBps > d.spreadMax + SPREAD_EPS_BPS) {
-      logTradeAction('skip_wide_spread', asset.symbol, { spreadBps: +spreadBps.toFixed(1) });
+      logTradeAction('skip_wide_spread', asset.symbol, { spreadBps: +spreadBps.toFixed(1), max: d.spreadMax });
       logGateFail(
         asset.symbol,
         'spread_too_wide',
@@ -5134,6 +5444,14 @@ export default function App() {
 
   const placeOrder = async (symbol, ccSymbol = symbol, d, sigPre = null, preQuoteMap = null, refs, batchId = null) => {
     const normalizedSymbol = toInternalSymbol(symbol);
+    const posSnapshot = refs?.positionsBySymbol?.get?.(normalizedSymbol) || null;
+    const openOrders = refs?.openOrders || [];
+    const decisionBase = buildDecisionBaseFields({
+      symbol: normalizedSymbol,
+      pos: posSnapshot,
+      openOrders,
+      tradeStateRef: refs?.tradeStateRef,
+    });
     if (TRADING_HALTED) {
       logTradeAction('daily_halt', normalizedSymbol, { reason: HALT_REASON || 'Rule' });
       logGateFail(normalizedSymbol, 'trading_halted', `reason=${HALT_REASON || 'Rule'}`);
@@ -5141,7 +5459,11 @@ export default function App() {
     }
     const preflight = await preflightAccountCheck();
     if (preflight?.blocked) {
-      logTradeAction('entry_skipped', normalizedSymbol, { entryReady: false, reason: 'preflight_blocked' });
+      logTradeAction('entry_skipped', normalizedSymbol, {
+        entryReady: false,
+        reason: 'preflight_blocked',
+        ...decisionBase,
+      });
       logGateFail(normalizedSymbol, 'preflight_blocked', preflight.reason || '');
       return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'preflight_blocked' };
     }
@@ -5221,7 +5543,6 @@ export default function App() {
       }
     } catch {}
 
-    const posSnapshot = refs?.positionsBySymbol?.get?.(normalizedSymbol) || null;
     let avail = Number(posSnapshot?.qty_available ?? posSnapshot?.available ?? posSnapshot?.qty ?? 0);
     let mv = Number(posSnapshot?.market_value ?? posSnapshot?.marketValue ?? 0);
     let trulyHeld = Number.isFinite(avail) ? avail > 0 : false;
@@ -5236,7 +5557,6 @@ export default function App() {
         trulyHeld = avail > 0 || mv >= effectiveSettings.dustFlattenMaxUsd;
       }
     }
-    const openOrders = refs?.openOrders || [];
     const openOrder = (openOrders || []).find((o) => normalizePair(o.symbol) === normalizedSymbol);
     const openOrderAgeMs = openOrder ? getOrderAgeMs(openOrder) : null;
     if (trulyHeld) {
@@ -5245,6 +5565,9 @@ export default function App() {
         reason: 'held_in_position',
         qty: avail,
         market_value: mv,
+        held_state: 'IN_POS',
+        held_reason: 'position',
+        ...decisionBase,
       });
       logGateFail(normalizedSymbol, 'held');
       return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'held_in_position' };
@@ -5256,6 +5579,9 @@ export default function App() {
         order_id: openOrder.id,
         side: openOrder.side,
         age_s: Number.isFinite(openOrderAgeMs) ? openOrderAgeMs / 1000 : null,
+        held_state: 'OPEN_ORDER',
+        held_reason: 'order_in_flight',
+        ...decisionBase,
       });
       logGateFail(normalizedSymbol, 'held');
       return { attempted: false, filled: false, attemptsSent: 0, attemptsFailed: 0, ordersOpen: 0, fillsCount: 0, decisionReason: 'held_order_in_flight' };
@@ -5311,7 +5637,12 @@ export default function App() {
         currentOpenPositions,
         decision: validation.decision,
       });
-      logTradeAction('entry_skipped', normalizedSymbol, { entryReady: true, reason: 'skip_small_order', note: 'no usable BP' });
+      logTradeAction('entry_skipped', normalizedSymbol, {
+        entryReady: true,
+        reason: 'skip_small_order',
+        note: 'no usable BP',
+        ...decisionBase,
+      });
       logGateFail(normalizedSymbol, 'buying_power', '', {
         buying_power: Number.isFinite(buyingPower) ? Number(buyingPower.toFixed(2)) : buyingPower,
         min_notional: minNotional,
@@ -5677,6 +6008,11 @@ export default function App() {
     scanningRef.current = true;
     scanLockRef.current = true;
     setIsLoading(true);
+    debugLogEnabled = effectiveSettings.logDebug;
+    currentScanId += 1;
+    const scanId = currentScanId;
+    const scanStartMs = Date.now();
+    decisionLogMap.clear();
     if (isMarketDataCooldown()) {
       setIsLoading(false);
       setRefreshing(false);
@@ -5795,7 +6131,7 @@ export default function App() {
       const barsMap = effectiveSettings.enforceMomentum ? await getCryptoBars1mBatch(cryptoSymbolsForQuotes, 6) : null;
 
       setOpenMeta({ positions: openCount, orders: (allOpenOrders || []).length, allowed: cryptosAll.length, universe: cryptosAll.length });
-      logTradeAction('scan_start', 'STATIC', { batch: cryptoSlice.length });
+      logTradeAction('scan_start', 'GLOBAL', { mode: 'LIVE', universe: cryptosAll.length });
       const sampleSymbol = cryptoSymbolsForQuotes[0];
       if (sampleSymbol) {
         console.log(`SYMBOL MAP: ${sampleSymbol} -> ${toAlpacaCryptoSymbol(sampleSymbol)}`);
@@ -5836,6 +6172,12 @@ export default function App() {
           const posNow = posBySym.get(normalizedSymbol);
           const isHolding = !!(posNow && Number(posNow.qty) > 0);
           tradeStateRef.current[normalizedSymbol] = { ...prevState, wasHolding: isHolding };
+          const decisionBase = buildDecisionBaseFields({
+            symbol: normalizedSymbol,
+            pos: posNow,
+            openOrders: allOpenOrders,
+            tradeStateRef,
+          });
 
           const sig = await computeEntrySignal({ ...asset, symbol: normalizedSymbol }, d, effectiveSettings.riskLevel, batchMap, barsMap, scanBatchId, scanFundingCtx);
           token.entryReady = sig.entryReady;
@@ -5846,8 +6188,15 @@ export default function App() {
           }
 
           if (sig.entryReady) {
-            console.log(`${normalizedSymbol} — Quote OK (bps=${Number.isFinite(sig.spreadBps) ? sig.spreadBps.toFixed(1) : 'n/a'})`);
-            logTradeAction('quote_ok', normalizedSymbol, { spreadBps: +Number(sig.spreadBps || 0).toFixed(1), batchId: scanBatchId });
+            const q = sig?.quote;
+            const mid = q && q.bid > 0 && q.ask > 0 ? 0.5 * (q.bid + q.ask) : null;
+            const freshness = q ? assessQuoteFreshness(q) : null;
+            logTradeAction('quote_ok', normalizedSymbol, {
+              mid,
+              spreadBps: +Number(sig.spreadBps || 0).toFixed(1),
+              ageMs: freshness?.ageMs ?? null,
+              batchId: scanBatchId,
+            });
           }
 
           const forceTest = FORCE_ONE_TEST_BUY && !forceTestBuyUsed && autoTrade;
@@ -5861,6 +6210,15 @@ export default function App() {
               if (submittedThisBatch.has(normalizedSymbol)) {
                 console.log(`DUPLICATE_SUPPRESS ${normalizedSymbol}`);
                 decisionReason = 'duplicate_suppress';
+                if (!isDecisionLogged(scanId, normalizedSymbol)) {
+                  logTradeAction('decision', normalizedSymbol, {
+                    state: 'FLAT',
+                    action: 'SKIP',
+                    reason: decisionReason,
+                    signal_summary: buildSignalSummary(sig),
+                    ...decisionBase,
+                  });
+                }
               } else {
                 submittedThisBatch.add(normalizedSymbol);
                 const result = await placeOrder(
@@ -5877,16 +6235,37 @@ export default function App() {
                 ordersOpen += result?.ordersOpen || 0;
                 fillsCount += result?.fillsCount || 0;
                 decisionReason = result?.decisionReason || (result?.filled ? 'filled' : (result?.attempted ? 'order_failed' : 'order_skipped'));
+                if (!isDecisionLogged(scanId, normalizedSymbol)) {
+                  const action = result?.attempted || result?.filled ? 'BUY' : 'SKIP';
+                  logTradeAction('decision', normalizedSymbol, {
+                    state: 'FLAT',
+                    action,
+                    reason: decisionReason,
+                    signal_summary: buildSignalSummary(sig),
+                    ...decisionBase,
+                  });
+                }
               }
             } else {
-              logTradeAction('entry_skipped', normalizedSymbol, { entryReady: true, reason: 'auto_off' });
+              logTradeAction('entry_skipped', normalizedSymbol, {
+                entryReady: true,
+                reason: 'auto_off',
+                signal_summary: buildSignalSummary(sig),
+                ...decisionBase,
+              });
               decisionReason = 'auto_off';
             }
           } else {
             watchCount++;
             skippedCount++;
             if (sig?.why) reasonCounts[sig.why] = (reasonCounts[sig.why] || 0) + 1;
-            logTradeAction('entry_skipped', normalizedSymbol, { entryReady: false, reason: sig.why, ...(sig.meta || {}) });
+            logTradeAction('entry_skipped', normalizedSymbol, {
+              entryReady: false,
+              reason: sig.why,
+              signal_summary: buildSignalSummary(sig),
+              ...(sig.meta || {}),
+              ...decisionBase,
+            });
             decisionReason = sig?.why || 'signal_false';
           }
         } catch (err) {
@@ -5917,16 +6296,22 @@ export default function App() {
       const openSell = exitMetrics?.openSellCount ?? 0;
       const cancels = exitMetrics?.cancelsCount ?? 0;
       const cancelsDueToTtl = exitMetrics?.ttlCancelsCount ?? 0;
-      logTradeAction('scan_summary', 'STATIC', {
-        readyCount,
-        attemptsSent,
-        attemptsFailed,
-        ordersOpen,
-        fillsCount,
-        openBuy,
-        openSell,
+      const scanDurationMs = Date.now() - scanStartMs;
+      logTradeAction('scan_summary', 'GLOBAL', {
+        ready: readyCount,
+        in_position: openCount,
+        open_orders: (allOpenOrders || []).length,
+        buys_sent: attemptsSent,
+        sells_sent: exitMetrics?.attemptsSent ?? 0,
         cancels,
-        cancelsDueToTtl,
+        replaces: 0,
+        fills_seen: fillsCount,
+        skips: skippedCount,
+        errors: attemptsFailed,
+        duration_ms: scanDurationMs,
+        open_buy: openBuy,
+        open_sell: openSell,
+        cancels_ttl: cancelsDueToTtl,
       });
       const followUp = await pollRecentOrderStates();
       if (followUp && Number.isFinite(followUp?.ordersOpen)) {
@@ -6069,7 +6454,7 @@ export default function App() {
 
   function reasonKeyFromEntry(raw) {
     if (!raw) return null;
-    if (raw.type === 'entry_skipped') return raw.reason || null;
+    if (raw.event === 'DECISION' && raw.action === 'SKIP') return raw.reason || null;
     if (raw.type === 'skip_wide_spread') return 'spread';
     if (raw.type === 'taker_blocked_fee') return 'taker_blocked_fee';
     if (raw.type === 'concurrency_guard') return 'concurrency_guard';
