@@ -142,6 +142,7 @@ const FORCE_EXIT_SECONDS = Number(process.env.FORCE_EXIT_SECONDS || 600);
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 100);
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
+const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
 const QUOTE_CACHE_MAX_AGE_MS = 60000;
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
@@ -155,6 +156,13 @@ const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
+const positionsSnapshot = {
+  tsMs: 0,
+  mapBySymbol: new Map(),
+  mapByRaw: new Map(),
+  loggedNoneSymbols: new Set(),
+  pending: null,
+};
 let lastHttpError = null;
 const marketDataState = {
   consecutiveFailures: 0,
@@ -322,9 +330,17 @@ function logMarketDataDiagnostics({ type, url, statusCode, snippet, errorType, r
 }
 
 function logHttpError({ symbol, label, url, error }) {
-  const statusCode = error?.statusCode ?? null;
-  const errorMessage = error?.errorMessage || error?.message || 'Unknown error';
-  const snippet = error?.responseSnippet200 || '';
+  const axiosStatus = error?.response?.status;
+  const statusCode = error?.statusCode ?? axiosStatus ?? null;
+  const axiosData = error?.response?.data;
+  const axiosSnippet =
+    typeof axiosData === 'string'
+      ? axiosData.slice(0, 200)
+      : axiosData
+        ? JSON.stringify(axiosData).slice(0, 200)
+        : '';
+  const errorMessage = error?.errorMessage || error?.message || `HTTP ${statusCode ?? 'NA'}`;
+  const snippet = error?.responseSnippet200 || error?.responseSnippet || axiosSnippet || '';
   const method = error?.method || null;
   const requestId = error?.requestId || null;
   const urlHost = error?.urlHost || null;
@@ -345,6 +361,67 @@ function logHttpError({ symbol, label, url, error }) {
   });
   if (statusCode === 401 || statusCode === 403) {
     console.error('AUTH_ERROR: check Render env vars');
+  }
+}
+
+function logPositionNoneOnce(symbol, statusCode = 404) {
+  const normalized = normalizeSymbol(symbol);
+  if (positionsSnapshot.loggedNoneSymbols.has(normalized)) return;
+  positionsSnapshot.loggedNoneSymbols.add(normalized);
+  console.log('POS_NONE', { symbol: normalized, status: statusCode });
+}
+
+function logPositionError({ symbol, statusCode, snippet, level = 'error', extra = {} }) {
+  const normalized = normalizeSymbol(symbol);
+  const payload = {
+    symbol: normalized,
+    status: statusCode ?? null,
+    snippet: snippet || '',
+    ...extra,
+  };
+  if (level === 'warn') {
+    console.warn('POS_ERR', payload);
+  } else {
+    console.error('POS_ERR', payload);
+  }
+}
+
+function updatePositionsSnapshot(positions = []) {
+  const mapBySymbol = new Map();
+  const mapByRaw = new Map();
+  for (const pos of positions) {
+    const rawSymbol = pos.rawSymbol ?? pos.symbol;
+    const normalizedSymbol = normalizeSymbol(rawSymbol);
+    if (rawSymbol) {
+      mapByRaw.set(rawSymbol, pos);
+    }
+    if (normalizedSymbol) {
+      mapBySymbol.set(normalizedSymbol, pos);
+    }
+  }
+  positionsSnapshot.mapBySymbol = mapBySymbol;
+  positionsSnapshot.mapByRaw = mapByRaw;
+  positionsSnapshot.tsMs = Date.now();
+  positionsSnapshot.loggedNoneSymbols.clear();
+}
+
+async function fetchPositionsSnapshot({ force = false } = {}) {
+  const nowMs = Date.now();
+  if (!force && positionsSnapshot.mapBySymbol.size > 0 && nowMs - positionsSnapshot.tsMs < POSITIONS_SNAPSHOT_TTL_MS) {
+    return positionsSnapshot;
+  }
+  if (positionsSnapshot.pending) {
+    return positionsSnapshot.pending;
+  }
+  positionsSnapshot.pending = (async () => {
+    const positions = await fetchPositions();
+    updatePositionsSnapshot(positions);
+    return positionsSnapshot;
+  })();
+  try {
+    return await positionsSnapshot.pending;
+  } finally {
+    positionsSnapshot.pending = null;
   }
 }
 
@@ -1192,12 +1269,14 @@ async function fetchPositions() {
     headers: alpacaHeaders(),
   });
   const positions = Array.isArray(res) ? res : [];
-  return positions.map((pos) => ({
+  const normalized = positions.map((pos) => ({
     ...pos,
     rawSymbol: pos.symbol,
     pairSymbol: normalizeSymbol(pos.symbol),
     symbol: normalizeSymbol(pos.symbol),
   }));
+  updatePositionsSnapshot(normalized);
+  return normalized;
 }
 
 async function fetchPosition(symbol) {
@@ -1207,11 +1286,49 @@ async function fetchPosition(symbol) {
     path: `positions/${encodeURIComponent(normalized)}`,
     label: 'positions_single',
   });
-  return requestJson({
-    method: 'GET',
-    url,
-    headers: alpacaHeaders(),
-  });
+  try {
+    return await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+  } catch (err) {
+    const statusCode = err?.statusCode ?? err?.response?.status ?? null;
+    const axiosData = err?.response?.data;
+    const axiosSnippet =
+      typeof axiosData === 'string'
+        ? axiosData.slice(0, 200)
+        : axiosData
+          ? JSON.stringify(axiosData).slice(0, 200)
+          : '';
+    const snippet = err?.responseSnippet200 || err?.responseSnippet || axiosSnippet || '';
+    if (statusCode === 404) {
+      logPositionNoneOnce(symbol, statusCode);
+      return null;
+    }
+    if (statusCode === 429) {
+      logPositionError({
+        symbol,
+        statusCode,
+        snippet,
+        level: 'warn',
+        extra: {
+          rateLimit: err?.rateLimit ?? null,
+        },
+      });
+      throw err;
+    }
+    if (statusCode === 401 || statusCode === 403) {
+      logPositionError({ symbol, statusCode, snippet, level: 'error' });
+      throw err;
+    }
+    if (Number.isFinite(statusCode) && statusCode >= 500) {
+      logPositionError({ symbol, statusCode, snippet, level: 'error' });
+      throw err;
+    }
+    logPositionError({ symbol, statusCode, snippet, level: 'error' });
+    throw err;
+  }
 }
 
 async function fetchAsset(symbol) {
@@ -1229,12 +1346,21 @@ async function fetchAsset(symbol) {
 }
 
 async function getAvailablePositionQty(symbol) {
+  const normalized = normalizeSymbol(symbol);
   try {
-    const pos = await fetchPosition(symbol);
+    const snapshot = await fetchPositionsSnapshot();
+    const pos = snapshot.mapBySymbol.get(normalized);
+    if (!pos) {
+      logPositionNoneOnce(normalized, 404);
+      return 0;
+    }
     const qty = Number(pos?.qty_available ?? pos?.available ?? pos?.qty ?? pos?.quantity ?? 0);
     return Number.isFinite(qty) ? qty : 0;
   } catch (err) {
-    if (err?.statusCode === 404) return 0;
+    if (err?.statusCode === 404) {
+      logPositionNoneOnce(normalized, 404);
+      return 0;
+    }
     throw err;
   }
 }
@@ -2545,6 +2671,14 @@ async function fetchOpenPositions() {
     throw err;
   }
   const positions = Array.isArray(res) ? res : [];
+  updatePositionsSnapshot(
+    positions.map((pos) => ({
+      ...pos,
+      rawSymbol: pos.symbol,
+      pairSymbol: normalizeSymbol(pos.symbol),
+      symbol: normalizeSymbol(pos.symbol),
+    }))
+  );
   return positions
     .map((pos) => {
       const qty = Number(pos.qty ?? pos.quantity ?? 0);
