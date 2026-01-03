@@ -2615,14 +2615,20 @@ async function getUsableBuyingPower({ forCrypto = true } = {}) {
   return { usable, base, pending, snapshot: a };
 }
 
-const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
+const isTpOrder = (order) => {
+  const clientId = order?.client_order_id ?? order?.clientOrderId ?? '';
+  return String(clientId).startsWith('TP_');
+};
+
+const cancelOpenOrdersForSymbol = async (symbol, side = null, options = {}) => {
   try {
     const open = await getOpenOrdersCached();
     const normalizedSymbol = normalizePair(symbol);
     const targets = (open || []).filter(
       (o) =>
         (o.pairSymbol ?? normalizePair(o.symbol)) === normalizedSymbol &&
-        (!side || (o.side || '').toLowerCase() === String(side).toLowerCase())
+        (!side || (o.side || '').toLowerCase() === String(side).toLowerCase()) &&
+        (options?.allowTpCancel || !isTpOrder(o))
     );
     await Promise.all(
       targets.map((o) =>
@@ -2632,10 +2638,11 @@ const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
     __openOrdersCache = { ts: 0, items: [] };
   } catch {}
 };
-const cancelAllOrders = async () => {
+const cancelAllOrders = async (options = {}) => {
   try {
     const orders = await getOpenOrdersCached();
-    await Promise.all((orders || []).map((o) => f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)));
+    const targets = (orders || []).filter((o) => options?.allowTpCancel || !isTpOrder(o));
+    await Promise.all(targets.map((o) => f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)));
     __openOrdersCache = { ts: 0, items: [] };
   } catch {}
 };
@@ -2711,7 +2718,12 @@ const buildExitClientOrderId = (symbol) => {
   return `EXIT-${normalized}-${Date.now()}`;
 };
 
-const getSellExitTimeInForce = (symbol) => (isStock(symbol) ? 'day' : 'ioc');
+const buildTpClientOrderId = (symbol) => {
+  const normalized = normalizePair(symbol).replace('/', '');
+  return `TP_${normalized}-${Date.now()}`;
+};
+
+const getSellExitTimeInForce = (symbol) => (isStock(symbol) ? 'day' : 'gtc');
 
 const RISK_EXIT_COOLDOWN_MS = 60000;
 function computeRiskDecision({ entryPrice, currentPrice, peakPrice, trailingActive, settings }) {
@@ -4134,7 +4146,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       type: 'limit',
       time_in_force: limitTIF,
       limit_price: finalLimit.toFixed(decimals),
-      client_order_id: buildExitClientOrderId(normalizedSymbol),
+      client_order_id: buildTpClientOrderId(normalizedSymbol),
       reason: 'exit_tp_limit',
     };
     logOrderPayload('sell_limit', order);
@@ -4282,6 +4294,7 @@ const reconcileExits = async ({
 
   const cancelSellOrder = async (order, reason) => {
     if (!order?.id) return false;
+    if (isTpOrder(order)) return false;
     const ok = await cancelOrder(order.id);
     if (ok) {
       cancelsCount += 1;

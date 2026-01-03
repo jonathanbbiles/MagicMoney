@@ -213,7 +213,7 @@ function buildAlpacaUrl({ baseUrl, path, params, label }) {
 }
 
 function toTradeSymbol(rawSymbol) {
-  return alpacaSymbol(rawSymbol);
+  return normalizePair(rawSymbol);
 }
 
 function toDataSymbol(rawSymbol) {
@@ -723,6 +723,11 @@ function buildClientOrderId(symbol, purpose) {
 function buildExitClientOrderId(symbol) {
   const normalized = canonicalAsset(symbol) || 'UNKNOWN';
   return `EXIT-${normalized}-${Date.now()}`;
+}
+
+function buildTpClientOrderId(symbol) {
+  const normalized = canonicalAsset(symbol) || 'UNKNOWN';
+  return `TP_${normalized}-${Date.now()}`;
 }
 
 function logBuyDecision(symbol, computedNotionalUsd, decision) {
@@ -1833,25 +1838,57 @@ async function submitLimitSell({
   const finalQty = sizeGuard.qty ?? qty;
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_limit_sell' });
+  const clientOrderId = buildTpClientOrderId(symbol);
   const payload = {
     symbol: toTradeSymbol(symbol),
     qty: finalQty,
     side: 'sell',
     type: 'limit',
-    time_in_force: isCryptoSymbol(symbol) ? 'ioc' : 'gtc',
+    time_in_force: 'gtc',
     limit_price: limitPrice,
-    client_order_id: buildExitClientOrderId(symbol),
+    client_order_id: clientOrderId,
   };
-  const response = await placeOrderUnified({
+  console.log('tp_sell_attempt', {
     symbol,
-    url,
-    payload,
-    label: 'orders_limit_sell',
-    reason,
-    context: 'limit_sell',
+    qty: finalQty,
+    limitPrice,
+    tif: payload.time_in_force,
+    client_order_id: clientOrderId,
+    sell_reason: 'TP_ATTACH',
   });
+  let response;
+  try {
+    response = await placeOrderUnified({
+      symbol,
+      url,
+      payload,
+      label: 'orders_limit_sell',
+      reason,
+      context: 'limit_sell',
+    });
+  } catch (err) {
+    const status = err?.statusCode ?? err?.response?.status ?? null;
+    const body = err?.response?.data ?? err?.responseSnippet200 ?? err?.responseSnippet ?? err?.message ?? null;
+    const bodyText = typeof body === 'string' ? body : JSON.stringify(body);
+    console.error('tp_sell_error', { symbol, status, body: bodyText });
+    throw err;
+  }
 
   console.log('submit_limit_sell', { symbol, qty, limitPrice, reason, orderId: response?.id });
+
+  try {
+    const open = await fetchOrders({ status: 'open' });
+    const hasOpenSell = (Array.isArray(open) ? open : []).some((order) => {
+      const orderSymbol = normalizePair(order.symbol);
+      const side = String(order.side || '').toLowerCase();
+      return orderSymbol === normalizePair(symbol) && side === 'sell';
+    });
+    if (!hasOpenSell) {
+      console.warn('TP missing after buy', { symbol });
+    }
+  } catch (err) {
+    console.warn('tp_open_check_failed', { symbol, error: err?.message || err });
+  }
 
   return response;
 
@@ -1892,7 +1929,7 @@ async function submitMarketSell({
     qty: finalQty,
     side: 'sell',
     type: 'market',
-    time_in_force: isCryptoSymbol(symbol) ? 'ioc' : 'gtc',
+    time_in_force: 'gtc',
     client_order_id: buildExitClientOrderId(symbol),
   };
   const response = await placeOrderUnified({
