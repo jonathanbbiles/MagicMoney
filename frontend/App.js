@@ -2620,6 +2620,13 @@ const isTpOrder = (order) => {
   return String(clientId).startsWith('TP_');
 };
 
+const lastCancelCaller = { reason: null, ts: null };
+const noteCancelCaller = (reason) => {
+  if (!reason) return;
+  lastCancelCaller.reason = reason;
+  lastCancelCaller.ts = Date.now();
+};
+
 const cancelOpenOrdersForSymbol = async (symbol, side = null, options = {}) => {
   try {
     const open = await getOpenOrdersCached();
@@ -2630,6 +2637,7 @@ const cancelOpenOrdersForSymbol = async (symbol, side = null, options = {}) => {
         (!side || (o.side || '').toLowerCase() === String(side).toLowerCase()) &&
         (options?.allowTpCancel || !isTpOrder(o))
     );
+    noteCancelCaller(options?.caller || `symbol_cancel:${normalizedSymbol}:${side || 'all'}`);
     await Promise.all(
       targets.map((o) =>
         f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)
@@ -2642,6 +2650,7 @@ const cancelAllOrders = async (options = {}) => {
   try {
     const orders = await getOpenOrdersCached();
     const targets = (orders || []).filter((o) => options?.allowTpCancel || !isTpOrder(o));
+    noteCancelCaller(options?.caller || 'cancel_all');
     await Promise.all(targets.map((o) => f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)));
     __openOrdersCache = { ts: 0, items: [] };
   } catch {}
@@ -2664,6 +2673,7 @@ async function getOpenSellOrderBySymbol(symbol, cached = null) {
 async function cancelOrder(orderId) {
   if (!orderId) return false;
   try {
+    noteCancelCaller(`cancel_order:${orderId}`);
     await f(`${BACKEND_BASE_URL}/orders/${orderId}`, { method: 'DELETE', headers: BACKEND_HEADERS });
     __openOrdersCache = { ts: 0, items: [] };
     return true;
@@ -2718,9 +2728,14 @@ const buildExitClientOrderId = (symbol) => {
   return `EXIT-${normalized}-${Date.now()}`;
 };
 
+const buildEntryClientOrderId = (symbol) => {
+  const normalized = normalizePair(symbol).replace('/', '');
+  return `ENTRY_${normalized}_${Date.now()}`;
+};
+
 const buildTpClientOrderId = (symbol) => {
   const normalized = normalizePair(symbol).replace('/', '');
-  return `TP_${normalized}-${Date.now()}`;
+  return `TP_${normalized}_${Date.now()}`;
 };
 
 const getSellExitTimeInForce = (symbol) => (isStock(symbol) ? 'day' : 'gtc');
@@ -3633,6 +3648,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       const order = {
         symbol: normalizedSymbol, qty, side: 'buy', type: 'limit', time_in_force: 'gtc',
         limit_price: formatLimit(join),
+        client_order_id: buildEntryClientOrderId(normalizedSymbol),
       };
       try {
         logOrderPayload('buy_limit', order);
@@ -3742,7 +3758,7 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         mQty = sizingCheck.qty ?? mQty;
       }
       const tif = isStock(symbol) ? 'day' : 'gtc';
-      const order = { symbol: normalizedSymbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif };
+      const order = { symbol: normalizedSymbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif, client_order_id: buildEntryClientOrderId(normalizedSymbol) };
       try {
         logOrderPayload('buy_market', order);
         emitDecisionSnapshot?.('ATTEMPT', {
@@ -3887,6 +3903,12 @@ const SELL_ORDER_TTL_MS = 60000;
 const SELL_ORDER_REPLACE_COOLDOWN_MS = 15000;
 const sellReplaceCooldownBySymbol = new Map();
 const SELL_EPS_BPS = 0.2;
+const TP_START_PROFIT_BPS = 500;
+const TP_STEP_DOWN_BPS = 10;
+const TP_STEP_INTERVAL_MS = 30000;
+const TP_FEE_BUY = 0.0025;
+const TP_FEE_SELL = 0.0025;
+const TP_FLOOR_BUFFER = 0.0001;
 
 /**
  * Dynamic, spread-aware stops with a grace window to avoid instant stop-outs.
@@ -3981,6 +4003,24 @@ const ensureRiskExits = async (symbol, { tradeStateRef, pos } = {}) => {
 /**
  * Fee-aware TP posting + taker touch exit using *dynamic buy bps* (maker/taker).
  */
+const getTpFloorPrice = (entryPx) => {
+  if (!(entryPx > 0)) return null;
+  const breakEvenMult = (1 + TP_FEE_BUY) / Math.max(1e-9, (1 - TP_FEE_SELL));
+  const floorMult = breakEvenMult * (1 + TP_FLOOR_BUFFER);
+  return entryPx * floorMult;
+};
+
+const fetchOrderById = async (orderId) => {
+  if (!orderId) return null;
+  try {
+    const res = await f(`${BACKEND_BASE_URL}/orders/${orderId}`, { headers: BACKEND_HEADERS });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+};
+
 const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, openSellBySym, pos } = {}) => {
   let attemptsSent = 0;
   let attemptsFailed = 0;
@@ -3999,6 +4039,168 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
 
   const riskExited = await ensureRiskExits(normalizedSymbol, { tradeStateRef, pos: posInfo });
   if (riskExited) return { attemptsSent, attemptsFailed, attempted };
+
+  if (!isStock(symbol)) {
+    const now = Date.now();
+    const entryTs = state.entryTs || now;
+    if (!state.entryTs) {
+      tradeStateRef.current[normalizedSymbol] = { ...(state || {}), entryTs };
+    }
+    const steps = Math.max(0, Math.floor((now - entryTs) / TP_STEP_INTERVAL_MS));
+    const targetBps = Math.max(0, TP_START_PROFIT_BPS - (steps * TP_STEP_DOWN_BPS));
+    const floorPrice = getTpFloorPrice(entryPx);
+    const targetPrice = entryPx * (1 + targetBps / 10000);
+    const tickSize = 1e-5;
+    let finalLimit = Math.max(targetPrice, floorPrice || 0);
+    finalLimit = roundToTick(finalLimit, tickSize);
+
+    let existing = null;
+    const bySym = openSellBySym?.get?.(normalizedSymbol);
+    if (bySym && isTpOrder(bySym)) existing = bySym;
+    if (!existing) {
+      const open = await getOpenOrdersCached();
+      existing = (open || []).find(
+        (o) =>
+          (o.side || '').toLowerCase() === 'sell' &&
+          (o.type || '').toLowerCase() === 'limit' &&
+          normalizePair(o.symbol) === normalizedSymbol &&
+          isTpOrder(o)
+      ) || null;
+    }
+
+    const stateRef = tradeStateRef?.current?.[normalizedSymbol] || state;
+    if (existing?.id) {
+      stateRef.tpOrderId = existing.id;
+    }
+
+    if (!existing && stateRef?.tpOrderId) {
+      const fetched = await fetchOrderById(stateRef.tpOrderId);
+      const status = String(fetched?.status || '').toLowerCase();
+      if (status === 'filled') {
+        stateRef.tpOrderId = null;
+        return { attemptsSent, attemptsFailed, attempted };
+      }
+      const ageSec = lastCancelCaller.ts ? Math.max(0, (Date.now() - lastCancelCaller.ts) / 1000) : null;
+      console.warn('tp_order_missing', {
+        symbol: normalizedSymbol,
+        orderId: stateRef.tpOrderId,
+        cancelCaller: lastCancelCaller.reason,
+        cancelAgeSec: ageSec,
+      });
+      stateRef.tpOrderId = null;
+    }
+
+    const currentLimit = existing ? Number(existing.limit_price ?? existing.limitPrice) : Number(stateRef?.tpLastLimit);
+    const priceDiff = Number.isFinite(currentLimit) ? Math.abs(currentLimit - finalLimit) : Infinity;
+    const stepChanged = stateRef?.tpStepIndex !== steps;
+
+    if (!existing) {
+      const latestPos = await getPositionInfo(normalizedSymbol);
+      const latestQty = Number(latestPos?.available ?? latestPos?.qty ?? 0);
+      if (!(latestQty > 0)) return { attemptsSent, attemptsFailed, attempted };
+      const order = {
+        symbol: toInternalSymbol(normalizedSymbol),
+        qty: latestQty,
+        side: 'sell',
+        type: 'limit',
+        time_in_force: 'gtc',
+        limit_price: finalLimit.toFixed(5),
+        client_order_id: buildTpClientOrderId(normalizedSymbol),
+        reason: 'exit_tp_limit',
+      };
+      try {
+        logOrderPayload('sell_limit', order);
+        attemptsSent += 1;
+        attempted = true;
+        const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
+        const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
+        logOrderResponse('sell_limit', order, res, data);
+        if (res.ok && data?.ok && data?.orderId) {
+          tradeStateRef.current[normalizedSymbol] = { ...(stateRef || {}), tpOrderId: data.orderId, tpLastLimit: finalLimit, tpStepIndex: steps };
+          console.log('tp_ladder_create', {
+            symbol: normalizedSymbol,
+            buyFillPrice: entryPx,
+            tpPrice: finalLimit,
+            floorPrice,
+            tpOrderId: data.orderId,
+          });
+          console.log('tp_ladder_step', {
+            symbol: normalizedSymbol,
+            oldPrice: Number.isFinite(currentLimit) ? currentLimit : null,
+            newPrice: finalLimit,
+            targetBps,
+            status: 'created',
+          });
+        } else {
+          attemptsFailed += 1;
+          const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
+          logTradeAction('tp_limit_error', normalizedSymbol, { error: `POST ${res.status} ${msg}` });
+        }
+      } catch (e) {
+        attemptsFailed += 1;
+        logOrderError('sell_limit', { symbol: normalizedSymbol, qty: latestQty, side: 'sell', type: 'limit', time_in_force: 'gtc', limit_price: finalLimit }, e);
+        logTradeAction('tp_limit_error', normalizedSymbol, { error: e.message });
+      }
+      return { attemptsSent, attemptsFailed, attempted };
+    }
+
+    if ((stepChanged || priceDiff >= tickSize) && Number.isFinite(finalLimit) && finalLimit > 0) {
+      const payload = { limit_price: finalLimit.toFixed(5) };
+      try {
+        attemptsSent += 1;
+        attempted = true;
+        const res = await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'PATCH', headers: BACKEND_HEADERS, body: JSON.stringify(payload) });
+        const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
+        const orderId = data?.orderId || data?.id || existing.id;
+        if (res.ok && (data?.ok || data?.id || data?.orderId)) {
+          tradeStateRef.current[normalizedSymbol] = {
+            ...(stateRef || {}),
+            tpOrderId: orderId,
+            tpLastLimit: finalLimit,
+            tpStepIndex: steps,
+          };
+          console.log('tp_ladder_step', {
+            symbol: normalizedSymbol,
+            oldPrice: Number.isFinite(currentLimit) ? currentLimit : null,
+            newPrice: finalLimit,
+            targetBps,
+            status: 'replaced',
+          });
+        } else {
+          attemptsFailed += 1;
+          const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
+          console.log('tp_ladder_step', {
+            symbol: normalizedSymbol,
+            oldPrice: Number.isFinite(currentLimit) ? currentLimit : null,
+            newPrice: finalLimit,
+            targetBps,
+            status: `replace_failed:${res.status}`,
+          });
+          logTradeAction('tp_limit_error', normalizedSymbol, { error: `PATCH ${res.status} ${msg}` });
+        }
+      } catch (e) {
+        attemptsFailed += 1;
+        console.log('tp_ladder_step', {
+          symbol: normalizedSymbol,
+          oldPrice: Number.isFinite(currentLimit) ? currentLimit : null,
+          newPrice: finalLimit,
+          targetBps,
+          status: 'replace_error',
+        });
+        logTradeAction('tp_limit_error', normalizedSymbol, { error: e.message });
+      }
+    } else if (stepChanged) {
+      tradeStateRef.current[normalizedSymbol] = { ...(stateRef || {}), tpStepIndex: steps };
+      console.log('tp_ladder_step', {
+        symbol: normalizedSymbol,
+        oldPrice: Number.isFinite(currentLimit) ? currentLimit : null,
+        newPrice: finalLimit,
+        targetBps,
+        status: 'hold',
+      });
+    }
+    return { attemptsSent, attemptsFailed, attempted };
+  }
 
   const heldMinutes = (Date.now() - (state.entryTs || 0)) / 60000;
   if (Number.isFinite(heldMinutes) && heldMinutes >= SETTINGS.maxHoldMin) {
@@ -4295,6 +4497,7 @@ const reconcileExits = async ({
   const cancelSellOrder = async (order, reason) => {
     if (!order?.id) return false;
     if (isTpOrder(order)) return false;
+    noteCancelCaller(`sell_cleanup:${reason || 'unknown'}`);
     const ok = await cancelOrder(order.id);
     if (ok) {
       cancelsCount += 1;
@@ -5160,7 +5363,7 @@ export default function App() {
     }
     if (FORCE_ONE_TEST_BUY && !forceTestBuyUsed && !STABLES.has(normalizedSymbol) && !BLACKLIST.has(normalizedSymbol)) {
       const notional = Math.max(1, Math.min(5, FORCE_ONE_TEST_BUY_NOTIONAL || 2));
-      const order = { symbol: normalizedSymbol, notional, side: 'buy', type: 'market', time_in_force: 'gtc' };
+      const order = { symbol: normalizedSymbol, notional, side: 'buy', type: 'market', time_in_force: 'gtc', client_order_id: buildEntryClientOrderId(normalizedSymbol) };
       console.warn('FORCE_ONE_TEST_BUY', { symbol: normalizedSymbol, notional });
       let attemptsSent = exitMetrics?.attemptsSent || 0;
       let attemptsFailed = exitMetrics?.attemptsFailed || 0;
@@ -6420,8 +6623,14 @@ export default function App() {
             <TouchableOpacity onPress={onRefresh} style={[styles.pillToggle, styles.pillNeutral]}>
               <Text style={styles.pillText}>Refresh</Text>
             </TouchableOpacity>
-            <TouchableOpacity onPress={cancelAllOrders} style={[styles.pillToggle, styles.btnWarn]}>
+            <TouchableOpacity onPress={() => cancelAllOrders({ caller: 'manual_cancel_orders' })} style={[styles.pillToggle, styles.btnWarn]}>
               <Text style={styles.pillText}>Cancel Orders</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => cancelAllOrders({ allowTpCancel: true, caller: 'manual_mass_cancel_tp' })}
+              style={[styles.pillToggle, styles.btnWarn]}
+            >
+              <Text style={styles.pillText}>Cancel TP</Text>
             </TouchableOpacity>
             <TouchableOpacity
               onPress={() => setAutoTrade((v) => !v)}

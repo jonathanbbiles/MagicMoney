@@ -720,6 +720,11 @@ function buildClientOrderId(symbol, purpose) {
   return `${normalized}-${purpose}-${randomUUID()}`;
 }
 
+function buildEntryClientOrderId(symbol) {
+  const normalized = canonicalAsset(symbol) || 'UNKNOWN';
+  return `ENTRY_${normalized}_${Date.now()}`;
+}
+
 function buildExitClientOrderId(symbol) {
   const normalized = canonicalAsset(symbol) || 'UNKNOWN';
   return `EXIT-${normalized}-${Date.now()}`;
@@ -727,7 +732,7 @@ function buildExitClientOrderId(symbol) {
 
 function buildTpClientOrderId(symbol) {
   const normalized = canonicalAsset(symbol) || 'UNKNOWN';
-  return `TP_${normalized}-${Date.now()}`;
+  return `TP_${normalized}_${Date.now()}`;
 }
 
 function logBuyDecision(symbol, computedNotionalUsd, decision) {
@@ -1031,7 +1036,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     // crypto orders must be GTC
     time_in_force: 'gtc',
     limit_price: limitPrice,
-    client_order_id: buildClientOrderId(normalizedSymbol, 'limit-buy'),
+    client_order_id: buildEntryClientOrderId(normalizedSymbol),
   };
   const buyOrder = await placeOrderUnified({
     symbol: normalizedSymbol,
@@ -2414,7 +2419,7 @@ async function placeMarketBuyThenSell(symbol) {
     side: 'buy',
     type: 'market',
     time_in_force: 'gtc',
-    client_order_id: buildClientOrderId(normalizedSymbol, 'market-buy'),
+    client_order_id: buildEntryClientOrderId(normalizedSymbol),
   };
   const buyOrder = await placeOrderUnified({
     symbol: normalizedSymbol,
@@ -2632,6 +2637,8 @@ async function submitOrder(order = {}) {
   const useNotional = !useQty && hasNotional;
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_submit' });
+  const defaultClientOrderId =
+    sideLower === 'buy' ? buildEntryClientOrderId(normalizedSymbol) : buildClientOrderId(normalizedSymbol, 'order');
   const payload = {
     symbol: toTradeSymbol(normalizedSymbol),
     side: sideLower,
@@ -2640,7 +2647,7 @@ async function submitOrder(order = {}) {
     limit_price: Number.isFinite(limitPriceNum) ? limitPriceNum : undefined,
     qty: useQty ? finalQty : undefined,
     notional: useNotional ? finalNotional : undefined,
-    client_order_id: client_order_id || buildClientOrderId(normalizedSymbol, 'order'),
+    client_order_id: client_order_id || defaultClientOrderId,
   };
   return placeOrderUnified({
     symbol: normalizedSymbol,
@@ -2651,6 +2658,26 @@ async function submitOrder(order = {}) {
     context: 'submit_order',
   });
 
+}
+
+async function replaceOrder(orderId, payload = {}) {
+  const url = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: `orders/${orderId}`,
+    label: 'orders_replace',
+  });
+  try {
+    const response = await requestJson({
+      method: 'PATCH',
+      url,
+      headers: alpacaJsonHeaders(),
+      body: JSON.stringify(payload),
+    });
+    return response;
+  } catch (err) {
+    logHttpError({ label: 'orders_replace', url, error: err });
+    throw err;
+  }
 }
 
 async function fetchOrders(params = {}) {
@@ -2960,6 +2987,8 @@ module.exports = {
   submitOrder,
 
   fetchOrders,
+  fetchOrderById,
+  replaceOrder,
 
   cancelOrder,
 
