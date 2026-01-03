@@ -8,6 +8,8 @@ const {
   initializeInventoryFromPositions,
   submitOrder,
   fetchOrders,
+  fetchOrderById,
+  replaceOrder,
   cancelOrder,
   startExitManager,
   getConcurrencyGuardStatus,
@@ -220,6 +222,16 @@ app.get('/orders', async (req, res) => {
   }
 });
 
+app.get('/orders/:id', async (req, res) => {
+  try {
+    const order = await fetchOrderById(req.params.id);
+    res.json(order || null);
+  } catch (error) {
+    console.error('Order fetch error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/orders', async (req, res) => {
   try {
     const result = await submitOrder(req.body || {});
@@ -238,6 +250,35 @@ app.post('/orders', async (req, res) => {
     }
   } catch (error) {
     console.error('Order submit error:', error?.responseSnippet || error.message);
+    res.status(500).json({
+      ok: false,
+      error: {
+        message: error.message,
+        code: error?.errorCode ?? error?.code ?? null,
+        status: error?.statusCode ?? 500,
+      },
+    });
+  }
+});
+
+app.patch('/orders/:id', async (req, res) => {
+  try {
+    const result = await replaceOrder(req.params.id, req.body || {});
+    if (result?.id) {
+      res.json({
+        ok: true,
+        orderId: result.id,
+        status: result.status || result.order_status || 'accepted',
+        order: result,
+      });
+    } else {
+      res.status(500).json({
+        ok: false,
+        error: { message: 'Order replace rejected', code: null, status: 500 },
+      });
+    }
+  } catch (error) {
+    console.error('Order replace error:', error?.responseSnippet || error.message);
     res.status(500).json({
       ok: false,
       error: {
