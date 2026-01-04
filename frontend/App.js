@@ -2482,12 +2482,17 @@ const getAllPositions = async () => {
       : [];
   } catch { return []; }
 };
+const OPEN_ORDER_STATUSES = new Set(['new', 'accepted', 'pending_new', 'partially_filled', 'open']);
+const isOpenOrderStatus = (order) => {
+  const status = String(order?.status || order?.order_status || order?.orderStatus || '').toLowerCase();
+  return OPEN_ORDER_STATUSES.has(status);
+};
 const getOrdersByStatus = async (status = 'open') => {
   try {
     const r = await f(`${BACKEND_BASE_URL}/orders?status=${encodeURIComponent(status)}&nested=true&limit=100`, { headers: BACKEND_HEADERS });
     if (!r.ok) return [];
     const arr = await r.json();
-    return Array.isArray(arr)
+    const mapped = Array.isArray(arr)
       ? arr.map((order) => ({
         ...order,
         rawSymbol: order.rawSymbol ?? order.symbol,
@@ -2495,6 +2500,10 @@ const getOrdersByStatus = async (status = 'open') => {
         symbol: normalizePair(order.rawSymbol ?? order.symbol),
       }))
       : [];
+    if (String(status || '').toLowerCase() === 'open') {
+      return mapped.filter(isOpenOrderStatus);
+    }
+    return mapped;
   } catch { return []; }
 };
 const getOpenOrders = async () => getOrdersByStatus('open');
@@ -4511,6 +4520,77 @@ const reconcileLocalState = async ({ positions, openOrders, tradeStateRef, touch
   }
 };
 
+const computeExitTargetPrice = ({ symbol, entryBase, qty, settings, state }) => {
+  const slipEw = symStats[symbol]?.slipEwmaBps ?? (settings?.slipBpsByRisk?.[settings?.riskLevel ?? SETTINGS.riskLevel] ?? 1);
+  const needAdj = Math.max(
+    requiredProfitBpsForSymbol(symbol, settings?.riskLevel ?? SETTINGS.riskLevel),
+    exitFloorBps(symbol) + 0.5 + slipEw,
+    eff(symbol, 'netMinProfitBps')
+  );
+  const tpBase = entryBase > 0 ? entryBase * (1 + needAdj / 10000) : null;
+  const feeFloor = entryBase > 0 && qty > 0
+    ? minExitPriceFeeAwareDynamic({
+      symbol,
+      entryPx: entryBase,
+      qty,
+      buyBpsOverride: state?.buyBpsApplied,
+    })
+    : null;
+  const targetPrice = Number.isFinite(tpBase) && Number.isFinite(feeFloor) ? Math.max(tpBase, feeFloor) : tpBase;
+  const tpBps = Number.isFinite(entryBase) && entryBase > 0 && Number.isFinite(targetPrice)
+    ? ((targetPrice - entryBase) / entryBase) * 10000
+    : null;
+  return { targetPrice, feeFloor, tpBps, slipEw, needAdj };
+};
+
+const getExitQuoteContext = async ({ symbol, entryBase, now }) => {
+  let rawQuote = null;
+  try {
+    const qmap = await getCryptoQuotesBatch([symbol]);
+    rawQuote = qmap.get(toInternalSymbol(symbol)) || null;
+  } catch {
+    rawQuote = null;
+  }
+
+  const hasQuote = rawQuote && Number.isFinite(rawQuote.bid) && Number.isFinite(rawQuote.ask) && rawQuote.bid > 0 && rawQuote.ask > 0;
+  const quoteFreshness = hasQuote ? assessQuoteFreshness(rawQuote, now) : { ok: false, ageMs: null, tsMs: null };
+  if (hasQuote && quoteFreshness.ok) {
+    return {
+      bid: rawQuote.bid,
+      ask: rawQuote.ask,
+      quoteFreshness,
+      fallbackUsed: null,
+      hadStaleQuote: false,
+    };
+  }
+
+  let fallback = null;
+  let fallbackUsed = null;
+  try {
+    const tmap = await getCryptoTradesBatch([symbol]);
+    const trade = tmap.get(toInternalSymbol(symbol));
+    if (trade && Number.isFinite(trade.price) && isFresh(trade.tms, SETTINGS.liveFreshTradeMsCrypto)) {
+      fallback = trade.price;
+      fallbackUsed = 'last_trade';
+    }
+  } catch {
+    fallback = null;
+  }
+
+  if (!fallbackUsed && Number.isFinite(entryBase) && entryBase > 0) {
+    fallback = entryBase;
+    fallbackUsed = 'entry_based';
+  }
+
+  return {
+    bid: Number.isFinite(fallback) ? fallback : null,
+    ask: Number.isFinite(fallback) ? fallback : null,
+    quoteFreshness,
+    fallbackUsed,
+    hadStaleQuote: Boolean(hasQuote && !quoteFreshness.ok),
+  };
+};
+
 const reconcileExits = async ({
   positions,
   openOrders,
@@ -4525,6 +4605,7 @@ const reconcileExits = async ({
   let attemptsSent = 0;
   let attemptsFailed = 0;
   for (const order of openOrders || []) {
+    if (!isOpenOrderStatus(order)) continue;
     const side = String(order?.side || '').toLowerCase();
     if (side === 'buy') openBuyCount += 1;
     if (side !== 'sell') continue;
@@ -4633,26 +4714,17 @@ const reconcileExits = async ({
     const minNotional = meta?._min_notional > 0 ? meta._min_notional : MIN_ORDER_NOTIONAL_USD;
     const state = tradeStateRef?.current?.[symbol] || {};
     const entryBase = Number(state.entry ?? pos.avg_entry_price ?? pos.basis ?? pos.mark ?? 0);
-    const slipEw = symStats[symbol]?.slipEwmaBps ?? (settings?.slipBpsByRisk?.[settings?.riskLevel ?? SETTINGS.riskLevel] ?? 1);
-    const needAdj = Math.max(
-      requiredProfitBpsForSymbol(symbol, settings?.riskLevel ?? SETTINGS.riskLevel),
-      exitFloorBps(symbol) + 0.5 + slipEw,
-      eff(symbol, 'netMinProfitBps')
-    );
-    const tpBase = entryBase > 0 ? entryBase * (1 + needAdj / 10000) : null;
-    const feeFloor = entryBase > 0 && plannedQty > 0
-      ? minExitPriceFeeAwareDynamic({
-        symbol,
-        entryPx: entryBase,
-        qty: plannedQty,
-        buyBpsOverride: state.buyBpsApplied,
-      })
-      : null;
-    const tp = Number.isFinite(tpBase) && Number.isFinite(feeFloor) ? Math.max(tpBase, feeFloor) : tpBase;
-    const quote = await getQuoteSmart(symbol);
-    const quoteFreshness = quote ? assessQuoteFreshness(quote, now) : { ok: false, ageMs: null, tsMs: null };
-    const currentBid = quoteFreshness.ok ? quote.bid : null;
-    const currentAsk = quoteFreshness.ok ? quote.ask : null;
+    const { targetPrice: tp, feeFloor, tpBps } = computeExitTargetPrice({
+      symbol,
+      entryBase,
+      qty: plannedQty,
+      settings,
+      state,
+    });
+    const quoteContext = await getExitQuoteContext({ symbol, entryBase, now });
+    const quoteFreshness = quoteContext.quoteFreshness || { ok: false, ageMs: null, tsMs: null };
+    const currentBid = Number.isFinite(quoteContext.bid) ? quoteContext.bid : null;
+    const currentAsk = Number.isFinite(quoteContext.ask) ? quoteContext.ask : null;
     const breakevenPrice = Number.isFinite(feeFloor) ? feeFloor : (entryBase > 0 ? entryBase : null);
     const targetPrice = Number.isFinite(tp) ? tp : null;
     const unrealizedBps = (Number.isFinite(currentBid) && Number.isFinite(breakevenPrice) && breakevenPrice > 0)
@@ -4679,19 +4751,13 @@ const reconcileExits = async ({
     } else if (!(entryBase > 0)) {
       reasonNoSell = 'other:missing_entry';
       skipReason = 'exit_missing_entry';
-    } else if (!quote) {
-      reasonNoSell = 'no_quote';
-      skipReason = 'exit_no_quote';
-    } else if (!quoteFreshness.ok) {
-      reasonNoSell = 'quote_stale';
-      skipReason = 'exit_quote_stale';
     } else {
       sellEligible = true;
       reasonNoSell = 'other:attempting_sell';
     }
-    const tpBps = Number.isFinite(entryBase) && entryBase > 0 && Number.isFinite(targetPrice)
-      ? ((targetPrice - entryBase) / entryBase) * 10000
-      : null;
+    if (quoteContext.hadStaleQuote && quoteContext.fallbackUsed) {
+      console.log(`EXIT — ${symbol} — stale_quote — using fallback=${quoteContext.fallbackUsed}`);
+    }
     const exitAgeSec = Number.isFinite(state.entryTs) ? Math.max(0, (now - state.entryTs) / 1000) : null;
     const exitNotMet = Number.isFinite(currentBid) && Number.isFinite(targetPrice)
       ? currentBid < targetPrice
@@ -4715,7 +4781,8 @@ const reconcileExits = async ({
       sellEligible,
       reason_no_sell: reasonNoSell,
       quoteAgeMs: quoteFreshness.ageMs,
-      quoteStale: quote ? !quoteFreshness.ok : true,
+      quoteStale: quoteContext.hadStaleQuote,
+      quoteFallback: quoteContext.fallbackUsed,
     });
     if (skipReason) {
       const openOrder = hasOpenSell ? (sellOrders[0] || existing) : null;
@@ -4733,11 +4800,39 @@ const reconcileExits = async ({
       });
     }
 
+    let action = 'none';
+    const limitText = Number.isFinite(targetPrice)
+      ? targetPrice.toFixed(isStock(symbol) ? 2 : 5)
+      : 'n/a';
+    if (
+      autoTrade &&
+      !hasOpenSell &&
+      !existing &&
+      !isSellReplaceCooldownActive(symbol, now) &&
+      plannedQty > 0 &&
+      entryBase > 0
+    ) {
+      const notionalPx = Number.isFinite(targetPrice) ? targetPrice : entryBase;
+      const computedNotional = Number.isFinite(notionalPx) ? plannedQty * notionalPx : NaN;
+      if (Number.isFinite(minNotional) && minNotional > 0 && Number.isFinite(computedNotional) && computedNotional < minNotional) {
+        console.log(`EXIT_SKIP — ${symbol} — reason=min_notional`);
+        logTradeAction('exit_skipped', symbol, {
+          reason: 'min_notional',
+          computedNotional,
+          minNotional,
+        });
+      } else {
+        action = 'place_sell';
+      }
+    }
+    console.log(`EXIT — ${symbol} — hasOpenSell=${hasOpenSell} — action=${action} — limit=${limitText} — qty=${plannedQty}`);
+
     if (state.dust) continue;
     if (!autoTrade || existing) continue;
     if (isSellReplaceCooldownActive(symbol, now)) continue;
     if (!(plannedQty > 0)) continue;
     if (!(entryBase > 0)) continue;
+    if (action !== 'place_sell') continue;
     const sizingCheck = validateOrderCandidate({
       symbol,
       side: 'sell',
@@ -4763,6 +4858,9 @@ const reconcileExits = async ({
     const exitResult = await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos });
     attemptsSent += exitResult?.attemptsSent || 0;
     attemptsFailed += exitResult?.attemptsFailed || 0;
+    if ((exitResult?.attemptsFailed || 0) > 0) {
+      console.log(`EXIT_FAIL — ${symbol} — order_submit_failed`);
+    }
     if (sellEligible && exitNotMet === false && !exitResult?.attempted) {
       attemptsFailed += 1;
       console.error('EXIT_ATTEMPT_MISSING', {
@@ -4792,6 +4890,10 @@ const reconcileExits = async ({
     attemptsFailed,
   };
 };
+
+const manageExits = async (params) =>
+  // EXIT pass is deliberately separate from entry scanning so held positions always maintain sells.
+  reconcileExits(params);
 
 /* ───────────────────────── 25) CONCURRENCY / PDT ───────────────────────────── */
 function __recentHitRate() {
@@ -6059,7 +6161,8 @@ export default function App() {
         targetNotional,
       };
 
-      const [positions, allOpenOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached()]);
+      __openOrdersCache = { ts: 0, items: [] };
+      const [positions, allOpenOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached(0)]);
       const alpacaHeldQtyBySymbol = buildHeldQtyBySymbol(positions);
       const openOrdersBySymbol = buildOpenOrdersBySymbol(allOpenOrders);
       console.log('ACCOUNT', scanBpInfo.snapshot ?? null);
@@ -6085,7 +6188,8 @@ export default function App() {
         riskTrailStateRef,
         recentRiskExitRef,
       });
-      const exitMetrics = await reconcileExits({
+      // EXIT pass runs before entry scanning so held positions always have managed sells.
+      const exitMetrics = await manageExits({
         positions,
         openOrders: allOpenOrders,
         autoTrade,
