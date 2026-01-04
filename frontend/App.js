@@ -2683,6 +2683,61 @@ async function cancelOrder(orderId) {
   }
 }
 
+const logHeldDiagnostics = ({
+  symbol,
+  localHeld,
+  localHeldReason,
+  alpacaQty,
+  openBuyOrdersCount,
+  openSellOrdersCount,
+  entryPrice,
+  currentMid,
+  targetTakeProfitPrice,
+  stopPrice,
+  decision,
+}) => {
+  console.log('HELD_DIAGNOSTICS', {
+    symbol,
+    localHeld,
+    localHeldReason,
+    alpacaQty,
+    openBuyOrdersCount,
+    openSellOrdersCount,
+    entryPrice,
+    currentMid,
+    targetTakeProfitPrice,
+    stopPrice,
+    decision,
+  });
+};
+
+const buildOpenOrdersBySymbol = (openOrders = []) => {
+  const map = new Map();
+  for (const order of openOrders || []) {
+    const symbol = order.pairSymbol ?? normalizePair(order.symbol);
+    if (!symbol) continue;
+    const side = String(order.side || '').toLowerCase();
+    const entry = map.get(symbol) || { buy: 0, sell: 0, total: 0 };
+    if (side === 'buy') entry.buy += 1;
+    if (side === 'sell') entry.sell += 1;
+    entry.total += 1;
+    map.set(symbol, entry);
+  }
+  return map;
+};
+
+const buildHeldQtyBySymbol = (positions = []) => {
+  const map = new Map();
+  for (const pos of positions || []) {
+    const symbol = pos.pairSymbol ?? normalizePair(pos.symbol);
+    const qty = Number(pos.qty ?? pos.quantity ?? 0);
+    if (!symbol) continue;
+    if (!Number.isFinite(qty)) continue;
+    map.set(symbol, qty);
+  }
+  return map;
+};
+
 const parseOrderTimestampMs = (order) => {
   const raw =
     order?.submitted_at ||
@@ -4708,6 +4763,24 @@ const reconcileExits = async ({
     const exitResult = await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos });
     attemptsSent += exitResult?.attemptsSent || 0;
     attemptsFailed += exitResult?.attemptsFailed || 0;
+    if (sellEligible && exitNotMet === false && !exitResult?.attempted) {
+      attemptsFailed += 1;
+      console.error('EXIT_ATTEMPT_MISSING', {
+        symbol,
+        qty: plannedQty,
+        targetPrice,
+        currentBid,
+        openSellOrdersCount: sellOrders.length,
+        reason: 'exit_conditions_met_but_no_attempt',
+      });
+      logTradeAction('exit_submit_error', symbol, {
+        reason: 'exit_conditions_met_but_no_attempt',
+        ...baseExitDetails,
+        targetPrice,
+        currentBid,
+        qty: plannedQty,
+      });
+    }
   }
 
   return {
@@ -5456,6 +5529,41 @@ export default function App() {
     const openOrder = (openOrders || []).find((o) => normalizePair(o.symbol) === normalizedSymbol);
     const openOrderAgeMs = openOrder ? getOrderAgeMs(openOrder) : null;
     if (trulyHeld) {
+      const state = refs?.tradeStateRef?.current?.[normalizedSymbol] || {};
+      const openOrderCounts = buildOpenOrdersBySymbol(openOrders).get(normalizedSymbol) || { buy: 0, sell: 0, total: 0 };
+      const entryBase = Number(state.entry ?? posSnapshot?.avg_entry_price ?? posSnapshot?.basis ?? posSnapshot?.mark ?? 0);
+      const slipEw = symStats[normalizedSymbol]?.slipEwmaBps ?? (effectiveSettings?.slipBpsByRisk?.[effectiveSettings?.riskLevel ?? SETTINGS.riskLevel] ?? 1);
+      const needAdj = Math.max(
+        requiredProfitBpsForSymbol(normalizedSymbol, effectiveSettings?.riskLevel ?? SETTINGS.riskLevel),
+        exitFloorBps(normalizedSymbol) + 0.5 + slipEw,
+        eff(normalizedSymbol, 'netMinProfitBps')
+      );
+      const tpBase = entryBase > 0 ? entryBase * (1 + needAdj / 10000) : null;
+      const targetTakeProfitPrice = Number.isFinite(state.tp) ? state.tp : tpBase;
+      const fallbackMid = Number.isFinite(mv) && Number.isFinite(avail) && avail > 0 ? mv / avail : null;
+      const currentMid = Number.isFinite(posSnapshot?.mark) ? posSnapshot.mark : fallbackMid;
+      const stopPrice = state.stopPx ?? state.hardStopPx ?? null;
+      const hasLocalState = state && Object.keys(state).length > 0;
+      const localHeldReason = hasLocalState
+        ? 'local_cache'
+        : (avail > 0 ? 'alpaca_position' : (openOrderCounts.total > 0 ? 'open_order' : null));
+      let decision = 'HOLD_NOT_READY';
+      if (openOrderCounts.sell > 0) {
+        decision = 'EXIT_HOLD';
+      }
+      logHeldDiagnostics({
+        symbol: normalizedSymbol,
+        localHeld: hasLocalState,
+        localHeldReason,
+        alpacaQty: avail,
+        openBuyOrdersCount: openOrderCounts.buy,
+        openSellOrdersCount: openOrderCounts.sell,
+        entryPrice: Number.isFinite(entryBase) && entryBase > 0 ? entryBase : null,
+        currentMid: Number.isFinite(currentMid) ? currentMid : null,
+        targetTakeProfitPrice: Number.isFinite(targetTakeProfitPrice) ? targetTakeProfitPrice : null,
+        stopPrice: Number.isFinite(stopPrice) ? stopPrice : null,
+        decision,
+      });
       logTradeAction('entry_skipped', normalizedSymbol, {
         entryReady: false,
         reason: 'held_in_position',
@@ -5952,9 +6060,23 @@ export default function App() {
       };
 
       const [positions, allOpenOrders] = await Promise.all([getAllPositionsCached(), getOpenOrdersCached()]);
+      const alpacaHeldQtyBySymbol = buildHeldQtyBySymbol(positions);
+      const openOrdersBySymbol = buildOpenOrdersBySymbol(allOpenOrders);
       console.log('ACCOUNT', scanBpInfo.snapshot ?? null);
       console.log('POSITIONS_RAW', positions);
       console.log('OPEN_ORDERS_RAW', allOpenOrders);
+      const localState = tradeStateRef?.current || {};
+      for (const symbol of Object.keys(localState)) {
+        const alpacaQty = Number(alpacaHeldQtyBySymbol.get(symbol) || 0);
+        const openOrdersCount = openOrdersBySymbol.get(symbol)?.total || 0;
+        if (!(alpacaQty > 0) && openOrdersCount === 0) {
+          delete localState[symbol];
+          if (touchMemoRef?.current) delete touchMemoRef.current[symbol];
+          riskTrailStateRef?.current?.delete(symbol);
+          recentRiskExitRef?.current?.delete(symbol);
+          console.log(`GHOST_HOLD_CLEARED symbol=${symbol} localHeld=true alpacaQty=0 openOrders=0`);
+        }
+      }
       await reconcileLocalState({
         positions,
         openOrders: allOpenOrders,
@@ -6052,6 +6174,62 @@ export default function App() {
           const posNow = posBySym.get(normalizedSymbol);
           const isHolding = !!(posNow && Number(posNow.qty) > 0);
           tradeStateRef.current[normalizedSymbol] = { ...prevState, wasHolding: isHolding };
+
+          const alpacaQty = Number(alpacaHeldQtyBySymbol.get(normalizedSymbol) || 0);
+          const openOrderCounts = openOrdersBySymbol.get(normalizedSymbol) || { buy: 0, sell: 0, total: 0 };
+          if (alpacaQty > 0) {
+            const state = tradeStateRef.current[normalizedSymbol] || {};
+            const entryBase = Number(state.entry ?? posNow?.avg_entry_price ?? posNow?.basis ?? posNow?.mark ?? 0);
+            const slipEw = symStats[normalizedSymbol]?.slipEwmaBps ?? (effectiveSettings?.slipBpsByRisk?.[effectiveSettings?.riskLevel ?? SETTINGS.riskLevel] ?? 1);
+            const needAdj = Math.max(
+              requiredProfitBpsForSymbol(normalizedSymbol, effectiveSettings?.riskLevel ?? SETTINGS.riskLevel),
+              exitFloorBps(normalizedSymbol) + 0.5 + slipEw,
+              eff(normalizedSymbol, 'netMinProfitBps')
+            );
+            const tpBase = entryBase > 0 ? entryBase * (1 + needAdj / 10000) : null;
+            const targetTakeProfitPrice = Number.isFinite(state.tp) ? state.tp : tpBase;
+            const currentBid = qDisplay?.bid ?? null;
+            const currentAsk = qDisplay?.ask ?? null;
+            const currentMid = (Number.isFinite(currentBid) && Number.isFinite(currentAsk))
+              ? 0.5 * (currentBid + currentAsk)
+              : (Number.isFinite(posNow?.mark) ? posNow.mark : null);
+            const stopPrice = state.stopPx ?? state.hardStopPx ?? null;
+            let decision = 'HOLD_NOT_READY';
+            if (openOrderCounts.sell > 0) {
+              decision = 'EXIT_HOLD';
+            } else if (Number.isFinite(currentBid) && Number.isFinite(targetTakeProfitPrice) && currentBid >= targetTakeProfitPrice) {
+              decision = 'PLACE_SELL';
+            }
+            const hasLocalState = state && Object.keys(state).length > 0;
+            const localHeldReason = hasLocalState
+              ? 'local_cache'
+              : (alpacaQty > 0 ? 'alpaca_position' : (openOrderCounts.total > 0 ? 'open_order' : null));
+            logHeldDiagnostics({
+              symbol: normalizedSymbol,
+              localHeld: hasLocalState,
+              localHeldReason,
+              alpacaQty,
+              openBuyOrdersCount: openOrderCounts.buy,
+              openSellOrdersCount: openOrderCounts.sell,
+              entryPrice: Number.isFinite(entryBase) && entryBase > 0 ? entryBase : null,
+              currentMid,
+              targetTakeProfitPrice: Number.isFinite(targetTakeProfitPrice) ? targetTakeProfitPrice : null,
+              stopPrice: Number.isFinite(stopPrice) ? stopPrice : null,
+              decision,
+            });
+            logTradeAction('entry_skipped', normalizedSymbol, {
+              entryReady: false,
+              reason: 'held_in_position',
+              qty: alpacaQty,
+              market_value: posNow?.market_value ?? posNow?.marketValue ?? null,
+            });
+            logGateFail(normalizedSymbol, 'held');
+            skippedCount++;
+            reasonCounts.held_in_position = (reasonCounts.held_in_position || 0) + 1;
+            decisionReason = 'held_in_position';
+            results.push(token);
+            continue;
+          }
 
           const sig = await computeEntrySignal({ ...asset, symbol: normalizedSymbol }, d, effectiveSettings.riskLevel, batchMap, barsMap, scanBatchId, scanFundingCtx);
           token.entryReady = sig.entryReady;
