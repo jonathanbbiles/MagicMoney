@@ -28,6 +28,10 @@ const normalizePair = (sym) => {
   }
   return raw;
 };
+const canon = (sym) => {
+  const pair = normalizePair(sym);
+  return pair ? pair.replace('/', '') : '';
+};
 
 const toAlpacaSymbol = (sym) => {
   if (!sym) return '';
@@ -2487,6 +2491,7 @@ const isOpenOrderStatus = (order) => {
   const status = String(order?.status || order?.order_status || order?.orderStatus || '').toLowerCase();
   return OPEN_ORDER_STATUSES.has(status);
 };
+const EXIT_OPEN_ORDER_STATUSES = new Set(['new', 'accepted', 'pending_new', 'partially_filled']);
 const getOrdersByStatus = async (status = 'open') => {
   try {
     const r = await f(`${BACKEND_BASE_URL}/orders?status=${encodeURIComponent(status)}&nested=true&limit=100`, { headers: BACKEND_HEADERS });
@@ -2658,8 +2663,16 @@ const cancelOpenOrdersForSymbol = async (symbol, side = null, options = {}) => {
 const cancelAllOrders = async (options = {}) => {
   try {
     const orders = await getOpenOrdersCached();
-    const targets = (orders || []).filter((o) => options?.allowTpCancel || !isTpOrder(o));
-    noteCancelCaller(options?.caller || 'cancel_all');
+    const sideFilter = String(options?.sideFilter || 'buy_only').toLowerCase();
+    const targets = (orders || []).filter((o) => {
+      if (!(options?.allowTpCancel || !isTpOrder(o))) return false;
+      const side = (o.side || '').toLowerCase();
+      if (sideFilter === 'all') return true;
+      if (sideFilter === 'sell_only') return side === 'sell';
+      return side === 'buy';
+    });
+    console.log(`CANCEL — called — side_filter=${sideFilter === 'all' ? 'all' : sideFilter === 'sell_only' ? 'sell_only' : 'buy_only'} — count=${targets.length}`);
+    noteCancelCaller(options?.caller || `cancel_all:${sideFilter}`);
     await Promise.all(targets.map((o) => f(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)));
     __openOrdersCache = { ts: 0, items: [] };
   } catch {}
@@ -4119,7 +4132,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     finalLimit = roundToTick(finalLimit, tickSize);
 
     let existing = null;
-    const bySym = openSellBySym?.get?.(normalizedSymbol);
+    const bySym = openSellBySym?.get?.(canon(normalizedSymbol)) || openSellBySym?.get?.(normalizedSymbol);
     if (bySym && isTpOrder(bySym)) existing = bySym;
     if (!existing) {
       const open = await getOpenOrdersCached();
@@ -4198,10 +4211,21 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
         } else {
           attemptsFailed += 1;
           const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
+          const msgLower = String(msg || '').toLowerCase();
+          if (msgLower.includes('min notional') || msgLower.includes('minimum notional') || msgLower.includes('min order') || msgLower.includes('minimum order') || msgLower.includes('order size')) {
+            console.log(`EXIT_SKIP — ${normalizedSymbol} — reason=min_notional — qty=${latestQty} — limit=${finalLimit}`);
+          }
+          console.log(`EXIT_FAIL — ${normalizedSymbol} — place_sell — ${msg || 'order_rejected'}`);
           logTradeAction('tp_limit_error', normalizedSymbol, { error: `POST ${res.status} ${msg}` });
         }
       } catch (e) {
         attemptsFailed += 1;
+        const errMsg = e?.message || 'unknown';
+        const msgLower = String(errMsg || '').toLowerCase();
+        if (msgLower.includes('min notional') || msgLower.includes('minimum notional') || msgLower.includes('min order') || msgLower.includes('minimum order') || msgLower.includes('order size')) {
+          console.log(`EXIT_SKIP — ${normalizedSymbol} — reason=min_notional — qty=${latestQty} — limit=${finalLimit}`);
+        }
+        console.log(`EXIT_FAIL — ${normalizedSymbol} — place_sell — ${errMsg}`);
         logOrderError('sell_limit', { symbol: normalizedSymbol, qty: latestQty, side: 'sell', type: 'limit', time_in_force: 'gtc', limit_price: finalLimit }, e);
         logTradeAction('tp_limit_error', normalizedSymbol, { error: e.message });
       }
@@ -4393,7 +4417,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
   }
 
   const limitTIF = getSellExitTimeInForce(symbol);
-  let existing = openSellBySym?.get?.(normalizedSymbol) || null;
+  let existing = openSellBySym?.get?.(canon(normalizedSymbol)) || openSellBySym?.get?.(normalizedSymbol) || null;
   if (existing && (existing.type || '').toLowerCase() !== 'limit') existing = null;
   const lastTs = state.lastLimitPostTs || 0;
   const existingLimit = existing ? parseFloat(existing.limit_price ?? existing.limitPrice) : NaN;
@@ -4438,9 +4462,11 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       const notional = Number(order.limit_price) * qty;
       const msgLower = String(msg || '').toLowerCase();
       if (msgLower.includes('min notional') || msgLower.includes('minimum notional') || msgLower.includes('min order') || msgLower.includes('minimum order') || msgLower.includes('order size')) {
+        console.log(`EXIT_SKIP — ${normalizedSymbol} — reason=min_notional — qty=${qty} — limit=${order.limit_price}`);
         console.log(`${normalizedSymbol} — Skip: dust_position`, { qty, notional });
         tradeStateRef.current[normalizedSymbol] = { ...(state || {}), dust: true };
       }
+      console.log(`EXIT_FAIL — ${normalizedSymbol} — place_sell — ${msg || 'order_rejected'}`);
       console.log(`${normalizedSymbol} — SELL attempt failed (error=${msg}, qty=${qty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
       logOrderFailure({
         order,
@@ -4456,9 +4482,11 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     const errMsg = e?.message || 'unknown';
     const msgLower = String(errMsg || '').toLowerCase();
     if (msgLower.includes('min notional') || msgLower.includes('minimum notional') || msgLower.includes('min order') || msgLower.includes('minimum order') || msgLower.includes('order size')) {
+      console.log(`EXIT_SKIP — ${normalizedSymbol} — reason=min_notional — qty=${qty} — limit=${finalLimit}`);
       console.log(`${normalizedSymbol} — Skip: dust_position`, { qty, notional });
       tradeStateRef.current[normalizedSymbol] = { ...(state || {}), dust: true };
     }
+    console.log(`EXIT_FAIL — ${normalizedSymbol} — place_sell — ${errMsg}`);
     console.log(`${normalizedSymbol} — SELL attempt failed (error=${errMsg}, qty=${qty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
     logOrderError('sell_limit', { symbol: normalizedSymbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit }, e);
     logTradeAction('tp_limit_error', normalizedSymbol, { error: e.message });
@@ -4604,16 +4632,20 @@ const reconcileExits = async ({
   let openSellCount = 0;
   let attemptsSent = 0;
   let attemptsFailed = 0;
+  let placedCount = 0;
+  let skippedCount = 0;
   for (const order of openOrders || []) {
-    if (!isOpenOrderStatus(order)) continue;
+    const status = String(order?.status || order?.order_status || order?.orderStatus || '').toLowerCase();
+    if (!EXIT_OPEN_ORDER_STATUSES.has(status)) continue;
     const side = String(order?.side || '').toLowerCase();
     if (side === 'buy') openBuyCount += 1;
     if (side !== 'sell') continue;
     openSellCount += 1;
     const sym = order.pairSymbol ?? normalizePair(order.symbol);
-    const list = openSellOrdersBySym.get(sym) || [];
+    const symKey = canon(sym);
+    const list = openSellOrdersBySym.get(symKey) || [];
     list.push(order);
-    openSellOrdersBySym.set(sym, list);
+    openSellOrdersBySym.set(symKey, list);
   }
 
   const openSellBySym = new Map();
@@ -4659,14 +4691,15 @@ const reconcileExits = async ({
 
   for (const pos of positions || []) {
     const symbol = pos.pairSymbol ?? normalizePair(pos.symbol);
+    const symbolKey = canon(symbol);
     const qty = Number(pos.qty ?? pos.quantity ?? 0);
-    const sellOrders = openSellOrdersBySym.get(symbol) || [];
+    const sellOrders = openSellOrdersBySym.get(symbolKey) || [];
     const hasOpenSell = sellOrders.length > 0;
 
     if (!(qty > 0)) {
       if (sellOrders.length) {
         await Promise.all(sellOrders.map((order) => cancelSellOrder(order, 'position_closed')));
-        openSellBySym.delete(symbol);
+        openSellBySym.delete(symbolKey);
       }
       continue;
     }
@@ -4677,17 +4710,17 @@ const reconcileExits = async ({
       if (extras.length) {
         markSellReplaceCooldown(symbol, now);
         sellOrders.splice(1);
-        openSellBySym.set(symbol, sellOrders[0]);
+        openSellBySym.set(symbolKey, sellOrders[0]);
       }
     }
 
-    let existing = openSellBySym.get(symbol) || null;
+    let existing = openSellBySym.get(symbolKey) || null;
     if (existing) {
       const remaining = getOrderRemainingQty(existing);
       if (Number.isFinite(remaining) && Math.abs(remaining - qty) > qtyEpsilon) {
         await cancelSellOrder(existing, 'qty_mismatch');
         markSellReplaceCooldown(symbol, now);
-        openSellBySym.delete(symbol);
+        openSellBySym.delete(symbolKey);
         existing = null;
       }
     }
@@ -4701,8 +4734,12 @@ const reconcileExits = async ({
       );
       await cancelSellOrder(existing, 'ttl');
       markSellReplaceCooldown(symbol, now);
-      openSellBySym.delete(symbol);
+      openSellBySym.delete(symbolKey);
       existing = null;
+    }
+
+    if (hasOpenSell) {
+      console.log(`EXIT — ${symbol} — hasOpenSell=true — orderId=${sellOrders[0]?.id || 'n/a'} — no_action`);
     }
 
     const meta = await fetchAssetMeta(symbol);
@@ -4721,6 +4758,11 @@ const reconcileExits = async ({
       settings,
       state,
     });
+    if (!Number.isFinite(tp)) {
+      console.log(`EXIT_SKIP — ${symbol} — reason=no_target_price`);
+      skippedCount += 1;
+      continue;
+    }
     const quoteContext = await getExitQuoteContext({ symbol, entryBase, now });
     const quoteFreshness = quoteContext.quoteFreshness || { ok: false, ageMs: null, tsMs: null };
     const currentBid = Number.isFinite(quoteContext.bid) ? quoteContext.bid : null;
@@ -4755,7 +4797,10 @@ const reconcileExits = async ({
       sellEligible = true;
       reasonNoSell = 'other:attempting_sell';
     }
-    if (quoteContext.hadStaleQuote && quoteContext.fallbackUsed) {
+    if (quoteContext.hadStaleQuote && quoteContext.fallbackUsed === 'entry_based') {
+      const limitText = Number.isFinite(tp) ? tp.toFixed(isStock(symbol) ? 2 : 5) : 'n/a';
+      console.log(`EXIT — ${symbol} — stale_quote — fallback=entry_based — limit=${limitText}`);
+    } else if (quoteContext.hadStaleQuote && quoteContext.fallbackUsed) {
       console.log(`EXIT — ${symbol} — stale_quote — using fallback=${quoteContext.fallbackUsed}`);
     }
     const exitAgeSec = Number.isFinite(state.entryTs) ? Math.max(0, (now - state.entryTs) / 1000) : null;
@@ -4815,7 +4860,8 @@ const reconcileExits = async ({
       const notionalPx = Number.isFinite(targetPrice) ? targetPrice : entryBase;
       const computedNotional = Number.isFinite(notionalPx) ? plannedQty * notionalPx : NaN;
       if (Number.isFinite(minNotional) && minNotional > 0 && Number.isFinite(computedNotional) && computedNotional < minNotional) {
-        console.log(`EXIT_SKIP — ${symbol} — reason=min_notional`);
+        console.log(`EXIT_SKIP — ${symbol} — reason=min_notional — qty=${plannedQty} — limit=${limitText}`);
+        skippedCount += 1;
         logTradeAction('exit_skipped', symbol, {
           reason: 'min_notional',
           computedNotional,
@@ -4825,7 +4871,10 @@ const reconcileExits = async ({
         action = 'place_sell';
       }
     }
-    console.log(`EXIT — ${symbol} — hasOpenSell=${hasOpenSell} — action=${action} — limit=${limitText} — qty=${plannedQty}`);
+    if (hasOpenSell && qty > 0) skippedCount += 1;
+    if (action === 'place_sell') {
+      console.log(`EXIT — ${symbol} — hasOpenSell=false — place_sell — qty=${plannedQty} — limit=${limitText} — tif=gtc`);
+    }
 
     if (state.dust) continue;
     if (!autoTrade || existing) continue;
@@ -4858,8 +4907,9 @@ const reconcileExits = async ({
     const exitResult = await ensureLimitTP(symbol, tp, { tradeStateRef, touchMemoRef, openSellBySym, pos });
     attemptsSent += exitResult?.attemptsSent || 0;
     attemptsFailed += exitResult?.attemptsFailed || 0;
+    if (exitResult?.attempted) placedCount += 1;
     if ((exitResult?.attemptsFailed || 0) > 0) {
-      console.log(`EXIT_FAIL — ${symbol} — order_submit_failed`);
+      console.log(`EXIT_FAIL — ${symbol} — place_sell — order_submit_failed`);
     }
     if (sellEligible && exitNotMet === false && !exitResult?.attempted) {
       attemptsFailed += 1;
@@ -4888,12 +4938,135 @@ const reconcileExits = async ({
     ttlCancelsCount,
     attemptsSent,
     attemptsFailed,
+    placedCount,
+    skippedCount,
   };
 };
 
-const manageExits = async (params) =>
+const manageExits = async ({
+  batchId,
+  autoTrade,
+  tradeStateRef,
+  touchMemoRef,
+  settings,
+}) => {
   // EXIT pass is deliberately separate from entry scanning so held positions always maintain sells.
-  reconcileExits(params);
+  let positions = [];
+  let openOrders = [];
+  let openBuyCount = 0;
+  let openSellCount = 0;
+  let placed = 0;
+  let skipped = 0;
+  let fails = 0;
+
+  const mapPositions = (arr) =>
+    Array.isArray(arr)
+      ? arr.map((pos) => ({
+        ...pos,
+        rawSymbol: pos.rawSymbol ?? pos.symbol,
+        pairSymbol: normalizePair(pos.rawSymbol ?? pos.symbol),
+        symbol: normalizePair(pos.rawSymbol ?? pos.symbol),
+      }))
+      : [];
+  const mapOrders = (arr) =>
+    Array.isArray(arr)
+      ? arr.map((order) => ({
+        ...order,
+        rawSymbol: order.rawSymbol ?? order.symbol,
+        pairSymbol: normalizePair(order.rawSymbol ?? order.symbol),
+        symbol: normalizePair(order.rawSymbol ?? order.symbol),
+      }))
+      : [];
+  const countOpenOrders = (orders = []) => {
+    let openBuy = 0;
+    let openSell = 0;
+    for (const order of orders || []) {
+      const status = String(order?.status || order?.order_status || order?.orderStatus || '').toLowerCase();
+      if (!EXIT_OPEN_ORDER_STATUSES.has(status)) continue;
+      const side = String(order?.side || '').toLowerCase();
+      if (side === 'buy') openBuy += 1;
+      if (side === 'sell') openSell += 1;
+    }
+    return { openBuy, openSell };
+  };
+
+  try {
+    try {
+      const res = await f(`${BACKEND_BASE_URL}/positions`, { headers: BACKEND_HEADERS });
+      if (!res.ok) {
+        fails += 1;
+        console.log(`EXIT_FAIL — positions_fetch — status=${res.status}`);
+        return { openBuyCount, openSellCount, placedCount: 0, skippedCount: 0, attemptsSent: 0, attemptsFailed: fails };
+      }
+      const arr = await res.json();
+      positions = mapPositions(arr);
+    } catch (err) {
+      fails += 1;
+      console.log(`EXIT_FAIL — positions_fetch — ${err?.message || err}`);
+      return { openBuyCount, openSellCount, placedCount: 0, skippedCount: 0, attemptsSent: 0, attemptsFailed: fails };
+    }
+
+    if (positions.length) {
+      const sample = positions[0]?.rawSymbol ?? positions[0]?.symbol ?? '';
+      console.log(`EXIT_DEBUG — sample_symbols — pos=${sample} — canon=${canon(sample)}`);
+    }
+
+    try {
+      const res = await f(`${BACKEND_BASE_URL}/orders?status=open&nested=true&limit=100`, { headers: BACKEND_HEADERS });
+      if (!res.ok) {
+        fails += 1;
+        console.log(`EXIT_FAIL — open_orders_fetch — status=${res.status}`);
+      } else {
+        const arr = await res.json();
+        openOrders = mapOrders(arr);
+      }
+    } catch (err) {
+      fails += 1;
+      console.log(`EXIT_FAIL — open_orders_fetch — ${err?.message || err}`);
+    }
+
+    const exitMetrics = await reconcileExits({
+      positions,
+      openOrders,
+      autoTrade,
+      tradeStateRef,
+      touchMemoRef,
+      settings,
+    });
+    placed = exitMetrics?.placedCount ?? 0;
+    skipped = exitMetrics?.skippedCount ?? 0;
+    fails += exitMetrics?.attemptsFailed ?? 0;
+
+    let openOrdersAfter = [];
+    try {
+      const res = await f(`${BACKEND_BASE_URL}/orders?status=open&nested=true&limit=100`, { headers: BACKEND_HEADERS });
+      if (!res.ok) {
+        fails += 1;
+        console.log(`EXIT_FAIL — open_orders_fetch — status=${res.status}`);
+      } else {
+        const arr = await res.json();
+        openOrdersAfter = mapOrders(arr);
+      }
+    } catch (err) {
+      fails += 1;
+      console.log(`EXIT_FAIL — open_orders_fetch — ${err?.message || err}`);
+    }
+
+    const { openBuy, openSell } = countOpenOrders(openOrdersAfter.length ? openOrdersAfter : openOrders);
+    openBuyCount = openBuy;
+    openSellCount = openSell;
+
+    return {
+      ...exitMetrics,
+      openBuyCount,
+      openSellCount,
+    };
+  } finally {
+    console.log(
+      `EXIT_PASS — done — batch=${batchId} — positions=${positions.length} — openSell=${openSellCount} — placed=${placed} — skipped=${skipped} — fails=${fails}`
+    );
+  }
+};
 
 /* ───────────────────────── 25) CONCURRENCY / PDT ───────────────────────────── */
 function __recentHitRate() {
@@ -6188,15 +6361,6 @@ export default function App() {
         riskTrailStateRef,
         recentRiskExitRef,
       });
-      // EXIT pass runs before entry scanning so held positions always have managed sells.
-      const exitMetrics = await manageExits({
-        positions,
-        openOrders: allOpenOrders,
-        autoTrade,
-        tradeStateRef,
-        touchMemoRef,
-        settings: effectiveSettings,
-      });
       const posBySym = new Map((positions || []).map((p) => [p.symbol, p]));
       const openCount = (positions || []).filter((p) => {
         const sym = p.symbol;
@@ -6231,12 +6395,23 @@ export default function App() {
       const cStart = cIdx * effectiveSettings.stockPageSize;
       const cryptoSlice = cryptosAll.slice(cStart, Math.min(cStart + effectiveSettings.stockPageSize, cryptosAll.length));
       cryptoPageRef.current += 1;
+      const scanBatchId = `scan_${Date.now()}_${cIdx}`;
 
       const cryptoSymbolsForQuotes = cryptoSlice.map((t) => toInternalSymbol(t.symbol));
 
       const barsMap = effectiveSettings.enforceMomentum ? await getCryptoBars1mBatch(cryptoSymbolsForQuotes, 6) : null;
 
       setOpenMeta({ positions: openCount, orders: (allOpenOrders || []).length, allowed: cryptosAll.length, universe: cryptosAll.length });
+      const exitPassTs = new Date().toISOString();
+      console.log(`EXIT_PASS — start — batch=${scanBatchId} — ts=${exitPassTs}`);
+      // EXIT pass runs before entry scanning so held positions always have managed sells.
+      const exitMetrics = await manageExits({
+        batchId: scanBatchId,
+        autoTrade,
+        tradeStateRef,
+        touchMemoRef,
+        settings: effectiveSettings,
+      });
       logTradeAction('scan_start', 'STATIC', { batch: cryptoSlice.length });
       const sampleSymbol = cryptoSymbolsForQuotes[0];
       if (sampleSymbol) {
@@ -6263,7 +6438,6 @@ export default function App() {
       let skippedCount = 0;
       const reasonCounts = {};
       const spreadSamples = [];
-      const scanBatchId = `scan_${Date.now()}_${cIdx}`;
       const submittedThisBatch = new Set();
       for (const asset of cryptoSlice) {
         const normalizedSymbol = toInternalSymbol(asset.symbol);
