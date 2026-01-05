@@ -198,6 +198,14 @@ const DEFAULT_SETTINGS = {
   touchFlipTimeoutSec: 8,
   maxHoldMin: 20,
   maxTimeLossUSD: -5.0,
+  cryptoExitAlwaysOn: true,
+  cryptoExitStartBps: 500,
+  cryptoExitHoldSec: 20,
+  cryptoExitDecayEverySec: 22,
+  cryptoExitDecayStepBps: 1,
+  cryptoExitMinEdgeBps: 1,
+  cryptoExitRepriceMinAgeSec: 22,
+  cryptoExitOnlyOneSell: true,
 
   // Stops / trailing
   enableStops: true,
@@ -2902,7 +2910,7 @@ const buildEntryClientOrderId = (symbol) => {
 
 const buildTpClientOrderId = (symbol, targetBps = null) => {
   const normalized = isCrypto(symbol)
-    ? canonicalizeSymbol(symbol)
+    ? canon(symbol)
     : normalizePair(symbol).replace('/', '');
   const bpsInt = Number.isFinite(targetBps) ? Math.round(targetBps) : 0;
   return `TP_${normalized}_${Date.now()}_${bpsInt}`;
@@ -4255,26 +4263,34 @@ const getTpOrderTargetBps = ({ order, entryPx }) => {
   return null;
 };
 
-const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, openSellBySym, pos } = {}) => {
+const ensureLimitTP = async (symbol, limitPrice, {
+  tradeStateRef,
+  touchMemoRef,
+  openSellBySym,
+  pos,
+  allowCancelTp = false,
+  forceReplace = false,
+} = {}) => {
   let attemptsSent = 0;
   let attemptsFailed = 0;
   let attempted = false;
+  let submittedOk = false;
   const normalizedSymbol = normalizePair(symbol);
   const isCrypto = !isStock(symbol);
   const posInfo = pos ?? await getPositionInfo(symbol);
-  if (!posInfo || posInfo.available <= 0) return { attemptsSent, attemptsFailed, attempted };
+  if (!posInfo || posInfo.available <= 0) return { attemptsSent, attemptsFailed, attempted, submittedOk };
 
   const state = (tradeStateRef?.current?.[normalizedSymbol]) || {};
   const entryPx = state.entry ?? posInfo.basis ?? posInfo.mark ?? 0;
   const qty = Number(posInfo.available ?? 0);
-  if (!(entryPx > 0) || !(qty > 0)) return { attemptsSent, attemptsFailed, attempted };
+  if (!(entryPx > 0) || !(qty > 0)) return { attemptsSent, attemptsFailed, attempted, submittedOk };
 
   const now = Date.now();
   const cooldownActive = isSellReplaceCooldownActive(normalizedSymbol, now);
-  if (!isCrypto && cooldownActive) return { attemptsSent, attemptsFailed, attempted };
+  if (!isCrypto && cooldownActive) return { attemptsSent, attemptsFailed, attempted, submittedOk };
 
   const riskExited = await ensureRiskExits(normalizedSymbol, { tradeStateRef, pos: posInfo });
-  if (riskExited) return { attemptsSent, attemptsFailed, attempted };
+  if (riskExited) return { attemptsSent, attemptsFailed, attempted, submittedOk };
 
   if (isCrypto) {
     const symbolKey = canonicalizeSymbol(normalizedSymbol);
@@ -4313,13 +4329,17 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     const existingTargetBpsSafe = Number.isFinite(existingTargetBps) ? existingTargetBps : TP_START_PROFIT_BPS;
     const targetBpsNow = Math.max(minProfitBps, existing ? existingTargetBpsSafe : TP_START_PROFIT_BPS);
     const targetPriceNow = entryPx > 0 ? roundToTick(entryPx * (1 + targetBpsNow / 10000), tickSize) : null;
+    const overrideLimit = Number.isFinite(limitPrice) ? roundToTick(limitPrice, tickSize) : null;
+    const overrideBps = Number.isFinite(overrideLimit) && entryPx > 0
+      ? ((overrideLimit - entryPx) / entryPx) * 10000
+      : null;
     const lastPlacementTs = (() => {
       const parsed = parseTpClientOrderId(existing?.client_order_id ?? existing?.clientOrderId);
       if (parsed?.ts) return parsed.ts;
       const ts = parseOrderTimestampMs(existing);
       return Number.isFinite(ts) ? ts : null;
     })();
-    const cooldownMsRemaining = Number.isFinite(lastPlacementTs)
+    const cooldownMsRemaining = Number.isFinite(lastPlacementTs) && !Number.isFinite(overrideLimit)
       ? Math.max(0, TP_STEP_INTERVAL_MS - (now - lastPlacementTs))
       : null;
 
@@ -4333,48 +4353,66 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       action = 'SKIP';
       reason = 'missing_entry';
     } else {
-      const estimatedNotional = plannedQty * (targetPriceNow || entryPx);
+      const targetPriceForCheck = Number.isFinite(overrideLimit) ? overrideLimit : targetPriceNow;
+      const estimatedNotional = plannedQty * (targetPriceForCheck || entryPx);
       if (Number.isFinite(minNotional) && estimatedNotional < minNotional) {
         action = 'SKIP';
         reason = 'dust_untradable';
       } else if (!existing) {
         action = 'PLACE';
         reason = 'no_open_sell';
+      } else if (forceReplace) {
+        action = 'REPLACE';
+        reason = 'forced_replace';
       } else if (qtyMismatch || existingType !== 'limit' || existingTif !== 'gtc') {
         action = 'REPLACE';
         reason = 'qty_mismatch';
       } else if (Number.isFinite(cooldownMsRemaining) && cooldownMsRemaining > 0) {
         action = 'HOLD';
         reason = 'cooldown';
-      } else {
+      } else if (!Number.isFinite(overrideLimit)) {
         const nextTargetBps = Math.max(minProfitBps, targetBpsNow - TP_STEP_DOWN_BPS);
         if (nextTargetBps < targetBpsNow) {
           action = 'REPLACE';
           reason = 'step_down';
         }
+      } else {
+        const existingRounded = Number.isFinite(existingLimit) ? roundToTick(existingLimit, tickSize) : null;
+        if (!Number.isFinite(existingRounded) || Math.abs(existingRounded - overrideLimit) >= tickSize / 2) {
+          action = 'REPLACE';
+          reason = 'price_mismatch';
+        }
       }
     }
 
-    let effectiveTargetBps = targetBpsNow;
+    let effectiveTargetBps = Number.isFinite(overrideBps) ? overrideBps : targetBpsNow;
     if (action === 'PLACE') {
-      effectiveTargetBps = Math.max(minProfitBps, TP_START_PROFIT_BPS);
+      effectiveTargetBps = Number.isFinite(overrideBps)
+        ? overrideBps
+        : Math.max(minProfitBps, TP_START_PROFIT_BPS);
     }
     if (action === 'REPLACE' && reason === 'step_down') {
       effectiveTargetBps = Math.max(minProfitBps, targetBpsNow - TP_STEP_DOWN_BPS);
     }
-    const effectiveTargetPrice = entryPx > 0
-      ? roundToTick(entryPx * (1 + effectiveTargetBps / 10000), tickSize)
-      : null;
+    const effectiveTargetPrice = Number.isFinite(overrideLimit)
+      ? overrideLimit
+      : (entryPx > 0 ? roundToTick(entryPx * (1 + effectiveTargetBps / 10000), tickSize) : null);
 
     if (action === 'PLACE' || action === 'REPLACE') {
       if (existing?.id) {
-        const cancelled = await cancelExitOrder(existing.id, {
-          symbol: normalizedSymbol,
-          reason: action === 'REPLACE' ? reason : 'orphan_cleanup',
-        });
-        if (!cancelled && action === 'REPLACE') {
+        const canCancel = allowCancelTp || forceReplace || !isTpOrder(existing);
+        if (canCancel) {
+          const cancelled = await cancelExitOrder(existing.id, {
+            symbol: normalizedSymbol,
+            reason: action === 'REPLACE' ? reason : 'orphan_cleanup',
+          });
+          if (!cancelled && action === 'REPLACE') {
+            action = 'HOLD';
+            reason = 'cancel_failed';
+          }
+        } else if (action === 'REPLACE') {
           action = 'HOLD';
-          reason = 'cancel_failed';
+          reason = 'tp_locked';
         }
       }
     }
@@ -4397,6 +4435,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       const submitRes = await submitExitLimitOrder(order, { reason });
       logOrderResponse('sell_limit', order, submitRes.res, submitRes.data);
       if (submitRes.ok && submitRes.data?.orderId) {
+        submittedOk = true;
         tradeStateRef.current[normalizedSymbol] = {
           ...(state || {}),
           tpOrderId: submitRes.data.orderId,
@@ -4431,7 +4470,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       cooldownMsRemaining: Number.isFinite(cooldownMsRemaining) ? cooldownMsRemaining : null,
     });
 
-    return { attemptsSent, attemptsFailed, attempted };
+    return { attemptsSent, attemptsFailed, attempted, submittedOk };
   }
 
   const heldMinutes = (Date.now() - (state.entryTs || 0)) / 60000;
@@ -4473,7 +4512,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
           });
           if (mkt) {
             logTradeAction('tp_limit_set', normalizedSymbol, { limit: `TIME_EXIT@~${q.bid.toFixed(isStock(symbol) ? 2 : 5)}` });
-            return { attemptsSent, attemptsFailed, attempted };
+            return { attemptsSent, attemptsFailed, attempted, submittedOk };
           }
         }
       }
@@ -4569,7 +4608,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     ? Math.abs(existingLimit - finalLimit) / Math.max(1, finalLimit)
     : Infinity;
   const needsPost = !existing || priceDrift > 0.001 || now - lastTs > 1000 * 10;
-  if (!needsPost) return { attemptsSent, attemptsFailed, attempted };
+  if (!needsPost) return { attemptsSent, attemptsFailed, attempted, submittedOk };
 
   try {
     const decimals = isStock(symbol) ? 2 : 5;
@@ -4595,6 +4634,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
     const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
     logOrderResponse('sell_limit', order, res, data);
     if (res.ok && data?.ok && data?.orderId) {
+      submittedOk = true;
       tradeStateRef.current[normalizedSymbol] = { ...(state || {}), lastLimitPostTs: now };
       if (existing) { await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null); }
       logTradeAction('tp_limit_set', normalizedSymbol, { id: data.orderId, limit: order.limit_price });
@@ -4642,7 +4682,7 @@ const ensureLimitTP = async (symbol, limitPrice, { tradeStateRef, touchMemoRef, 
       error: e,
     });
   }
-  return { attemptsSent, attemptsFailed, attempted };
+  return { attemptsSent, attemptsFailed, attempted, submittedOk };
 };
 
 const reconcileLocalState = async ({ positions, openOrders, tradeStateRef, touchMemoRef, riskTrailStateRef, recentRiskExitRef }) => {
@@ -4809,6 +4849,36 @@ const reconcileExits = async ({
   let cancelsCount = 0;
   let ttlCancelsCount = 0;
 
+  const getOrInitExitPlan = (symbol, nowMs, settings) => {
+    const normalizedSymbol = normalizePair(symbol);
+    const state = tradeStateRef?.current?.[normalizedSymbol] || {};
+    const existing = state.exitPlan || {};
+    const startBps = Number.isFinite(settings.cryptoExitStartBps) ? settings.cryptoExitStartBps : 0;
+    const holdMs = Math.max(0, (settings.cryptoExitHoldSec || 0) * 1000);
+    const bps = Number.isFinite(existing.bps) ? existing.bps : startBps;
+    const nextDecayAtMs = Number.isFinite(existing.nextDecayAtMs) ? existing.nextDecayAtMs : nowMs + holdMs;
+    const lastPlacedAtMs = Number.isFinite(existing.lastPlacedAtMs) ? existing.lastPlacedAtMs : 0;
+    return { bps, nextDecayAtMs, lastPlacedAtMs };
+  };
+
+  const advanceExitPlanIfDue = (exitPlan, nowMs, settings, floorBps) => {
+    const plan = { ...exitPlan };
+    const decayEveryMs = Math.max(1000, (settings.cryptoExitDecayEverySec || 0) * 1000);
+    const stepBps = Math.max(0, settings.cryptoExitDecayStepBps || 0);
+    const minEdgeBps = Math.max(0, settings.cryptoExitMinEdgeBps || 0);
+    const floor = Number.isFinite(floorBps) ? floorBps : minEdgeBps;
+    if (!Number.isFinite(plan.bps)) plan.bps = Number.isFinite(settings.cryptoExitStartBps) ? settings.cryptoExitStartBps : floor;
+    if (!Number.isFinite(plan.nextDecayAtMs)) {
+      plan.nextDecayAtMs = nowMs + Math.max(0, (settings.cryptoExitHoldSec || 0) * 1000);
+    }
+    while (stepBps > 0 && nowMs >= plan.nextDecayAtMs) {
+      plan.bps = Math.max(floor, plan.bps - stepBps);
+      plan.nextDecayAtMs += decayEveryMs;
+    }
+    plan.bps = Math.max(plan.bps, floor);
+    return plan;
+  };
+
   const cancelSellOrder = async (order, reason) => {
     if (!order?.id) return false;
     if (isTpOrder(order)) return false;
@@ -4877,21 +4947,146 @@ const reconcileExits = async ({
     const symbol = pos.pairSymbol ?? normalizePair(pos.symbol);
     const symbolKey = canon(symbol);
     const isCryptoPair = normalizePair(symbol).endsWith('/USD');
+    const exitAutoOk = isCryptoPair ? !!settings.cryptoExitAlwaysOn : !!autoTrade;
     if (isCryptoPair) {
       const qty = Number(pos.qty ?? pos.quantity ?? 0);
       if (!(qty > 0)) continue;
-      const exitResult = await ensureLimitTP(symbol, NaN, {
+      if (!exitAutoOk) continue;
+      const normalizedSymbol = normalizePair(symbol);
+      const state = tradeStateRef?.current?.[normalizedSymbol] || {};
+      const meta = await fetchAssetMeta(symbol);
+      const quantizeQty = createQtyQuantizer(symbol, meta);
+      const plannedQty = quantizeQty(qty);
+      const minNotional = meta?._min_notional > 0 ? meta._min_notional : MIN_ORDER_NOTIONAL_USD;
+      const tickSize = meta?._price_inc > 0 ? meta._price_inc : 1e-5;
+      const entryBase = Number(state.entry ?? pos.avg_entry_price ?? pos.basis ?? pos.mark ?? 0);
+      if (!(plannedQty > 0) || !(entryBase > 0)) {
+        skippedCount += 1;
+        continue;
+      }
+      const feeFloor = entryBase > 0 && plannedQty > 0
+        ? minExitPriceFeeAwareDynamic({
+          symbol: normalizedSymbol,
+          entryPx: entryBase,
+          qty: plannedQty,
+          buyBpsOverride: state.buyBpsApplied,
+        })
+        : null;
+      const floorBpsFromFee = entryBase > 0 && Number.isFinite(feeFloor)
+        ? ((feeFloor / entryBase) - 1) * 10000
+        : 0;
+      const floorBps = Math.max(
+        settings.cryptoExitMinEdgeBps || 0,
+        floorBpsFromFee + (settings.cryptoExitMinEdgeBps || 0)
+      );
+      let exitPlan = getOrInitExitPlan(symbol, now, settings);
+      exitPlan = advanceExitPlanIfDue(exitPlan, now, settings, floorBps);
+
+      let sellOrders = openSellOrdersBySym.get(symbolKey) || [];
+      if ((settings.cryptoExitOnlyOneSell ?? true) && sellOrders.length > 1) {
+        const sorted = sellOrders.slice().sort((a, b) => {
+          const aTp = isTpOrder(a);
+          const bTp = isTpOrder(b);
+          if (aTp !== bTp) return aTp ? -1 : 1;
+          return (parseOrderTimestampMs(b) || 0) - (parseOrderTimestampMs(a) || 0);
+        });
+        const [keep, ...extras] = sorted;
+        const cancelList = extras.slice().sort((a, b) => (parseOrderTimestampMs(a) || 0) - (parseOrderTimestampMs(b) || 0));
+        for (const extra of cancelList) {
+          const ok = await cancelExitOrder(extra.id, { symbol: extra.symbol, reason: 'duplicate_sell' });
+          if (ok) cancelsCount += 1;
+        }
+        sellOrders = keep ? [keep] : [];
+      }
+
+      let existing = sellOrders[0] || null;
+      const hasTpSell = existing && isTpOrder(existing);
+      if (existing && !hasTpSell) {
+        const ok = await cancelExitOrder(existing.id, { symbol: existing.symbol, reason: 'non_tp_sell' });
+        if (ok) cancelsCount += 1;
+        existing = null;
+      }
+
+      if (!existing) {
+        console.log(`EXIT_ORPHAN — ${symbol} — placing fresh TP`);
+        exitPlan = {
+          ...exitPlan,
+          bps: Number.isFinite(settings.cryptoExitStartBps) ? settings.cryptoExitStartBps : exitPlan.bps,
+          nextDecayAtMs: now + Math.max(0, (settings.cryptoExitHoldSec || 0) * 1000),
+        };
+      }
+
+      const desiredBps = Math.max(exitPlan.bps, floorBps);
+      let desiredPrice = entryBase > 0 ? entryBase * (1 + desiredBps / 10000) : NaN;
+      if (Number.isFinite(feeFloor)) desiredPrice = Math.max(desiredPrice, feeFloor);
+      desiredPrice = roundToTick(desiredPrice, tickSize);
+      console.log(
+        `EXIT_PLAN — ${symbol} — qty=${plannedQty} — entry=${entryBase} — feeFloor=${feeFloor} — bps=${desiredBps.toFixed(1)} — px=${desiredPrice}`
+      );
+      tradeStateRef.current[normalizedSymbol] = { ...state, exitPlan };
+
+      const sizingCheck = validateOrderCandidate({
+        symbol: normalizedSymbol,
+        side: 'sell',
+        qty: plannedQty,
+        price: desiredPrice,
+        computedNotional: plannedQty * desiredPrice,
+        minNotional,
+        quantizeQty,
+        autoBumpMinNotional: false,
+      });
+      if (sizingCheck.decision !== 'ATTEMPT') {
+        console.warn('exit_reconcile_skip', { symbol, qty: plannedQty, reason: sizingCheck.reason });
+        logTradeAction('exit_skipped', normalizedSymbol, {
+          reason: 'exit_size_guard',
+          computedNotional: plannedQty * desiredPrice,
+          minNotional,
+        });
+        skippedCount += 1;
+        continue;
+      }
+
+      const existingLimit = existing ? Number(existing.limit_price ?? existing.limitPrice) : null;
+      const existingRounded = Number.isFinite(existingLimit) ? roundToTick(existingLimit, tickSize) : null;
+      const desiredRounded = roundToTick(desiredPrice, tickSize);
+      const priceDiffers = !Number.isFinite(existingRounded) || Math.abs(existingRounded - desiredRounded) >= tickSize / 2;
+      const orderAgeMs = existing ? getOrderAgeMs(existing, now) : null;
+      const orderAgeSec = Number.isFinite(orderAgeMs) ? orderAgeMs / 1000 : null;
+      const repriceByAge = Number.isFinite(orderAgeSec) && orderAgeSec >= (settings.cryptoExitRepriceMinAgeSec || 0);
+      const decayDue = now >= (exitPlan.nextDecayAtMs || 0);
+      const needsReplace = existing && priceDiffers && (repriceByAge || decayDue);
+
+      if (existing && !needsReplace) {
+        continue;
+      }
+
+      const openSellMap = new Map();
+      if (existing) openSellMap.set(canonicalizeSymbol(symbol), existing);
+      const exitResult = await ensureLimitTP(symbol, desiredPrice, {
         tradeStateRef,
         touchMemoRef,
-        openSellBySym: openTpBestByKey,
+        openSellBySym: openSellMap,
         pos,
+        allowCancelTp: true,
+        forceReplace: needsReplace,
       });
       attemptsSent += exitResult?.attemptsSent || 0;
       attemptsFailed += exitResult?.attemptsFailed || 0;
       if (exitResult?.attempted) placedCount += 1;
+      if (exitResult?.submittedOk) {
+        const updated = tradeStateRef.current[normalizedSymbol] || {};
+        const nextDecayAtMs = now + Math.max(0, (settings.cryptoExitDecayEverySec || 0) * 1000);
+        tradeStateRef.current[normalizedSymbol] = {
+          ...updated,
+          exitPlan: {
+            ...(updated.exitPlan || exitPlan),
+            lastPlacedAtMs: now,
+            nextDecayAtMs,
+          },
+        };
+      }
       continue;
     }
-    const exitAutoOk = autoTrade || isCryptoPair;
     const qty = Number(pos.qty ?? pos.quantity ?? 0);
     const sellOrders = openSellOrdersBySym.get(symbolKey) || [];
     const hasOpenSell = sellOrders.length > 0;
@@ -5083,12 +5278,13 @@ const reconcileExits = async ({
     if (!(plannedQty > 0)) continue;
     if (!(entryBase > 0)) continue;
     if (!isCryptoPair && action !== 'place_sell') continue;
+    const computedNotional = plannedQty * tp;
     const sizingCheck = validateOrderCandidate({
       symbol,
       side: 'sell',
       qty: plannedQty,
       price: tp,
-      computedNotional: plannedQty * tp,
+      computedNotional,
       minNotional,
       quantizeQty,
       autoBumpMinNotional: false,
@@ -5097,6 +5293,8 @@ const reconcileExits = async ({
       console.warn('exit_reconcile_skip', { symbol, qty: plannedQty, reason: sizingCheck.reason });
       logTradeAction('exit_skipped', symbol, {
         reason: 'exit_size_guard',
+        computedNotional,
+        minNotional,
         pnl_bps: Number.isFinite(unrealizedBps) ? unrealizedBps : null,
         tp_bps: tpBps,
         sl_bps: Number.isFinite(eff(symbol, 'stopLossBps')) ? eff(symbol, 'stopLossBps') : null,
@@ -6608,6 +6806,7 @@ export default function App() {
       setOpenMeta({ positions: openCount, orders: (allOpenOrders || []).length, allowed: cryptosAll.length, universe: cryptosAll.length });
       const exitPassTs = new Date().toISOString();
       console.log(`EXIT_PASS — start — batch=${scanBatchId} — ts=${exitPassTs}`);
+      console.log(`EXIT_PASS — invoked manageExits — batch=${scanBatchId}`);
       // EXIT pass runs before entry scanning so held positions always have managed sells.
       const exitMetrics = await manageExits({
         batchId: scanBatchId,
