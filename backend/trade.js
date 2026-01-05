@@ -773,6 +773,42 @@ function logExitDecision({
   });
 }
 
+function logExitRepairDecision({
+  symbol,
+  qty,
+  avgEntryPrice,
+  costBasis,
+  bid,
+  ask,
+  targetPrice,
+  timeInForce,
+  orderType,
+  hasOpenSell,
+  gates,
+  decision,
+}) {
+  console.log('exit_repair_decision', {
+    symbol,
+    qty,
+    avgEntryPrice,
+    costBasis,
+    bid,
+    ask,
+    targetPrice,
+    timeInForce,
+    orderType,
+    hasOpenSell,
+    gates,
+    decision,
+  });
+}
+
+function readEnvFlag(name, defaultValue = true) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return defaultValue;
+  return String(raw).toLowerCase() === 'true';
+}
+
 function updateInventoryFromBuy(symbol, qty, price) {
 
   const normalizedSymbol = normalizeSymbol(symbol);
@@ -2036,9 +2072,348 @@ async function handleBuyFill({
 
 }
 
+async function repairOrphanExits() {
+  const autoTradeEnabled = readEnvFlag('AUTO_TRADE', true);
+  const autoSellEnabled = readEnvFlag('AUTO_SELL', true);
+  const exitsEnabled = readEnvFlag('EXITS_ENABLED', true);
+  const liveMode = readEnvFlag('LIVE', readEnvFlag('LIVE_MODE', readEnvFlag('LIVE_TRADING', true)));
+  const gateFlags = { autoTradeEnabled, autoSellEnabled, exitsEnabled, liveMode };
+  let positions = [];
+  let openOrders = [];
+
+  try {
+    [positions, openOrders] = await Promise.all([fetchPositions(), fetchOpenOrders()]);
+  } catch (err) {
+    console.warn('exit_repair_fetch_failed', { error: err?.message || err });
+    return { placed: 0, skipped: 0, failed: 0 };
+  }
+
+  const openSellSymbols = new Set(
+    (Array.isArray(openOrders) ? openOrders : [])
+      .filter((order) => String(order.side || '').toLowerCase() === 'sell')
+      .map((order) => normalizePair(order.rawSymbol || order.symbol))
+  );
+  let placed = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  console.log('exit_repair_pass_start', {
+    positions: Array.isArray(positions) ? positions.length : 0,
+    openSell: openSellSymbols.size,
+  });
+
+  for (const pos of positions) {
+    const symbol = normalizeSymbol(pos.symbol);
+    const qty = Number(pos.qty ?? pos.quantity ?? 0);
+    const avgEntryPrice = Number(pos.avg_entry_price ?? pos.avgEntryPrice ?? 0);
+    const costBasis = Number(pos.cost_basis ?? pos.costBasis ?? 0);
+    const orderType = 'limit';
+    const timeInForce = 'gtc';
+    let bid = null;
+    let ask = null;
+
+    try {
+      const quote = await getLatestQuote(symbol);
+      bid = quote.bid;
+      ask = quote.ask;
+    } catch (err) {
+      console.warn('exit_repair_quote_failed', { symbol, error: err?.message || err });
+    }
+
+    const hasOpenSell = openSellSymbols.has(normalizePair(symbol));
+    const hasTrackedExit = exitState.has(symbol);
+    let decision = 'SKIP:unknown';
+    let targetPrice = null;
+
+    if (!Number.isFinite(qty) || qty <= 0) {
+      decision = 'SKIP:non_positive_qty';
+      skipped += 1;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
+
+    if (isDustQty(qty)) {
+      decision = 'SKIP:dust_qty';
+      skipped += 1;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
+
+    if (hasTrackedExit) {
+      decision = 'SKIP:tracked_exit';
+      skipped += 1;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
+
+    if (hasOpenSell) {
+      decision = 'SKIP:open_sell';
+      skipped += 1;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
+
+    console.warn('exit_orphan_detected', { symbol, qty });
+
+    if (!Number.isFinite(avgEntryPrice) || avgEntryPrice <= 0) {
+      decision = 'SKIP:missing_cost_basis';
+      skipped += 1;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
+
+    if (!autoTradeEnabled) {
+      decision = 'SKIP:auto_trade_disabled';
+      skipped += 1;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
+
+    if (!autoSellEnabled) {
+      decision = 'SKIP:auto_sell_disabled';
+      skipped += 1;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
+
+    if (!exitsEnabled) {
+      decision = 'SKIP:exits_disabled';
+      skipped += 1;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
+
+    if (!liveMode) {
+      decision = 'SKIP:live_mode_disabled';
+      skipped += 1;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
+
+    const notionalUsd = qty * avgEntryPrice;
+    const minNetProfitBps = await feeAwareMinProfitBps(symbol, notionalUsd);
+    targetPrice = roundToTick(avgEntryPrice * (1 + minNetProfitBps / 10000));
+
+    try {
+      const repairOrder = await submitLimitSell({
+        symbol,
+        qty,
+        limitPrice: targetPrice,
+        reason: 'exit_repair_orphan',
+      });
+      if (repairOrder?.skipped) {
+        decision = `SKIP:${repairOrder.reason || 'submit_skipped'}`;
+        skipped += 1;
+        logExitRepairDecision({
+          symbol,
+          qty,
+          avgEntryPrice,
+          costBasis,
+          bid,
+          ask,
+          targetPrice,
+          timeInForce,
+          orderType,
+          hasOpenSell,
+          gates: gateFlags,
+          decision,
+        });
+        continue;
+      }
+      if (!repairOrder?.id) {
+        decision = 'FAIL:invalid_order_response';
+        failed += 1;
+        logExitRepairDecision({
+          symbol,
+          qty,
+          avgEntryPrice,
+          costBasis,
+          bid,
+          ask,
+          targetPrice,
+          timeInForce,
+          orderType,
+          hasOpenSell,
+          gates: gateFlags,
+          decision,
+        });
+        continue;
+      }
+      const now = Date.now();
+      exitState.set(symbol, {
+        symbol,
+        qty,
+        entryPrice: avgEntryPrice,
+        entryTime: now,
+        notionalUsd,
+        minNetProfitBps,
+        targetPrice,
+        sellOrderId: repairOrder.id,
+        sellOrderSubmittedAt: now,
+        sellOrderLimit: targetPrice,
+      });
+      placed += 1;
+      decision = 'PLACE_EXIT';
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+    } catch (err) {
+      failed += 1;
+      decision = `FAIL:${err?.message || err}`;
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+    }
+  }
+
+  console.log('exit_repair_pass_done', { placed, skipped, failed });
+  return { placed, skipped, failed };
+}
+
 async function manageExitStates() {
 
   const now = Date.now();
+
+  await repairOrphanExits();
 
   for (const [symbol, state] of exitState.entries()) {
 
