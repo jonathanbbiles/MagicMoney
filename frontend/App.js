@@ -5036,7 +5036,13 @@ const reconcileExits = async ({
         autoBumpMinNotional: false,
       });
       if (sizingCheck.decision !== 'ATTEMPT') {
-        console.warn('exit_reconcile_skip', { symbol, qty: plannedQty, reason: sizingCheck.reason });
+        console.warn('exit_reconcile_skip', {
+          symbol,
+          qty: plannedQty,
+          reason: sizingCheck.reason,
+          computedNotional: plannedQty * desiredPrice,
+          minNotional,
+        });
         logTradeAction('exit_skipped', normalizedSymbol, {
           reason: 'exit_size_guard',
           computedNotional: plannedQty * desiredPrice,
