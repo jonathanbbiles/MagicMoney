@@ -1935,8 +1935,29 @@ const FRIENDLY = {
   buy_success: { sev: 'success', msg: (d) => `BUY filled qty ${d.qty} @≤${d.limit}` },
   buy_unfilled_canceled: { sev: 'warn', msg: () => `BUY unfilled — canceled bid` },
   tp_limit_set: { sev: 'success', msg: (d) => `TP set @ ${d.limit}` },
+  SELL_PLACED: { sev: 'success', msg: (d) => `SELL placed @ ${d.limit} (${d.targetBps ?? 'n/a'} bps)` },
+  SELL_REPLACED: { sev: 'info', msg: (d) => `SELL replaced @ ${d.limit} (${d.targetBps ?? 'n/a'} bps)` },
   taker_force_flip: { sev: 'warn', msg: (d) => `TAKER force flip @~${d?.limit ?? ''}` },
   tp_limit_error: { sev: 'error', msg: (d) => `TP set error: ${d.error}` },
+  exit_http_error: { sev: 'error', msg: (d) => `Alpaca exit ${d.status ?? 'error'}${d.body ? ' • ' + d.body : ''}` },
+  exit_submit_retry: { sev: 'warn', msg: (d) => `Exit submit retry ${d.attempt}/${d.maxAttempts}` },
+  EXIT_PASS_START: {
+    sev: 'info',
+    msg: (d) => `Exit pass start (positions ${d.positions ?? 0}, openSell ${d.openSell ?? 0})`,
+  },
+  EXIT_PASS_END: {
+    sev: 'info',
+    msg: (d) =>
+      `Exit pass done (positions ${d.positions ?? 0}, openSell ${d.openSell ?? 0}, placed ${d.placed ?? 0}, skipped ${d.skipped ?? 0}, fails ${d.fails ?? 0})`,
+  },
+  EXIT_ORPHAN: { sev: 'warn', msg: (d) => `Exit orphan ${d.recovered ? 'recovered' : 'detected'} ${d.action ? '• ' + d.action : ''}` },
+  EXIT_PLAN: { sev: 'info', msg: (d) => `Exit plan bps ${d.bps ?? 'n/a'} @ ${d.price ?? 'n/a'}` },
+  EXIT_STATUS: { sev: 'info', msg: (d) => `Exit status ${d.status}` },
+  exit_quote_stale: { sev: 'warn', msg: (d) => `Exit stale quote (fallback ${d.fallback ?? 'n/a'})` },
+  exit_held: { sev: 'info', msg: () => `Exit held snapshot` },
+  exit_notice: { sev: 'info', msg: (d) => `Exit notice (qty ${d.qty ?? 'n/a'})` },
+  sell_order_ttl: { sev: 'warn', msg: (d) => `SELL TTL cancel @ ${d.limit ?? 'n/a'}` },
+  sell_order_cancel: { sev: 'warn', msg: (d) => `SELL canceled (${d.reason ?? 'unknown'})` },
   scan_start: { sev: 'info', msg: (d) => `Scan start (batch ${d.batch})` },
   scan_summary: {
     sev: 'info',
@@ -2740,11 +2761,26 @@ async function cancelOrder(orderId) {
   if (!orderId) return false;
   try {
     noteCancelCaller(`cancel_order:${orderId}`);
-    await f(`${BACKEND_BASE_URL}/orders/${orderId}`, { method: 'DELETE', headers: BACKEND_HEADERS });
+    const res = await f(`${BACKEND_BASE_URL}/orders/${orderId}`, { method: 'DELETE', headers: BACKEND_HEADERS });
+    const raw = await res.text().catch(() => '');
+    if (!res.ok) {
+      logTradeAction('exit_http_error', 'ORDER', {
+        status: res.status ?? null,
+        body: raw ?? '',
+        action: 'cancel',
+        orderId,
+      });
+    }
     __openOrdersCache = { ts: 0, items: [] };
     return true;
   } catch (err) {
     console.warn('Cancel error', err?.message || err);
+    logTradeAction('exit_http_error', 'ORDER', {
+      status: null,
+      body: err?.message || String(err),
+      action: 'cancel',
+      orderId,
+    });
     return false;
   }
 }
@@ -2769,9 +2805,25 @@ const submitExitLimitOrder = async (order, { reason } = {}) => {
       reason,
       response: { status: null, body: message },
     });
+    logTradeAction('exit_http_error', order?.symbol || 'ORDER', {
+      status: null,
+      body: message,
+      side: order?.side,
+      type: order?.type,
+      reason,
+    });
     return { ok: false, res: null, data: null, raw: message, error };
   }
   const ok = Boolean(res?.ok && data?.ok && data?.orderId);
+  if (!ok) {
+    logTradeAction('exit_http_error', order?.symbol || 'ORDER', {
+      status: res?.status ?? null,
+      body: raw ?? '',
+      side: order?.side,
+      type: order?.type,
+      reason,
+    });
+  }
   return { ok, res, data, raw };
 };
 
@@ -2790,6 +2842,15 @@ const cancelExitOrder = async (orderId, { symbol, reason } = {}) => {
       response: { status: res.status, body: raw },
     });
     __openOrdersCache = { ts: 0, items: [] };
+    if (!res.ok) {
+      logTradeAction('exit_http_error', symbol || 'ORDER', {
+        status: res.status,
+        body: raw ?? '',
+        action: 'cancel',
+        orderId,
+        reason,
+      });
+    }
     return !!res.ok;
   } catch (error) {
     const message = error?.message || String(error);
@@ -2798,6 +2859,13 @@ const cancelExitOrder = async (orderId, { symbol, reason } = {}) => {
       symbol,
       reason,
       response: { status: null, body: message },
+    });
+    logTradeAction('exit_http_error', symbol || 'ORDER', {
+      status: null,
+      body: message,
+      action: 'cancel',
+      orderId,
+      reason,
     });
     return false;
   }
@@ -4398,6 +4466,7 @@ const ensureLimitTP = async (symbol, limitPrice, {
       ? overrideLimit
       : (entryPx > 0 ? roundToTick(entryPx * (1 + effectiveTargetBps / 10000), tickSize) : null);
 
+    let cancelledExisting = false;
     if (action === 'PLACE' || action === 'REPLACE') {
       if (existing?.id) {
         const canCancel = allowCancelTp || forceReplace || !isTpOrder(existing);
@@ -4406,6 +4475,7 @@ const ensureLimitTP = async (symbol, limitPrice, {
             symbol: normalizedSymbol,
             reason: action === 'REPLACE' ? reason : 'orphan_cleanup',
           });
+          cancelledExisting = cancelled;
           if (!cancelled && action === 'REPLACE') {
             action = 'HOLD';
             reason = 'cancel_failed';
@@ -4430,24 +4500,50 @@ const ensureLimitTP = async (symbol, limitPrice, {
         reason: 'exit_tp_limit',
       };
       logOrderPayload('sell_limit', order);
-      attemptsSent += 1;
-      attempted = true;
-      const submitRes = await submitExitLimitOrder(order, { reason });
-      logOrderResponse('sell_limit', order, submitRes.res, submitRes.data);
-      if (submitRes.ok && submitRes.data?.orderId) {
-        submittedOk = true;
-        tradeStateRef.current[normalizedSymbol] = {
-          ...(state || {}),
-          tpOrderId: submitRes.data.orderId,
-          tpLastLimit: effectiveTargetPrice,
-          tpLastBps: effectiveTargetBps,
-          tpLastPlacedAt: now,
-        };
-      } else {
+      const retryBackoffMs = [500, 1000, 2000, 4000, 5000];
+      const maxAttempts = Math.min(cancelledExisting ? 5 : 1, retryBackoffMs.length);
+      let submitRes = null;
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        attemptsSent += 1;
+        attempted = true;
+        submitRes = await submitExitLimitOrder(order, { reason });
+        logOrderResponse('sell_limit', order, submitRes.res, submitRes.data);
+        if (submitRes.ok && submitRes.data?.orderId) {
+          submittedOk = true;
+          tradeStateRef.current[normalizedSymbol] = {
+            ...(state || {}),
+            tpOrderId: submitRes.data.orderId,
+            tpLastLimit: effectiveTargetPrice,
+            tpLastBps: effectiveTargetBps,
+            tpLastPlacedAt: now,
+          };
+          break;
+        }
         attemptsFailed += 1;
+        logTradeAction('exit_submit_retry', normalizedSymbol, {
+          attempt: attempt + 1,
+          maxAttempts,
+          status: submitRes.res?.status ?? null,
+          body: submitRes.raw ?? submitRes.data?.raw ?? '',
+          reason,
+        });
+        if (attempt < maxAttempts - 1) {
+          await sleep(retryBackoffMs[attempt]);
+        }
+      }
+      if (!submittedOk) {
         action = 'HOLD';
         reason = 'order_submit_failed';
       }
+    }
+
+    if (submittedOk) {
+      const logType = action === 'REPLACE' ? 'SELL_REPLACED' : 'SELL_PLACED';
+      logTradeAction(logType, normalizedSymbol, {
+        targetBps: Number.isFinite(effectiveTargetBps) ? Number(effectiveTargetBps.toFixed(2)) : null,
+        limit: Number.isFinite(effectiveTargetPrice) ? effectiveTargetPrice : null,
+        qty: plannedQty,
+      });
     }
 
     logExitEval({
@@ -4639,19 +4735,25 @@ const ensureLimitTP = async (symbol, limitPrice, {
       if (existing) { await f(`${BACKEND_BASE_URL}/orders/${existing.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null); }
       logTradeAction('tp_limit_set', normalizedSymbol, { id: data.orderId, limit: order.limit_price });
       logTradeAction('sell_resting', normalizedSymbol, { limit: order.limit_price });
-      console.log(`${normalizedSymbol} — SELL attempt sent (qty=${qty}, type=limit, limit=${order.limit_price}, reason=tp_hit)`);
     } else {
       attemptsFailed += 1;
       const msg = data?.error?.message || data?.message || data?.raw?.slice?.(0, 100) || '';
       const notional = Number(order.limit_price) * qty;
       const msgLower = String(msg || '').toLowerCase();
       if (msgLower.includes('min notional') || msgLower.includes('minimum notional') || msgLower.includes('min order') || msgLower.includes('minimum order') || msgLower.includes('order size')) {
-        console.log(`EXIT_SKIP — ${normalizedSymbol} — reason=min_notional — qty=${qty} — limit=${order.limit_price}`);
-        console.log(`${normalizedSymbol} — Skip: dust_position`, { qty, notional });
+        logTradeAction('exit_skipped', normalizedSymbol, { reason: 'min_notional', qty, limit: order.limit_price, notional });
         tradeStateRef.current[normalizedSymbol] = { ...(state || {}), dust: true };
       }
-      console.log(`EXIT_FAIL — ${normalizedSymbol} — place_sell — ${msg || 'order_rejected'}`);
-      console.log(`${normalizedSymbol} — SELL attempt failed (error=${msg}, qty=${qty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
+      logTradeAction('exit_submit_error', normalizedSymbol, {
+        reason: msg || 'order_rejected',
+        qty,
+        notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
+      });
+      logTradeAction('exit_http_error', normalizedSymbol, {
+        status: res.status,
+        body: msg,
+        action: 'submit',
+      });
       logOrderFailure({
         order,
         endpoint: `${BACKEND_BASE_URL}/orders`,
@@ -4666,12 +4768,19 @@ const ensureLimitTP = async (symbol, limitPrice, {
     const errMsg = e?.message || 'unknown';
     const msgLower = String(errMsg || '').toLowerCase();
     if (msgLower.includes('min notional') || msgLower.includes('minimum notional') || msgLower.includes('min order') || msgLower.includes('minimum order') || msgLower.includes('order size')) {
-      console.log(`EXIT_SKIP — ${normalizedSymbol} — reason=min_notional — qty=${qty} — limit=${finalLimit}`);
-      console.log(`${normalizedSymbol} — Skip: dust_position`, { qty, notional });
+      logTradeAction('exit_skipped', normalizedSymbol, { reason: 'min_notional', qty, limit: finalLimit, notional });
       tradeStateRef.current[normalizedSymbol] = { ...(state || {}), dust: true };
     }
-    console.log(`EXIT_FAIL — ${normalizedSymbol} — place_sell — ${errMsg}`);
-    console.log(`${normalizedSymbol} — SELL attempt failed (error=${errMsg}, qty=${qty}, notional=${Number.isFinite(notional) ? notional.toFixed(2) : notional})`);
+    logTradeAction('exit_submit_error', normalizedSymbol, {
+      reason: errMsg,
+      qty,
+      notional: Number.isFinite(notional) ? Number(notional.toFixed(2)) : notional,
+    });
+    logTradeAction('exit_http_error', normalizedSymbol, {
+      status: null,
+      body: errMsg,
+      action: 'submit',
+    });
     logOrderError('sell_limit', { symbol: normalizedSymbol, qty, side: 'sell', type: 'limit', time_in_force: limitTIF, limit_price: finalLimit }, e);
     logTradeAction('tp_limit_error', normalizedSymbol, { error: e.message });
     logOrderFailure({
@@ -4809,6 +4918,7 @@ const reconcileExits = async ({
   autoTrade,
   tradeStateRef,
   touchMemoRef,
+  orphanedSymbols,
   settings,
 }) => {
   const openSellOrdersBySym = new Map();
@@ -4888,8 +4998,7 @@ const reconcileExits = async ({
       cancelsCount += 1;
       if (reason === 'ttl') ttlCancelsCount += 1;
       if (reason) {
-        console.log('sell_order_cancel', {
-          symbol: order.pairSymbol ?? normalizePair(order.symbol),
+        logTradeAction('sell_order_cancel', order.pairSymbol ?? normalizePair(order.symbol), {
           orderId: order.id,
           reason,
         });
@@ -4949,6 +5058,7 @@ const reconcileExits = async ({
     const isCryptoPair = normalizePair(symbol).endsWith('/USD');
     const exitAutoOk = isCryptoPair ? !!settings.cryptoExitAlwaysOn : !!autoTrade;
     if (isCryptoPair) {
+      if (orphanedSymbols?.has?.(canonicalizeSymbol(symbol))) continue;
       const qty = Number(pos.qty ?? pos.quantity ?? 0);
       if (!(qty > 0)) continue;
       if (!exitAutoOk) continue;
@@ -5008,7 +5118,7 @@ const reconcileExits = async ({
       }
 
       if (!existing) {
-        console.log(`EXIT_ORPHAN — ${symbol} — placing fresh TP`);
+        logTradeAction('EXIT_ORPHAN', symbol, { reason: 'no_open_sell', action: 'placing_tp' });
         exitPlan = {
           ...exitPlan,
           bps: Number.isFinite(settings.cryptoExitStartBps) ? settings.cryptoExitStartBps : exitPlan.bps,
@@ -5020,9 +5130,13 @@ const reconcileExits = async ({
       let desiredPrice = entryBase > 0 ? entryBase * (1 + desiredBps / 10000) : NaN;
       if (Number.isFinite(feeFloor)) desiredPrice = Math.max(desiredPrice, feeFloor);
       desiredPrice = roundToTick(desiredPrice, tickSize);
-      console.log(
-        `EXIT_PLAN — ${symbol} — qty=${plannedQty} — entry=${entryBase} — feeFloor=${feeFloor} — bps=${desiredBps.toFixed(1)} — px=${desiredPrice}`
-      );
+      logTradeAction('EXIT_PLAN', symbol, {
+        qty: plannedQty,
+        entry: entryBase,
+        feeFloor,
+        bps: Number.isFinite(desiredBps) ? Number(desiredBps.toFixed(2)) : null,
+        price: Number.isFinite(desiredPrice) ? desiredPrice : null,
+      });
       tradeStateRef.current[normalizedSymbol] = { ...state, exitPlan };
 
       const sizingCheck = validateOrderCandidate({
@@ -5130,9 +5244,12 @@ const reconcileExits = async ({
       const ageMs = getOrderAgeMs(existing, now);
       const limit = existing.limit_price ?? existing.limitPrice ?? 'NA';
       const tif = existing.time_in_force ?? existing.timeInForce ?? 'NA';
-      console.log(
-        `SELL TTL cancel: ${symbol} orderId=${existing.id} ageSec=${(ageMs / 1000).toFixed(1)} limit=${limit} tif=${tif}`
-      );
+      logTradeAction('sell_order_ttl', symbol, {
+        orderId: existing.id,
+        age_s: Number.isFinite(ageMs) ? ageMs / 1000 : null,
+        limit,
+        tif,
+      });
       await cancelSellOrder(existing, 'ttl');
       markSellReplaceCooldown(symbol, now);
       openSellBySym.delete(symbolKey);
@@ -5140,14 +5257,17 @@ const reconcileExits = async ({
     }
 
     if (hasOpenSell) {
-      console.log(`EXIT — ${symbol} — hasOpenSell=true — orderId=${sellOrders[0]?.id || 'n/a'} — no_action`);
+      logTradeAction('EXIT_STATUS', symbol, {
+        status: 'has_open_sell',
+        orderId: sellOrders[0]?.id || null,
+      });
     }
 
     const meta = await fetchAssetMeta(symbol);
     const quantizeQty = createQtyQuantizer(symbol, meta);
     const plannedQty = quantizeQty(qty);
     if (plannedQty > 0 && plannedQty < MIN_TRADE_QTY) {
-      console.log(`${symbol} — Sell allowed despite below_min_order_size`, { qty: plannedQty, minQty: MIN_TRADE_QTY });
+      logTradeAction('exit_notice', symbol, { qty: plannedQty, minQty: MIN_TRADE_QTY });
     }
     const minNotional = meta?._min_notional > 0 ? meta._min_notional : MIN_ORDER_NOTIONAL_USD;
     const state = tradeStateRef?.current?.[symbol] || {};
@@ -5160,7 +5280,7 @@ const reconcileExits = async ({
       state,
     });
     if (!Number.isFinite(tp)) {
-      console.log(`EXIT_SKIP — ${symbol} — reason=no_target_price`);
+      logTradeAction('exit_skipped', symbol, { reason: 'no_target_price' });
       skippedCount += 1;
       continue;
     }
@@ -5200,9 +5320,9 @@ const reconcileExits = async ({
     }
     if (quoteContext.hadStaleQuote && quoteContext.fallbackUsed === 'entry_based') {
       const limitText = Number.isFinite(tp) ? tp.toFixed(isStock(symbol) ? 2 : 5) : 'n/a';
-      console.log(`EXIT — ${symbol} — stale_quote — fallback=entry_based — limit=${limitText}`);
+      logTradeAction('exit_quote_stale', symbol, { fallback: 'entry_based', limit: limitText });
     } else if (quoteContext.hadStaleQuote && quoteContext.fallbackUsed) {
-      console.log(`EXIT — ${symbol} — stale_quote — using fallback=${quoteContext.fallbackUsed}`);
+      logTradeAction('exit_quote_stale', symbol, { fallback: quoteContext.fallbackUsed });
     }
     const exitAgeSec = Number.isFinite(state.entryTs) ? Math.max(0, (now - state.entryTs) / 1000) : null;
     const exitNotMet = Number.isFinite(currentBid) && Number.isFinite(targetPrice)
@@ -5216,7 +5336,7 @@ const reconcileExits = async ({
       exit_not_met: exitNotMet,
       quote_age_s: Number.isFinite(quoteFreshness.ageMs) ? quoteFreshness.ageMs / 1000 : null,
     };
-    console.log(`${symbol} — Held`, {
+    logTradeAction('exit_held', symbol, {
       qtyHeld: plannedQty,
       avgEntry: entryBase,
       breakevenPrice,
@@ -5261,7 +5381,7 @@ const reconcileExits = async ({
       const notionalPx = Number.isFinite(targetPrice) ? targetPrice : entryBase;
       const computedNotional = Number.isFinite(notionalPx) ? plannedQty * notionalPx : NaN;
       if (Number.isFinite(minNotional) && minNotional > 0 && Number.isFinite(computedNotional) && computedNotional < minNotional) {
-        console.log(`EXIT_SKIP — ${symbol} — reason=min_notional — qty=${plannedQty} — limit=${limitText}`);
+        logTradeAction('exit_skipped', symbol, { reason: 'min_notional', qty: plannedQty, limit: limitText });
         skippedCount += 1;
         logTradeAction('exit_skipped', symbol, {
           reason: 'min_notional',
@@ -5274,7 +5394,12 @@ const reconcileExits = async ({
     }
     if (hasOpenSell && qty > 0) skippedCount += 1;
     if (action === 'place_sell') {
-      console.log(`EXIT — ${symbol} — hasOpenSell=false — place_sell — qty=${plannedQty} — limit=${limitText} — tif=gtc`);
+      logTradeAction('EXIT_STATUS', symbol, {
+        status: 'place_sell',
+        qty: plannedQty,
+        limit: limitText,
+        tif: 'gtc',
+      });
     }
 
     if (state.dust) continue;
@@ -5283,7 +5408,6 @@ const reconcileExits = async ({
     if (!isCryptoPair && isSellReplaceCooldownActive(symbol, now)) continue;
     if (!(plannedQty > 0)) continue;
     if (!(entryBase > 0)) continue;
-    if (!isCryptoPair && action !== 'place_sell') continue;
     const computedNotional = plannedQty * tp;
     const sizingCheck = validateOrderCandidate({
       symbol,
@@ -5314,7 +5438,7 @@ const reconcileExits = async ({
     attemptsFailed += exitResult?.attemptsFailed || 0;
     if (exitResult?.attempted) placedCount += 1;
     if ((exitResult?.attemptsFailed || 0) > 0) {
-      console.log(`EXIT_FAIL — ${symbol} — place_sell — order_submit_failed`);
+      logTradeAction('exit_submit_error', symbol, { reason: 'order_submit_failed' });
     }
     if (sellEligible && exitNotMet === false && !exitResult?.attempted) {
       attemptsFailed += 1;
@@ -5363,6 +5487,8 @@ const manageExits = async ({
   let placed = 0;
   let skipped = 0;
   let fails = 0;
+  let orphanDetected = 0;
+  let orphanRecovered = 0;
 
   const mapPositions = (arr) =>
     Array.isArray(arr)
@@ -5400,34 +5526,110 @@ const manageExits = async ({
       const res = await f(`${BACKEND_BASE_URL}/positions`, { headers: BACKEND_HEADERS });
       if (!res.ok) {
         fails += 1;
-        console.log(`EXIT_FAIL — positions_fetch — status=${res.status}`);
+        const body = await res.text().catch(() => '');
+        logTradeAction('exit_http_error', 'positions', {
+          status: res.status,
+          body,
+          action: 'fetch',
+        });
         return { openBuyCount, openSellCount, placedCount: 0, skippedCount: 0, attemptsSent: 0, attemptsFailed: fails };
       }
       const arr = await res.json();
       positions = mapPositions(arr);
     } catch (err) {
       fails += 1;
-      console.log(`EXIT_FAIL — positions_fetch — ${err?.message || err}`);
+      logTradeAction('exit_http_error', 'positions', {
+        status: null,
+        body: err?.message || String(err),
+        action: 'fetch',
+      });
       return { openBuyCount, openSellCount, placedCount: 0, skippedCount: 0, attemptsSent: 0, attemptsFailed: fails };
     }
 
     if (positions.length) {
       const sample = positions[0]?.rawSymbol ?? positions[0]?.symbol ?? '';
-      console.log(`EXIT_DEBUG — sample_symbols — pos=${sample} — canon=${canon(sample)}`);
+      logTradeAction('exit_debug', 'positions', { sample, canon: canon(sample) });
     }
 
     try {
       const res = await f(`${BACKEND_BASE_URL}/orders?status=open&nested=true&limit=100`, { headers: BACKEND_HEADERS });
       if (!res.ok) {
         fails += 1;
-        console.log(`EXIT_FAIL — open_orders_fetch — status=${res.status}`);
+        const body = await res.text().catch(() => '');
+        logTradeAction('exit_http_error', 'open_orders', {
+          status: res.status,
+          body,
+          action: 'fetch',
+        });
       } else {
         const arr = await res.json();
         openOrders = mapOrders(arr);
       }
     } catch (err) {
       fails += 1;
-      console.log(`EXIT_FAIL — open_orders_fetch — ${err?.message || err}`);
+      logTradeAction('exit_http_error', 'open_orders', {
+        status: null,
+        body: err?.message || String(err),
+        action: 'fetch',
+      });
+    }
+
+    const positionsBySym = new Map();
+    const orphanedSymbols = new Set();
+    for (const pos of positions || []) {
+      const sym = pos.pairSymbol ?? normalizePair(pos.symbol);
+      const qty = Number(pos.qty ?? pos.quantity ?? 0);
+      if (!sym || !isCrypto(sym) || !(qty > 0)) continue;
+      positionsBySym.set(canonicalizeSymbol(sym), pos);
+    }
+
+    const openSellBySym = new Map();
+    for (const order of openOrders || []) {
+      const status = String(order?.status || order?.order_status || order?.orderStatus || '').toLowerCase();
+      if (!EXIT_OPEN_ORDER_STATUSES.has(status)) continue;
+      const side = String(order?.side || '').toLowerCase();
+      if (side !== 'sell') continue;
+      const sym = order.pairSymbol ?? normalizePair(order.symbol);
+      if (!sym) continue;
+      const key = canonicalizeSymbol(sym);
+      if (!key) continue;
+      const existing = openSellBySym.get(key);
+      if (!existing) {
+        openSellBySym.set(key, order);
+        continue;
+      }
+      const existingTs = parseOrderTimestampMs(existing) || 0;
+      const nextTs = parseOrderTimestampMs(order) || 0;
+      if (nextTs > existingTs) openSellBySym.set(key, order);
+    }
+
+    logTradeAction('EXIT_PASS_START', 'STATIC', {
+      batchId,
+      positions: positions.length,
+      openSell: openSellBySym.size,
+    });
+
+    for (const [symKey, pos] of positionsBySym.entries()) {
+      if (openSellBySym.has(symKey)) continue;
+      const normalizedSymbol = normalizePair(pos.pairSymbol ?? pos.symbol);
+      const qty = Number(pos.qty ?? pos.quantity ?? 0);
+      if (!(qty > 0)) continue;
+      orphanDetected += 1;
+      const orphanResult = await ensureLimitTP(normalizedSymbol, null, {
+        tradeStateRef,
+        touchMemoRef,
+        openSellBySym,
+        pos,
+        allowCancelTp: true,
+        forceReplace: false,
+      });
+      orphanedSymbols.add(symKey);
+      if (orphanResult?.submittedOk) orphanRecovered += 1;
+      logTradeAction('EXIT_ORPHAN', normalizedSymbol, {
+        qty,
+        recovered: !!orphanResult?.submittedOk,
+        attempted: !!orphanResult?.attempted,
+      });
     }
 
     const exitMetrics = await reconcileExits({
@@ -5436,6 +5638,7 @@ const manageExits = async ({
       autoTrade,
       tradeStateRef,
       touchMemoRef,
+      orphanedSymbols,
       settings,
     });
     placed = exitMetrics?.placedCount ?? 0;
@@ -5447,14 +5650,23 @@ const manageExits = async ({
       const res = await f(`${BACKEND_BASE_URL}/orders?status=open&nested=true&limit=100`, { headers: BACKEND_HEADERS });
       if (!res.ok) {
         fails += 1;
-        console.log(`EXIT_FAIL — open_orders_fetch — status=${res.status}`);
+        const body = await res.text().catch(() => '');
+        logTradeAction('exit_http_error', 'open_orders', {
+          status: res.status,
+          body,
+          action: 'fetch_after',
+        });
       } else {
         const arr = await res.json();
         openOrdersAfter = mapOrders(arr);
       }
     } catch (err) {
       fails += 1;
-      console.log(`EXIT_FAIL — open_orders_fetch — ${err?.message || err}`);
+      logTradeAction('exit_http_error', 'open_orders', {
+        status: null,
+        body: err?.message || String(err),
+        action: 'fetch_after',
+      });
     }
 
     const { openBuy, openSell } = countOpenOrders(openOrdersAfter.length ? openOrdersAfter : openOrders);
@@ -5467,9 +5679,16 @@ const manageExits = async ({
       openSellCount,
     };
   } finally {
-    console.log(
-      `EXIT_PASS — done — batch=${batchId} — positions=${positions.length} — openSell=${openSellCount} — placed=${placed} — skipped=${skipped} — fails=${fails}`
-    );
+    logTradeAction('EXIT_PASS_END', 'STATIC', {
+      batchId,
+      positions: positions.length,
+      openSell: openSellCount,
+      placed,
+      skipped,
+      fails,
+      orphanDetected,
+      orphanRecovered,
+    });
   }
 };
 
@@ -6811,8 +7030,8 @@ export default function App() {
 
       setOpenMeta({ positions: openCount, orders: (allOpenOrders || []).length, allowed: cryptosAll.length, universe: cryptosAll.length });
       const exitPassTs = new Date().toISOString();
-      console.log(`EXIT_PASS — start — batch=${scanBatchId} — ts=${exitPassTs}`);
-      console.log(`EXIT_PASS — invoked manageExits — batch=${scanBatchId}`);
+      logTradeAction('EXIT_PASS_START', 'STATIC', { batchId: scanBatchId, ts: exitPassTs });
+      logTradeAction('EXIT_STATUS', 'STATIC', { status: 'manage_exits_invoked', batchId: scanBatchId });
       // EXIT pass runs before entry scanning so held positions always have managed sells.
       const exitMetrics = await manageExits({
         batchId: scanBatchId,
