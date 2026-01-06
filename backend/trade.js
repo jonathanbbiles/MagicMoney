@@ -2329,16 +2329,21 @@ async function repairOrphanExits() {
     if (['filled', 'canceled', 'expired', 'rejected'].includes(status)) {
       return acc;
     }
-    const symbol = normalizePair(order.symbol || order.rawSymbol);
+    const symbol = normalizeSymbol(order.symbol || order.rawSymbol);
     if (!acc.has(symbol)) {
       acc.set(symbol, []);
     }
     acc.get(symbol).push(order);
     return acc;
   }, new Map());
+  const openSellSymbols = new Set(
+    (Array.isArray(openOrders) ? openOrders : [])
+      .filter((order) => String(order.side || '').toLowerCase() === 'sell')
+      .map((order) => normalizeSymbol(order.symbol || order.rawSymbol))
+  );
   const positionsBySymbol = new Map(
     (Array.isArray(positions) ? positions : []).map((pos) => [
-      normalizePair(pos.symbol || pos.rawSymbol),
+      normalizeSymbol(pos.symbol || pos.rawSymbol),
       Number(pos.qty ?? pos.quantity ?? 0),
     ])
   );
@@ -2348,7 +2353,9 @@ async function repairOrphanExits() {
 
   console.log('exit_repair_pass_start', {
     positions: Array.isArray(positions) ? positions.length : 0,
-    openSell: openSellsBySymbol.size,
+    openSell: openSellSymbols.size,
+    openOrdersCount: Array.isArray(openOrders) ? openOrders.length : 0,
+    openSellSample: Array.from(openSellSymbols).slice(0, 3),
   });
 
   for (const [symbol, sellOrders] of openSellsBySymbol.entries()) {
@@ -2390,7 +2397,7 @@ async function repairOrphanExits() {
       console.warn('exit_repair_quote_failed', { symbol, error: err?.message || err });
     }
 
-    const hasOpenSell = (openSellsBySymbol.get(normalizePair(symbol)) || []).length > 0;
+    const hasOpenSell = openSellSymbols.has(symbol);
     const hasTrackedExit = exitState.has(symbol);
     let decision = 'SKIP:unknown';
     let targetPrice = null;
@@ -3807,19 +3814,18 @@ async function fetchOpenPositions() {
 async function fetchOpenOrders() {
   const orders = await fetchOrders({ status: 'open' });
   const list = Array.isArray(orders) ? orders : [];
-  return list
-    .map((order) => ({
-      id: order.id,
-      client_order_id: order.client_order_id,
-      rawSymbol: order.symbol,
-      pairSymbol: normalizeSymbol(order.symbol),
-      symbol: normalizeSymbol(order.symbol),
-      side: order.side,
-      status: order.status,
-      limit_price: order.limit_price,
-      submitted_at: order.submitted_at,
-      created_at: order.created_at,
-    }));
+  return list.map((order) => ({
+    id: order.id || order.order_id,
+    client_order_id: order.client_order_id,
+    rawSymbol: order.rawSymbol ?? order.symbol,
+    pairSymbol: normalizeSymbol(order.symbol),
+    symbol: normalizeSymbol(order.symbol),
+    side: order.side,
+    status: order.status,
+    limit_price: order.limit_price,
+    submitted_at: order.submitted_at,
+    created_at: order.created_at,
+  }));
 }
 
 async function getConcurrencyGuardStatus() {
