@@ -2314,16 +2314,33 @@ async function repairOrphanExits() {
   let openOrders = [];
 
   try {
-    [positions, openOrders] = await Promise.all([fetchPositions(), fetchOpenOrders()]);
+    [positions, openOrders] = await Promise.all([fetchPositions(), fetchOrders({ status: 'open' })]);
   } catch (err) {
     console.warn('exit_repair_fetch_failed', { error: err?.message || err });
     return { placed: 0, skipped: 0, failed: 0 };
   }
 
-  const openSellSymbols = new Set(
-    (Array.isArray(openOrders) ? openOrders : [])
-      .filter((order) => String(order.side || '').toLowerCase() === 'sell')
-      .map((order) => normalizePair(order.rawSymbol || order.symbol))
+  const openSellsBySymbol = (Array.isArray(openOrders) ? openOrders : []).reduce((acc, order) => {
+    const side = String(order.side || '').toLowerCase();
+    const status = String(order.status || '').toLowerCase();
+    if (side !== 'sell') {
+      return acc;
+    }
+    if (['filled', 'canceled', 'expired', 'rejected'].includes(status)) {
+      return acc;
+    }
+    const symbol = normalizePair(order.symbol || order.rawSymbol);
+    if (!acc.has(symbol)) {
+      acc.set(symbol, []);
+    }
+    acc.get(symbol).push(order);
+    return acc;
+  }, new Map());
+  const positionsBySymbol = new Map(
+    (Array.isArray(positions) ? positions : []).map((pos) => [
+      normalizePair(pos.symbol || pos.rawSymbol),
+      Number(pos.qty ?? pos.quantity ?? 0),
+    ])
   );
   let placed = 0;
   let skipped = 0;
@@ -2331,8 +2348,29 @@ async function repairOrphanExits() {
 
   console.log('exit_repair_pass_start', {
     positions: Array.isArray(positions) ? positions.length : 0,
-    openSell: openSellSymbols.size,
+    openSell: openSellsBySymbol.size,
   });
+
+  for (const [symbol, sellOrders] of openSellsBySymbol.entries()) {
+    const qty = positionsBySymbol.get(symbol);
+    if (!Number.isFinite(qty) || qty <= 0 || isDustQty(qty)) {
+      let canceled = 0;
+      for (const order of sellOrders) {
+        const orderId = order?.id || order?.order_id;
+        if (orderId) {
+          await cancelOrderSafe(orderId);
+          canceled += 1;
+        }
+      }
+      const hadTracked = exitState.has(symbol);
+      exitState.delete(symbol);
+      console.log('exit_orphan_cleanup', {
+        symbol,
+        canceled,
+        clearedTracked: hadTracked,
+      });
+    }
+  }
 
   for (const pos of positions) {
     const symbol = normalizeSymbol(pos.symbol);
@@ -2352,7 +2390,7 @@ async function repairOrphanExits() {
       console.warn('exit_repair_quote_failed', { symbol, error: err?.message || err });
     }
 
-    const hasOpenSell = openSellSymbols.has(normalizePair(symbol));
+    const hasOpenSell = (openSellsBySymbol.get(normalizePair(symbol)) || []).length > 0;
     const hasTrackedExit = exitState.has(symbol);
     let decision = 'SKIP:unknown';
     let targetPrice = null;
@@ -2398,8 +2436,27 @@ async function repairOrphanExits() {
     }
 
     if (hasTrackedExit) {
-      decision = 'SKIP:tracked_exit';
-      skipped += 1;
+      if (hasOpenSell) {
+        decision = 'OK:tracked_and_has_open_sell';
+        skipped += 1;
+        logExitRepairDecision({
+          symbol,
+          qty,
+          avgEntryPrice,
+          costBasis,
+          bid,
+          ask,
+          targetPrice,
+          timeInForce,
+          orderType,
+          hasOpenSell,
+          gates: gateFlags,
+          decision,
+        });
+        continue;
+      }
+      exitState.delete(symbol);
+      decision = 'RESET:tracked_missing_open_sell';
       logExitRepairDecision({
         symbol,
         qty,
@@ -2414,7 +2471,6 @@ async function repairOrphanExits() {
         gates: gateFlags,
         decision,
       });
-      continue;
     }
 
     if (hasOpenSell) {
@@ -2756,8 +2812,9 @@ async function manageExitStates() {
         const limitPrice = normalizeOrderLimitPrice(onlyOrder);
         state.sellOrderLimit = Number.isFinite(limitPrice) ? limitPrice : state.sellOrderLimit;
         const orderAgeMs = getOrderAgeMs(onlyOrder);
-        if (!state.sellOrderSubmittedAt && Number.isFinite(orderAgeMs)) {
-          state.sellOrderSubmittedAt = now - orderAgeMs;
+        const normalizedOrderAgeMs = Number.isFinite(orderAgeMs) ? Math.max(0, orderAgeMs) : null;
+        if (!state.sellOrderSubmittedAt && Number.isFinite(normalizedOrderAgeMs)) {
+          state.sellOrderSubmittedAt = now - normalizedOrderAgeMs;
         }
       }
       if (openSellOrders.length > 1) {
@@ -2785,7 +2842,11 @@ async function manageExitStates() {
           state.sellOrderId = keepId;
           const limitPrice = normalizeOrderLimitPrice(keepOrder);
           state.sellOrderLimit = Number.isFinite(limitPrice) ? limitPrice : state.sellOrderLimit;
-          state.sellOrderSubmittedAt = state.sellOrderSubmittedAt || (Number.isFinite(getOrderAgeMs(keepOrder)) ? now - getOrderAgeMs(keepOrder) : null);
+          const keepOrderAgeMs = getOrderAgeMs(keepOrder);
+          const normalizedKeepOrderAgeMs = Number.isFinite(keepOrderAgeMs) ? Math.max(0, keepOrderAgeMs) : null;
+          state.sellOrderSubmittedAt =
+            state.sellOrderSubmittedAt ||
+            (Number.isFinite(normalizedKeepOrderAgeMs) ? now - normalizedKeepOrderAgeMs : null);
         }
         lastCancelReplaceAt.set(symbol, now);
       }
@@ -3030,8 +3091,8 @@ async function manageExitStates() {
           });
         } else {
           const existingOrderAgeMs =
-            (order && getOrderAgeMs(order)) ||
-            (state.sellOrderSubmittedAt ? now - state.sellOrderSubmittedAt : null);
+            (order && Number.isFinite(getOrderAgeMs(order)) ? Math.max(0, getOrderAgeMs(order)) : null) ||
+            (state.sellOrderSubmittedAt ? Math.max(0, Date.now() - state.sellOrderSubmittedAt) : null);
           const currentLimit = normalizeOrderLimitPrice(order) ?? state.sellOrderLimit;
           if (Number.isFinite(currentLimit)) {
             state.sellOrderLimit = currentLimit;
@@ -3119,8 +3180,8 @@ async function manageExitStates() {
             reasonCode = 'tp_maker';
           } else if (state.sellOrderId && Number.isFinite(desiredLimit)) {
             const existingOrderAgeMs =
-              (order && getOrderAgeMs(order)) ||
-              (state.sellOrderSubmittedAt ? now - state.sellOrderSubmittedAt : null);
+              (order && Number.isFinite(getOrderAgeMs(order)) ? Math.max(0, getOrderAgeMs(order)) : null) ||
+              (state.sellOrderSubmittedAt ? Math.max(0, Date.now() - state.sellOrderSubmittedAt) : null);
             const currentLimit = normalizeOrderLimitPrice(order) ?? state.sellOrderLimit;
             if (Number.isFinite(currentLimit)) {
               state.sellOrderLimit = currentLimit;
@@ -3199,8 +3260,8 @@ async function manageExitStates() {
         decisionPath = 'hold_within_band';
       }
 
-      const existingOrderAgeMs =
-        state.sellOrderSubmittedAt ? now - state.sellOrderSubmittedAt : null;
+      const rawAge = state.sellOrderSubmittedAt ? Date.now() - state.sellOrderSubmittedAt : null;
+      const existingOrderAgeMs = Number.isFinite(rawAge) ? Math.max(0, rawAge) : null;
       const loggedLastCancelReplaceAt = lastCancelReplaceAt.get(symbol) || lastCancelReplaceAtMs;
       const loggedLastRepriceAgeMs = Number.isFinite(loggedLastCancelReplaceAt) ? now - loggedLastCancelReplaceAt : null;
 
@@ -3748,13 +3809,17 @@ async function fetchOpenOrders() {
   const list = Array.isArray(orders) ? orders : [];
   return list
     .map((order) => ({
+      id: order.id,
+      client_order_id: order.client_order_id,
       rawSymbol: order.symbol,
       pairSymbol: normalizeSymbol(order.symbol),
       symbol: normalizeSymbol(order.symbol),
       side: order.side,
       status: order.status,
-    }))
-    .filter((order) => String(order.status || '').toLowerCase() === 'open');
+      limit_price: order.limit_price,
+      submitted_at: order.submitted_at,
+      created_at: order.created_at,
+    }));
 }
 
 async function getConcurrencyGuardStatus() {
