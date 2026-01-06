@@ -133,7 +133,16 @@ const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 10);
 
 const BUFFER_BPS = Number(process.env.BUFFER_BPS || 15);
 
+const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
+const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
+const PROFIT_BUFFER_BPS = Number(process.env.PROFIT_BUFFER_BPS || 2);
+const REPLACE_THRESHOLD_BPS = Number(process.env.REPLACE_THRESHOLD_BPS || 8);
+const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
+const SYMBOL_COOLDOWN_MS = Number(process.env.SYMBOL_COOLDOWN_MS || 15000);
+const MAX_SPREAD_BPS_TO_TRADE = Number(process.env.MAX_SPREAD_BPS_TO_TRADE || 60);
+
 const MAX_HOLD_SECONDS = Number(process.env.MAX_HOLD_SECONDS || 300);
+const MAX_HOLD_MS = Number(process.env.MAX_HOLD_MS || MAX_HOLD_SECONDS * 1000);
 
 const REPRICE_EVERY_SECONDS = Number(process.env.REPRICE_EVERY_SECONDS || 20);
 
@@ -151,6 +160,8 @@ const quoteTsDebugLogged = new Set();
 const inventoryState = new Map();
 
 const exitState = new Map();
+const symbolLocks = new Map();
+const lastActionAt = new Map();
 
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
@@ -720,19 +731,64 @@ function buildClientOrderId(symbol, purpose) {
   return `${normalized}-${purpose}-${randomUUID()}`;
 }
 
-function buildEntryClientOrderId(symbol) {
+function getOrderIntentBucket() {
+  const ttl = Number.isFinite(ORDER_TTL_MS) && ORDER_TTL_MS > 0 ? ORDER_TTL_MS : 45000;
+  return Math.floor(Date.now() / ttl);
+}
+
+function buildIntentClientOrderId({ symbol, side, intent, ref }) {
   const normalized = canonicalAsset(symbol) || 'UNKNOWN';
-  return `ENTRY_${normalized}_${Date.now()}`;
+  const safeSide = String(side || '').toUpperCase();
+  const safeIntent = String(intent || '').toUpperCase();
+  const suffix = ref || getOrderIntentBucket();
+  return `BOT:${normalized}:${safeSide}:${safeIntent}:${suffix}`;
+}
+
+function buildEntryClientOrderId(symbol) {
+  return buildIntentClientOrderId({ symbol, side: 'BUY', intent: 'ENTRY' });
 }
 
 function buildExitClientOrderId(symbol) {
-  const normalized = canonicalAsset(symbol) || 'UNKNOWN';
-  return `EXIT-${normalized}-${Date.now()}`;
+  return buildIntentClientOrderId({ symbol, side: 'SELL', intent: 'EXIT' });
 }
 
-function buildTpClientOrderId(symbol) {
+function buildTpClientOrderId(symbol, ref) {
+  return buildIntentClientOrderId({ symbol, side: 'SELL', intent: 'TP', ref });
+}
+
+function buildIntentPrefix({ symbol, side, intent }) {
   const normalized = canonicalAsset(symbol) || 'UNKNOWN';
-  return `TP_${normalized}_${Date.now()}`;
+  const safeSide = String(side || '').toUpperCase();
+  const safeIntent = String(intent || '').toUpperCase();
+  return `BOT:${normalized}:${safeSide}:${safeIntent}`;
+}
+
+function getOrderAgeMs(order) {
+  const rawTs = order?.submitted_at || order?.submittedAt || order?.created_at || order?.createdAt;
+  if (!rawTs) return null;
+  const tsMs = Date.parse(rawTs);
+  return Number.isFinite(tsMs) ? Date.now() - tsMs : null;
+}
+
+function hasOpenOrderForIntent(openOrders, { symbol, side, intent }) {
+  const prefix = buildIntentPrefix({ symbol, side, intent });
+  return (Array.isArray(openOrders) ? openOrders : []).some((order) => {
+    const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
+    const orderSide = String(order.side || '').toUpperCase();
+    const clientOrderId = String(order.client_order_id || order.clientOrderId || '');
+    return orderSymbol === normalizePair(symbol) && orderSide === String(side || '').toUpperCase() && clientOrderId.startsWith(prefix);
+  });
+}
+
+function shouldReplaceOrder({ side, currentPrice, nextPrice }) {
+  const cur = Number(currentPrice);
+  const next = Number(nextPrice);
+  if (!Number.isFinite(cur) || !Number.isFinite(next) || cur <= 0) return false;
+  const deltaBps = ((next - cur) / cur) * 10000;
+  if (String(side || '').toLowerCase() === 'buy') {
+    return -deltaBps >= REPLACE_THRESHOLD_BPS;
+  }
+  return deltaBps >= REPLACE_THRESHOLD_BPS;
 }
 
 function logBuyDecision(symbol, computedNotionalUsd, decision) {
@@ -1021,6 +1077,28 @@ async function feeAwareMinProfitBps(symbol, notionalUsd) {
 async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   const normalizedSymbol = normalizeSymbol(symbol);
+  const openOrders = await fetchOrders({ status: 'open' });
+  if (hasOpenOrderForIntent(openOrders, { symbol: normalizedSymbol, side: 'BUY', intent: 'ENTRY' })) {
+    console.log('hold_existing_order', { symbol: normalizedSymbol, side: 'buy', reason: 'existing_entry_intent' });
+    return { skipped: true, reason: 'existing_entry_intent' };
+  }
+  let bid = null;
+  let ask = null;
+  let spreadBps = null;
+  try {
+    const quote = await getLatestQuote(normalizedSymbol);
+    bid = quote.bid;
+    ask = quote.ask;
+    if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
+      spreadBps = ((ask - bid) / bid) * 10000;
+    }
+  } catch (err) {
+    console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err });
+  }
+  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
+    logSkip('spread_too_wide', { symbol: normalizedSymbol, bid, ask, spreadBps });
+    return { skipped: true, reason: 'spread_too_wide', spreadBps };
+  }
 
   const intendedNotional = Number(qty) * Number(limitPrice);
 
@@ -1152,6 +1230,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     qty: filledOrder.filled_qty,
 
     entryPrice: avgPrice,
+    entryOrderId: filledOrder.id || buyOrder?.id,
 
   });
 
@@ -1487,10 +1566,59 @@ function roundPrice(price) {
 
 }
 
-function roundToTick(price, tick = PRICE_TICK) {
+function getTickSize({ symbol, price }) {
+  if (isCryptoSymbol(symbol)) {
+    const priceNum = Number(price);
+    if (Number.isFinite(priceNum) && priceNum < 1) {
+      return 0.0001;
+    }
+    return 0.01;
+  }
+  return Number.isFinite(PRICE_TICK) && PRICE_TICK > 0 ? PRICE_TICK : 0.01;
+}
+
+function roundToTick(price, symbolOrTick = PRICE_TICK, direction = 'up') {
   if (!Number.isFinite(price)) return price;
-  const tickSize = Number.isFinite(tick) && tick > 0 ? tick : 0.01;
+  const tickSize =
+    typeof symbolOrTick === 'number'
+      ? (Number.isFinite(symbolOrTick) && symbolOrTick > 0 ? symbolOrTick : 0.01)
+      : getTickSize({ symbol: symbolOrTick, price });
+  if (!Number.isFinite(tickSize) || tickSize <= 0) return price;
+  if (direction === 'down') {
+    return Math.floor(price / tickSize) * tickSize;
+  }
   return Math.ceil(price / tickSize) * tickSize;
+}
+
+function getFeeBps({ orderType, isMaker }) {
+  const typeLower = String(orderType || '').toLowerCase();
+  if (typeLower === 'market') {
+    return FEE_BPS_TAKER;
+  }
+  return isMaker ? FEE_BPS_MAKER : FEE_BPS_TAKER;
+}
+
+function computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps }) {
+  const feeBps = Number.isFinite(feeBpsRoundTrip) ? feeBpsRoundTrip : 0;
+  const bufferBps = Number.isFinite(profitBufferBps) ? profitBufferBps : 0;
+  return feeBps + bufferBps;
+}
+
+function computeTargetSellPrice(entryPrice, feeBpsRoundTrip, profitBufferBps, tickSize) {
+  const minBps = computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps });
+  const rawTarget = Number(entryPrice) * (1 + minBps / 10000);
+  if (!Number.isFinite(tickSize) || tickSize <= 0) {
+    return rawTarget;
+  }
+  return Math.ceil(rawTarget / tickSize) * tickSize;
+}
+
+function isProfitableExit(entryPrice, exitPrice, feeBpsRoundTrip, profitBufferBps) {
+  const entry = Number(entryPrice);
+  const exit = Number(exitPrice);
+  if (!Number.isFinite(entry) || !Number.isFinite(exit) || entry <= 0) return false;
+  const netBps = ((exit - entry) / entry) * 10000;
+  return netBps >= computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps });
 }
 
 async function fetchFallbackTradeQuote(symbol, nowMs) {
@@ -1855,8 +1983,25 @@ async function submitLimitSell({
   limitPrice,
 
   reason,
+  intentRef,
+  openOrders,
 
 }) {
+
+  const open = openOrders || (await fetchOrders({ status: 'open' }));
+  const hasOpenSell = (Array.isArray(open) ? open : []).some((order) => {
+    const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
+    const side = String(order.side || '').toLowerCase();
+    return orderSymbol === normalizePair(symbol) && side === 'sell';
+  });
+  if (hasOpenSell) {
+    console.log('hold_existing_order', { symbol, side: 'sell', reason: 'existing_sell_open' });
+    return { skipped: true, reason: 'existing_sell_open' };
+  }
+  if (hasOpenOrderForIntent(open, { symbol, side: 'SELL', intent: 'TP' })) {
+    console.log('hold_existing_order', { symbol, side: 'sell', reason: 'existing_tp_intent' });
+    return { skipped: true, reason: 'existing_tp_intent' };
+  }
 
   const availableQty = await getAvailablePositionQty(symbol);
   if (!(availableQty > 0)) {
@@ -1866,10 +2011,11 @@ async function submitLimitSell({
   const qtyNum = Number(qty);
   const adjustedQty = Number.isFinite(qtyNum) && qtyNum > 0 ? Math.min(qtyNum, availableQty) : availableQty;
 
+  const roundedLimit = roundToTick(Number(limitPrice), symbol, 'up');
   const sizeGuard = guardTradeSize({
     symbol,
     qty: adjustedQty,
-    price: Number(limitPrice),
+    price: roundedLimit,
     side: 'sell',
     context: 'limit_sell',
   });
@@ -1879,20 +2025,20 @@ async function submitLimitSell({
   const finalQty = sizeGuard.qty ?? qty;
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_limit_sell' });
-  const clientOrderId = buildTpClientOrderId(symbol);
+  const clientOrderId = buildTpClientOrderId(symbol, intentRef);
   const payload = {
     symbol: toTradeSymbol(symbol),
     qty: finalQty,
     side: 'sell',
     type: 'limit',
     time_in_force: 'gtc',
-    limit_price: limitPrice,
+    limit_price: roundedLimit,
     client_order_id: clientOrderId,
   };
   console.log('tp_sell_attempt', {
     symbol,
     qty: finalQty,
-    limitPrice,
+    limitPrice: roundedLimit,
     tif: payload.time_in_force,
     client_order_id: clientOrderId,
     sell_reason: 'TP_ATTACH',
@@ -1915,11 +2061,11 @@ async function submitLimitSell({
     throw err;
   }
 
-  console.log('submit_limit_sell', { symbol, qty, limitPrice, reason, orderId: response?.id });
+  console.log('submit_limit_sell', { symbol, qty, limitPrice: roundedLimit, reason, orderId: response?.id });
 
   try {
-    const open = await fetchOrders({ status: 'open' });
-    const hasOpenSell = (Array.isArray(open) ? open : []).some((order) => {
+    const openList = openOrders || open;
+    const hasOpenSell = (Array.isArray(openList) ? openList : []).some((order) => {
       const orderSymbol = normalizePair(order.symbol);
       const side = String(order.side || '').toLowerCase();
       return orderSymbol === normalizePair(symbol) && side === 'sell';
@@ -1982,7 +2128,7 @@ async function submitMarketSell({
     context: 'market_sell',
   });
 
-  console.log('submit_market_sell', { symbol, qty, reason, orderId: response?.id });
+  console.log('submit_market_sell', { symbol, qty, reason, exit_reason: reason, orderId: response?.id });
 
   return response;
 
@@ -1995,6 +2141,7 @@ async function handleBuyFill({
   qty,
 
   entryPrice,
+  entryOrderId,
 
 }) {
 
@@ -2006,9 +2153,15 @@ async function handleBuyFill({
 
   const notionalUsd = qtyNum * entryPriceNum;
 
-  const minNetProfitBps = await feeAwareMinProfitBps(symbol, notionalUsd);
-
-  const targetPrice = roundToTick(entryPriceNum * (1 + minNetProfitBps / 10000));
+  const entryFeeBps = getFeeBps({ orderType: 'limit', isMaker: true });
+  const exitFeeBps = getFeeBps({ orderType: 'limit', isMaker: false });
+  const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
+  const minNetProfitBps = computeMinNetProfitBps({
+    feeBpsRoundTrip,
+    profitBufferBps: PROFIT_BUFFER_BPS,
+  });
+  const tickSize = getTickSize({ symbol, price: entryPriceNum });
+  const targetPrice = computeTargetSellPrice(entryPriceNum, feeBpsRoundTrip, PROFIT_BUFFER_BPS, tickSize);
 
   const sellOrder = await submitLimitSell({
 
@@ -2019,6 +2172,7 @@ async function handleBuyFill({
     limitPrice: targetPrice,
 
     reason: 'initial_target',
+    intentRef: entryOrderId || getOrderIntentBucket(),
 
   });
 
@@ -2039,6 +2193,9 @@ async function handleBuyFill({
     minNetProfitBps,
 
     targetPrice,
+    feeBpsRoundTrip,
+    profitBufferBps: PROFIT_BUFFER_BPS,
+    entryOrderId: entryOrderId || null,
 
     sellOrderId: sellOrder.id,
 
@@ -2046,6 +2203,7 @@ async function handleBuyFill({
 
     sellOrderLimit: targetPrice,
 
+    takerAttempted: false,
   });
 
   logExitDecision({
@@ -2308,8 +2466,15 @@ async function repairOrphanExits() {
     }
 
     const notionalUsd = qty * avgEntryPrice;
-    const minNetProfitBps = await feeAwareMinProfitBps(symbol, notionalUsd);
-    targetPrice = roundToTick(avgEntryPrice * (1 + minNetProfitBps / 10000));
+    const entryFeeBps = getFeeBps({ orderType: 'limit', isMaker: true });
+    const exitFeeBps = getFeeBps({ orderType: 'limit', isMaker: false });
+    const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
+    const minNetProfitBps = computeMinNetProfitBps({
+      feeBpsRoundTrip,
+      profitBufferBps: PROFIT_BUFFER_BPS,
+    });
+    const tickSize = getTickSize({ symbol, price: avgEntryPrice });
+    targetPrice = computeTargetSellPrice(avgEntryPrice, feeBpsRoundTrip, PROFIT_BUFFER_BPS, tickSize);
 
     try {
       const repairOrder = await submitLimitSell({
@@ -2317,6 +2482,8 @@ async function repairOrphanExits() {
         qty,
         limitPrice: targetPrice,
         reason: 'exit_repair_orphan',
+        intentRef: getOrderIntentBucket(),
+        openOrders,
       });
       if (repairOrder?.skipped) {
         decision = `SKIP:${repairOrder.reason || 'submit_skipped'}`;
@@ -2365,9 +2532,12 @@ async function repairOrphanExits() {
         notionalUsd,
         minNetProfitBps,
         targetPrice,
+        feeBpsRoundTrip,
+        profitBufferBps: PROFIT_BUFFER_BPS,
         sellOrderId: repairOrder.id,
         sellOrderSubmittedAt: now,
         sellOrderLimit: targetPrice,
+        takerAttempted: false,
       });
       placed += 1;
       decision = 'PLACE_EXIT';
@@ -2414,50 +2584,375 @@ async function manageExitStates() {
   const now = Date.now();
 
   await repairOrphanExits();
+  let openOrders = [];
+  try {
+    openOrders = await fetchOrders({ status: 'open' });
+  } catch (err) {
+    console.warn('exit_manager_open_orders_failed', { error: err?.message || err });
+  }
+  const openOrdersList = Array.isArray(openOrders) ? openOrders : [];
+  const openOrdersBySymbol = openOrdersList.reduce((acc, order) => {
+    const symbol = normalizePair(order.symbol || order.rawSymbol);
+    if (!acc.has(symbol)) {
+      acc.set(symbol, []);
+    }
+    acc.get(symbol).push(order);
+    return acc;
+  }, new Map());
+  const maxHoldMs = Number.isFinite(MAX_HOLD_MS) && MAX_HOLD_MS > 0 ? MAX_HOLD_MS : MAX_HOLD_SECONDS * 1000;
 
   for (const [symbol, state] of exitState.entries()) {
-
-    const heldSeconds = (now - state.entryTime) / 1000;
-
-    let bid = null;
-
-    let ask = null;
-    let quoteFetchFailed = false;
-
-    try {
-
-      const quote = await getLatestQuote(symbol);
-
-      bid = quote.bid;
-
-      ask = quote.ask;
-
-    } catch (err) {
-
-      console.warn('quote_fetch_failed', { symbol, error: err?.message || err });
-      quoteFetchFailed = isNetworkError(err);
-
-    }
-
-    if (quoteFetchFailed) {
-      console.warn('exit_manager_skip_orders', { symbol, reason: 'quote_network_error' });
+    if (symbolLocks.get(symbol)) {
+      console.log('exit_manager_symbol_locked', { symbol });
       continue;
     }
+    symbolLocks.set(symbol, true);
+    try {
+      const lastAction = lastActionAt.get(symbol) || 0;
+      const inCooldown = Number.isFinite(lastAction) && now - lastAction < SYMBOL_COOLDOWN_MS;
+      const heldMs = now - state.entryTime;
+      const heldSeconds = heldMs / 1000;
+      const symbolOrders = openOrdersBySymbol.get(normalizePair(symbol)) || [];
+      const openBuyCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'buy').length;
+      const openSellCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell').length;
 
-    let actionTaken = 'none';
+      let bid = null;
 
+      let ask = null;
+      let quoteFetchFailed = false;
 
-    if (heldSeconds >= FORCE_EXIT_SECONDS) {
+      try {
 
-      if (state.sellOrderId) {
+        const quote = await getLatestQuote(symbol);
 
-        await cancelOrderSafe(state.sellOrderId);
+        bid = quote.bid;
+
+        ask = quote.ask;
+
+      } catch (err) {
+
+        console.warn('quote_fetch_failed', { symbol, error: err?.message || err });
+        quoteFetchFailed = isNetworkError(err);
 
       }
 
-      await submitMarketSell({ symbol, qty: state.qty, reason: 'forced_exit_timeout' });
+      if (quoteFetchFailed) {
+        console.warn('exit_manager_skip_orders', { symbol, reason: 'quote_network_error' });
+        continue;
+      }
 
-      exitState.delete(symbol);
+      let actionTaken = 'none';
+      let reasonCode = 'hold';
+      const spreadBps =
+        Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
+      const entryFeeBps = getFeeBps({ orderType: 'limit', isMaker: true });
+      const exitFeeBps = getFeeBps({ orderType: 'limit', isMaker: false });
+      const feeBpsRoundTrip = Number.isFinite(state.feeBpsRoundTrip)
+        ? state.feeBpsRoundTrip
+        : entryFeeBps + exitFeeBps;
+      const profitBufferBps = Number.isFinite(state.profitBufferBps) ? state.profitBufferBps : PROFIT_BUFFER_BPS;
+      const minNetProfitBps = computeMinNetProfitBps({
+        feeBpsRoundTrip,
+        profitBufferBps,
+      });
+      const tickSize = getTickSize({ symbol, price: state.entryPrice });
+      const targetPrice = computeTargetSellPrice(state.entryPrice, feeBpsRoundTrip, profitBufferBps, tickSize);
+      state.targetPrice = targetPrice;
+      state.minNetProfitBps = minNetProfitBps;
+      state.feeBpsRoundTrip = feeBpsRoundTrip;
+      state.profitBufferBps = profitBufferBps;
+
+
+      if (heldSeconds >= FORCE_EXIT_SECONDS) {
+
+        if (state.sellOrderId) {
+
+          await cancelOrderSafe(state.sellOrderId);
+
+        }
+
+        await submitMarketSell({ symbol, qty: state.qty, reason: 'kill_switch' });
+
+        exitState.delete(symbol);
+
+        actionTaken = 'forced_exit_timeout';
+        reasonCode = 'kill_switch';
+        lastActionAt.set(symbol, now);
+
+        logExitDecision({
+
+          symbol,
+
+          heldSeconds,
+
+          entryPrice: state.entryPrice,
+
+          targetPrice,
+
+          bid,
+
+          ask,
+
+          minNetProfitBps,
+
+          actionTaken,
+
+        });
+
+        console.log('exit_scan', {
+          symbol,
+          heldQty: state.qty,
+          entryPrice: state.entryPrice,
+          bid,
+          ask,
+          spreadBps,
+          openBuyCount,
+          openSellCount,
+          existingOrderAgeMs: null,
+          feeBpsRoundTrip,
+          profitBufferBps,
+          minNetProfitBps,
+          targetPrice,
+          actionTaken,
+          reasonCode,
+        });
+
+        continue;
+
+      }
+
+
+      if (heldMs >= maxHoldMs && Number.isFinite(bid)) {
+
+        const netProfitBps = ((bid - state.entryPrice) / state.entryPrice) * 10000;
+
+        if (netProfitBps >= minNetProfitBps) {
+
+          if (state.sellOrderId) {
+
+            await cancelOrderSafe(state.sellOrderId);
+
+          }
+
+          await submitMarketSell({ symbol, qty: state.qty, reason: 'max_hold' });
+
+          exitState.delete(symbol);
+
+          actionTaken = 'max_hold_exit';
+          reasonCode = 'max_hold';
+          lastActionAt.set(symbol, now);
+
+          logExitDecision({
+
+            symbol,
+
+            heldSeconds,
+
+            entryPrice: state.entryPrice,
+
+            targetPrice,
+
+            bid,
+
+            ask,
+
+            minNetProfitBps,
+
+            actionTaken,
+
+          });
+
+          console.log('exit_scan', {
+            symbol,
+            heldQty: state.qty,
+            entryPrice: state.entryPrice,
+            bid,
+            ask,
+            spreadBps,
+            openBuyCount,
+            openSellCount,
+            existingOrderAgeMs: null,
+            feeBpsRoundTrip,
+            profitBufferBps,
+            minNetProfitBps,
+            targetPrice,
+            actionTaken,
+            reasonCode,
+          });
+
+          continue;
+
+        }
+
+      }
+
+
+      if (inCooldown) {
+        actionTaken = 'cooldown_hold';
+        reasonCode = 'symbol_cooldown';
+      } else if (state.sellOrderId) {
+
+        let order;
+
+        try {
+
+          order = await fetchOrderById(state.sellOrderId);
+
+        } catch (err) {
+
+          console.warn('order_fetch_failed', { symbol, orderId: state.sellOrderId, error: err?.message || err });
+
+        }
+
+        if (order && ['canceled', 'expired', 'rejected'].includes(order.status)) {
+
+          state.sellOrderId = null;
+
+          state.sellOrderSubmittedAt = null;
+
+          state.sellOrderLimit = null;
+
+        }
+
+        if (!state.sellOrderId) {
+
+          const replacement = await submitLimitSell({
+
+            symbol,
+
+            qty: state.qty,
+
+            limitPrice: targetPrice,
+
+            reason: 'missing_sell_order',
+            intentRef: state.entryOrderId || getOrderIntentBucket(),
+
+          });
+
+          if (!replacement?.skipped && replacement?.id) {
+            state.sellOrderId = replacement.id;
+            state.sellOrderSubmittedAt = Date.now();
+            state.sellOrderLimit = targetPrice;
+            actionTaken = 'recreate_limit_sell';
+            reasonCode = 'missing_sell_order';
+            lastActionAt.set(symbol, now);
+          } else {
+            actionTaken = 'hold_existing_order';
+            reasonCode = replacement?.reason || 'missing_sell_order_skipped';
+          }
+
+        } else if (order && order.status === 'filled') {
+
+          exitState.delete(symbol);
+
+          actionTaken = 'sell_filled';
+          reasonCode = 'tp_maker';
+
+          logExitDecision({
+
+            symbol,
+
+            heldSeconds,
+
+            entryPrice: state.entryPrice,
+
+            targetPrice,
+
+            bid,
+
+            ask,
+
+            minNetProfitBps,
+
+            actionTaken,
+
+          });
+
+        } else {
+
+          const existingOrderAgeMs =
+            (order && getOrderAgeMs(order)) ||
+            (state.sellOrderSubmittedAt ? now - state.sellOrderSubmittedAt : null);
+
+          if (existingOrderAgeMs != null && existingOrderAgeMs < ORDER_TTL_MS) {
+            actionTaken = 'hold_existing_order';
+            reasonCode = 'order_ttl_not_reached';
+          } else if (Number.isFinite(bid) && bid >= targetPrice && !state.takerAttempted) {
+            const takerFeeBpsRoundTrip =
+              getFeeBps({ orderType: 'limit', isMaker: true }) + getFeeBps({ orderType: 'market', isMaker: false });
+            if (isProfitableExit(state.entryPrice, bid, takerFeeBpsRoundTrip, profitBufferBps)) {
+              await cancelOrderSafe(state.sellOrderId);
+              await submitMarketSell({ symbol, qty: state.qty, reason: 'tp_taker' });
+              exitState.delete(symbol);
+              actionTaken = 'taker_exit_on_tp_touch';
+              reasonCode = 'tp_taker';
+              lastActionAt.set(symbol, now);
+              state.takerAttempted = true;
+            } else {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'tp_touch_not_profitable';
+            }
+          } else if (
+            Number.isFinite(state.sellOrderLimit) &&
+            shouldReplaceOrder({ side: 'sell', currentPrice: state.sellOrderLimit, nextPrice: targetPrice })
+          ) {
+            await cancelOrderSafe(state.sellOrderId);
+            const replacement = await submitLimitSell({
+              symbol,
+              qty: state.qty,
+              limitPrice: targetPrice,
+              reason: 'reprice_improve',
+              intentRef: state.entryOrderId || getOrderIntentBucket(),
+            });
+            if (replacement?.id) {
+              state.sellOrderId = replacement.id;
+              state.sellOrderSubmittedAt = Date.now();
+              state.sellOrderLimit = targetPrice;
+              actionTaken = 'reprice_cancel_replace';
+              reasonCode = 'price_improve';
+              lastActionAt.set(symbol, now);
+            } else {
+              actionTaken = 'hold_existing_order';
+              reasonCode = replacement?.reason || 'replace_skipped';
+            }
+          } else {
+            actionTaken = 'hold_existing_order';
+            reasonCode = 'no_reprice_needed';
+          }
+
+        }
+
+      } else {
+
+        const replacement = await submitLimitSell({
+
+          symbol,
+
+          qty: state.qty,
+
+          limitPrice: targetPrice,
+
+          reason: 'missing_sell_order',
+          intentRef: state.entryOrderId || getOrderIntentBucket(),
+
+        });
+
+        if (!replacement?.skipped && replacement?.id) {
+          state.sellOrderId = replacement.id;
+          state.sellOrderSubmittedAt = Date.now();
+          state.sellOrderLimit = targetPrice;
+          actionTaken = 'recreate_limit_sell';
+          reasonCode = 'missing_sell_order';
+          lastActionAt.set(symbol, now);
+        } else {
+          actionTaken = 'hold_existing_order';
+          reasonCode = replacement?.reason || 'missing_sell_order_skipped';
+        }
+
+      }
+
+      const existingOrderAgeMs =
+        state.sellOrderSubmittedAt ? now - state.sellOrderSubmittedAt : null;
 
       logExitDecision({
 
@@ -2467,222 +2962,38 @@ async function manageExitStates() {
 
         entryPrice: state.entryPrice,
 
-        targetPrice: state.targetPrice,
+        targetPrice,
 
         bid,
 
         ask,
 
-        minNetProfitBps: state.minNetProfitBps,
+        minNetProfitBps,
 
-        actionTaken: 'forced_exit_timeout',
+        actionTaken,
 
       });
 
-      continue;
-
-    }
-
-
-    if (heldSeconds >= MAX_HOLD_SECONDS && Number.isFinite(bid)) {
-
-      const netProfitBps = ((bid - state.entryPrice) / state.entryPrice) * 10000;
-
-      if (netProfitBps >= state.minNetProfitBps) {
-
-        if (state.sellOrderId) {
-
-          await cancelOrderSafe(state.sellOrderId);
-
-        }
-
-        await submitMarketSell({ symbol, qty: state.qty, reason: 'profit_exit' });
-
-        exitState.delete(symbol);
-
-        logExitDecision({
-
-          symbol,
-
-          heldSeconds,
-
-          entryPrice: state.entryPrice,
-
-          targetPrice: state.targetPrice,
-
-          bid,
-
-          ask,
-
-          minNetProfitBps: state.minNetProfitBps,
-
-          actionTaken: 'profit_exit_market',
-
-        });
-
-        continue;
-
-      }
-
-    }
-
-
-    if (state.sellOrderId) {
-
-      let order;
-
-      try {
-
-        order = await fetchOrderById(state.sellOrderId);
-
-      } catch (err) {
-
-        console.warn('order_fetch_failed', { symbol, orderId: state.sellOrderId, error: err?.message || err });
-
-      }
-
-      if (order && ['canceled', 'expired', 'rejected'].includes(order.status)) {
-
-        state.sellOrderId = null;
-
-        state.sellOrderSubmittedAt = null;
-
-        state.sellOrderLimit = null;
-
-      }
-
-      if (!state.sellOrderId) {
-
-        const replacement = await submitLimitSell({
-
-          symbol,
-
-          qty: state.qty,
-
-          limitPrice: state.targetPrice,
-
-          reason: 'missing_sell_order',
-
-        });
-
-        state.sellOrderId = replacement.id;
-
-        state.sellOrderSubmittedAt = Date.now();
-
-        state.sellOrderLimit = state.targetPrice;
-
-        actionTaken = 'recreate_limit_sell';
-
-      } else if (order && order.status === 'filled') {
-
-        exitState.delete(symbol);
-
-        actionTaken = 'sell_filled';
-
-        logExitDecision({
-
-          symbol,
-
-          heldSeconds,
-
-          entryPrice: state.entryPrice,
-
-          targetPrice: state.targetPrice,
-
-          bid,
-
-          ask,
-
-          minNetProfitBps: state.minNetProfitBps,
-
-          actionTaken,
-
-        });
-
-        continue;
-
-      } else {
-
-        const orderAgeSeconds = state.sellOrderSubmittedAt ? (now - state.sellOrderSubmittedAt) / 1000 : 0;
-
-        if (orderAgeSeconds >= REPRICE_EVERY_SECONDS && Number.isFinite(ask)) {
-
-          if (ask < state.sellOrderLimit - PRICE_TICK) {
-
-            await cancelOrderSafe(state.sellOrderId);
-
-            const newLimit = roundToTick(Math.max(state.targetPrice, ask - PRICE_TICK));
-
-            const replacement = await submitLimitSell({
-
-              symbol,
-
-              qty: state.qty,
-
-              limitPrice: newLimit,
-
-              reason: 'reprice_lower_ask',
-
-            });
-
-            state.sellOrderId = replacement.id;
-
-            state.sellOrderSubmittedAt = Date.now();
-
-            state.sellOrderLimit = newLimit;
-
-            actionTaken = 'reprice_cancel_replace';
-
-          }
-
-        }
-
-      }
-
-    } else {
-
-      const replacement = await submitLimitSell({
-
+      console.log('exit_scan', {
         symbol,
-
-        qty: state.qty,
-
-        limitPrice: state.targetPrice,
-
-        reason: 'missing_sell_order',
-
+        heldQty: state.qty,
+        entryPrice: state.entryPrice,
+        bid,
+        ask,
+        spreadBps,
+        openBuyCount,
+        openSellCount,
+        existingOrderAgeMs,
+        feeBpsRoundTrip,
+        profitBufferBps,
+        minNetProfitBps,
+        targetPrice,
+        actionTaken,
+        reasonCode,
       });
-
-      state.sellOrderId = replacement.id;
-
-      state.sellOrderSubmittedAt = Date.now();
-
-      state.sellOrderLimit = state.targetPrice;
-
-      actionTaken = 'recreate_limit_sell';
-
+    } finally {
+      symbolLocks.delete(symbol);
     }
-
-
-    logExitDecision({
-
-      symbol,
-
-      heldSeconds,
-
-      entryPrice: state.entryPrice,
-
-      targetPrice: state.targetPrice,
-
-      bid,
-
-      ask,
-
-      minNetProfitBps: state.minNetProfitBps,
-
-      actionTaken,
-
-    });
 
   }
 
@@ -2713,6 +3024,28 @@ function startExitManager() {
 async function placeMarketBuyThenSell(symbol) {
 
   const normalizedSymbol = normalizeSymbol(symbol);
+  const openOrders = await fetchOrders({ status: 'open' });
+  if (hasOpenOrderForIntent(openOrders, { symbol: normalizedSymbol, side: 'BUY', intent: 'ENTRY' })) {
+    console.log('hold_existing_order', { symbol: normalizedSymbol, side: 'buy', reason: 'existing_entry_intent' });
+    return { skipped: true, reason: 'existing_entry_intent' };
+  }
+  let bid = null;
+  let ask = null;
+  let spreadBps = null;
+  try {
+    const quote = await getLatestQuote(normalizedSymbol);
+    bid = quote.bid;
+    ask = quote.ask;
+    if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
+      spreadBps = ((ask - bid) / bid) * 10000;
+    }
+  } catch (err) {
+    console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err });
+  }
+  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
+    logSkip('spread_too_wide', { symbol: normalizedSymbol, bid, ask, spreadBps });
+    return { skipped: true, reason: 'spread_too_wide', spreadBps };
+  }
 
   const [price, account] = await Promise.all([
 
@@ -2876,6 +3209,7 @@ async function placeMarketBuyThenSell(symbol) {
       qty: filled.filled_qty,
 
       entryPrice: avgPrice,
+      entryOrderId: filled.id || buyOrder?.id,
 
     });
 
@@ -2957,6 +3291,16 @@ async function submitOrder(order = {}) {
       });
       return { skipped: true, reason: 'no_position_qty' };
     }
+    const openOrders = await fetchOrders({ status: 'open' });
+    const hasOpenSell = (Array.isArray(openOrders) ? openOrders : []).some((order) => {
+      const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
+      const side = String(order.side || '').toLowerCase();
+      return orderSymbol === normalizePair(normalizedSymbol) && side === 'sell';
+    });
+    if (hasOpenSell) {
+      console.log('hold_existing_order', { symbol: normalizedSymbol, side: 'sell', reason: 'existing_sell_open' });
+      return { skipped: true, reason: 'existing_sell_open' };
+    }
     if (!Number.isFinite(qtyNum) || qtyNum <= 0) {
       qtyNum = availableQty;
     } else {
@@ -2991,6 +3335,14 @@ async function submitOrder(order = {}) {
 
     }
 
+  }
+
+  if (sideLower === 'buy') {
+    const openOrders = await fetchOrders({ status: 'open' });
+    if (hasOpenOrderForIntent(openOrders, { symbol: normalizedSymbol, side: 'BUY', intent: 'ENTRY' })) {
+      console.log('hold_existing_order', { symbol: normalizedSymbol, side: 'buy', reason: 'existing_entry_intent' });
+      return { skipped: true, reason: 'existing_entry_intent' };
+    }
   }
 
   const sizeGuard = guardTradeSize({
