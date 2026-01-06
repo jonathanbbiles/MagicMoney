@@ -136,6 +136,7 @@ const BUFFER_BPS = Number(process.env.BUFFER_BPS || 15);
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
 const PROFIT_BUFFER_BPS = Number(process.env.PROFIT_BUFFER_BPS || 2);
+const TAKER_EXIT_ON_TOUCH = readEnvFlag('TAKER_EXIT_ON_TOUCH', false);
 const REPLACE_THRESHOLD_BPS = Number(process.env.REPLACE_THRESHOLD_BPS || 8);
 const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
 const SELL_ORDER_TTL_MS = Number(process.env.SELL_ORDER_TTL_MS || 45000);
@@ -162,6 +163,7 @@ const quoteTsDebugLogged = new Set();
 const inventoryState = new Map();
 
 const exitState = new Map();
+const desiredExitBpsBySymbol = new Map();
 const symbolLocks = new Map();
 const lastActionAt = new Map();
 const lastCancelReplaceAt = new Map();
@@ -1601,14 +1603,21 @@ function getFeeBps({ orderType, isMaker }) {
   return isMaker ? FEE_BPS_MAKER : FEE_BPS_TAKER;
 }
 
-function computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps }) {
+function resolveRequiredExitBps({ desiredNetExitBps, feeBpsRoundTrip, profitBufferBps }) {
+  const desired = Number(desiredNetExitBps);
+  if (Number.isFinite(desired) && desired > 0) return desired;
   const feeBps = Number.isFinite(feeBpsRoundTrip) ? feeBpsRoundTrip : 0;
   const bufferBps = Number.isFinite(profitBufferBps) ? profitBufferBps : 0;
   return feeBps + bufferBps;
 }
 
-function computeTargetSellPrice(entryPrice, feeBpsRoundTrip, profitBufferBps, tickSize) {
-  const minBps = computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps });
+function computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps, desiredNetExitBps }) {
+  return resolveRequiredExitBps({ desiredNetExitBps, feeBpsRoundTrip, profitBufferBps });
+}
+
+// requiredExitBps is the total net move (fees + buffer or desiredNetExitBps) above entry.
+function computeTargetSellPrice(entryPrice, requiredExitBps, tickSize) {
+  const minBps = Number.isFinite(requiredExitBps) ? requiredExitBps : 0;
   const rawTarget = Number(entryPrice) * (1 + minBps / 10000);
   if (!Number.isFinite(tickSize) || tickSize <= 0) {
     return rawTarget;
@@ -1618,6 +1627,30 @@ function computeTargetSellPrice(entryPrice, feeBpsRoundTrip, profitBufferBps, ti
 
 function computeBreakevenPrice(entryPrice, minNetProfitBps) {
   return Number(entryPrice) * (1 + Number(minNetProfitBps) / 10000);
+}
+
+function normalizeOrderType(orderType) {
+  return String(orderType || '').toLowerCase();
+}
+
+function inferEntryFeeBps({ symbol, orderType, postOnly }) {
+  const typeLower = normalizeOrderType(orderType);
+  const isMarket = typeLower === 'market';
+  if (isMarket) return FEE_BPS_TAKER;
+  if (isCryptoSymbol(symbol) && typeLower === 'limit' && postOnly === false) {
+    return FEE_BPS_TAKER;
+  }
+  return FEE_BPS_MAKER;
+}
+
+function inferExitFeeBps({ takerExitOnTouch }) {
+  return takerExitOnTouch ? FEE_BPS_TAKER : FEE_BPS_MAKER;
+}
+
+function computeExitFloorBps({ exitFeeBps }) {
+  const entryFeeBps = FEE_BPS_MAKER;
+  const exitFee = Number.isFinite(exitFeeBps) ? exitFeeBps : FEE_BPS_MAKER;
+  return entryFeeBps + exitFee;
 }
 
 function normalizeOrderLimitPrice(order) {
@@ -2216,6 +2249,7 @@ async function handleBuyFill({
 
   entryPrice,
   entryOrderId,
+  desiredNetExitBps,
 
 }) {
 
@@ -2227,15 +2261,56 @@ async function handleBuyFill({
 
   const notionalUsd = qtyNum * entryPriceNum;
 
-  const entryFeeBps = getFeeBps({ orderType: 'limit', isMaker: true });
-  const exitFeeBps = getFeeBps({ orderType: 'limit', isMaker: false });
+  let entryOrderType = null;
+  let entryPostOnly = null;
+  if (entryOrderId) {
+    try {
+      const entryOrder = await fetchOrderById(entryOrderId);
+      entryOrderType = entryOrder?.type ?? entryOrder?.order_type ?? null;
+      entryPostOnly = entryOrder?.post_only ?? entryOrder?.postOnly ?? null;
+    } catch (err) {
+      console.warn('entry_order_fetch_failed', { symbol, entryOrderId, error: err?.message || err });
+    }
+  }
+  const entryFeeBps = inferEntryFeeBps({
+    symbol,
+    orderType: entryOrderType,
+    postOnly: entryPostOnly,
+  });
+  const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
   const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
+  const desiredNetExitBpsValue = Number.isFinite(desiredNetExitBps)
+    ? Number(desiredNetExitBps)
+    : (Number.isFinite(desiredExitBpsBySymbol.get(symbol)) ? desiredExitBpsBySymbol.get(symbol) : null);
+  if (desiredNetExitBpsValue != null) {
+    desiredExitBpsBySymbol.delete(symbol);
+  }
+  const profitBufferBps = PROFIT_BUFFER_BPS;
   const minNetProfitBps = computeMinNetProfitBps({
     feeBpsRoundTrip,
-    profitBufferBps: PROFIT_BUFFER_BPS,
+    profitBufferBps,
+    desiredNetExitBps: desiredNetExitBpsValue,
   });
   const tickSize = getTickSize({ symbol, price: entryPriceNum });
-  const targetPrice = computeTargetSellPrice(entryPriceNum, feeBpsRoundTrip, PROFIT_BUFFER_BPS, tickSize);
+  const requiredExitBps = resolveRequiredExitBps({
+    desiredNetExitBps: desiredNetExitBpsValue,
+    feeBpsRoundTrip,
+    profitBufferBps,
+  });
+  const targetPrice = computeTargetSellPrice(entryPriceNum, requiredExitBps, tickSize);
+  const postOnly = true;
+
+  console.log('tp_attach_plan', {
+    symbol,
+    entryPrice: entryPriceNum,
+    entryFeeBps,
+    exitFeeBps,
+    feeBpsRoundTrip,
+    desiredNetExitBps: desiredNetExitBpsValue,
+    targetPrice,
+    takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
+    postOnly,
+  });
 
   const sellOrder = await submitLimitSell({
 
@@ -2247,6 +2322,7 @@ async function handleBuyFill({
 
     reason: 'initial_target',
     intentRef: entryOrderId || getOrderIntentBucket(),
+    postOnly,
 
   });
 
@@ -2268,7 +2344,10 @@ async function handleBuyFill({
 
     targetPrice,
     feeBpsRoundTrip,
-    profitBufferBps: PROFIT_BUFFER_BPS,
+    profitBufferBps,
+    desiredNetExitBps: desiredNetExitBpsValue,
+    entryFeeBps,
+    exitFeeBps,
     entryOrderId: entryOrderId || null,
 
     sellOrderId: sellOrder.id,
@@ -2603,15 +2682,43 @@ async function repairOrphanExits() {
     }
 
     const notionalUsd = qty * avgEntryPrice;
-    const entryFeeBps = getFeeBps({ orderType: 'limit', isMaker: true });
-    const exitFeeBps = getFeeBps({ orderType: 'limit', isMaker: false });
+    const entryFeeBps = inferEntryFeeBps({ symbol, orderType, postOnly: true });
+    const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
     const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
+    const exitFloorBps = computeExitFloorBps({ exitFeeBps });
+    const slippageBps = Number.isFinite(SLIPPAGE_BPS) ? SLIPPAGE_BPS : null;
+    const desiredNetExitBps = Number.isFinite(desiredExitBpsBySymbol.get(symbol))
+      ? desiredExitBpsBySymbol.get(symbol)
+      : Math.max(
+        USER_MIN_PROFIT_BPS,
+        Number.isFinite(exitFloorBps) ? exitFloorBps + (Number.isFinite(slippageBps) ? slippageBps : 0) : USER_MIN_PROFIT_BPS
+      );
+    const profitBufferBps = PROFIT_BUFFER_BPS;
     const minNetProfitBps = computeMinNetProfitBps({
       feeBpsRoundTrip,
-      profitBufferBps: PROFIT_BUFFER_BPS,
+      profitBufferBps,
+      desiredNetExitBps,
     });
     const tickSize = getTickSize({ symbol, price: avgEntryPrice });
-    targetPrice = computeTargetSellPrice(avgEntryPrice, feeBpsRoundTrip, PROFIT_BUFFER_BPS, tickSize);
+    const requiredExitBps = resolveRequiredExitBps({
+      desiredNetExitBps,
+      feeBpsRoundTrip,
+      profitBufferBps,
+    });
+    targetPrice = computeTargetSellPrice(avgEntryPrice, requiredExitBps, tickSize);
+    const postOnly = true;
+
+    console.log('tp_attach_plan', {
+      symbol,
+      entryPrice: avgEntryPrice,
+      entryFeeBps,
+      exitFeeBps,
+      feeBpsRoundTrip,
+      desiredNetExitBps,
+      targetPrice,
+      takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
+      postOnly,
+    });
 
     try {
       const repairOrder = await submitLimitSell({
@@ -2621,6 +2728,7 @@ async function repairOrphanExits() {
         reason: 'exit_repair_orphan',
         intentRef: getOrderIntentBucket(),
         openOrders,
+        postOnly,
       });
       if (repairOrder?.skipped) {
         decision = `SKIP:${repairOrder.reason || 'submit_skipped'}`;
@@ -2670,12 +2778,16 @@ async function repairOrphanExits() {
         minNetProfitBps,
         targetPrice,
         feeBpsRoundTrip,
-        profitBufferBps: PROFIT_BUFFER_BPS,
+        profitBufferBps,
+        desiredNetExitBps,
+        entryFeeBps,
+        exitFeeBps,
         sellOrderId: repairOrder.id,
         sellOrderSubmittedAt: now,
         sellOrderLimit: targetPrice,
         takerAttempted: false,
       });
+      desiredExitBpsBySymbol.delete(symbol);
       placed += 1;
       decision = 'PLACE_EXIT';
       logExitRepairDecision({
@@ -2780,22 +2892,36 @@ async function manageExitStates() {
       let reasonCode = 'hold';
       const spreadBps =
         Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
-      const entryFeeBps = getFeeBps({ orderType: 'limit', isMaker: true });
-      const exitFeeBps = getFeeBps({ orderType: 'limit', isMaker: false });
+      const entryFeeBps = Number.isFinite(state.entryFeeBps)
+        ? state.entryFeeBps
+        : inferEntryFeeBps({ symbol, orderType: 'limit', postOnly: true });
+      const exitFeeBps = Number.isFinite(state.exitFeeBps)
+        ? state.exitFeeBps
+        : inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
       const feeBpsRoundTrip = Number.isFinite(state.feeBpsRoundTrip)
         ? state.feeBpsRoundTrip
         : entryFeeBps + exitFeeBps;
       const profitBufferBps = Number.isFinite(state.profitBufferBps) ? state.profitBufferBps : PROFIT_BUFFER_BPS;
+      const desiredNetExitBps = Number.isFinite(state.desiredNetExitBps) ? state.desiredNetExitBps : null;
       const minNetProfitBps = computeMinNetProfitBps({
         feeBpsRoundTrip,
         profitBufferBps,
+        desiredNetExitBps,
       });
       const tickSize = getTickSize({ symbol, price: state.entryPrice });
-      const targetPrice = computeTargetSellPrice(state.entryPrice, feeBpsRoundTrip, profitBufferBps, tickSize);
+      const requiredExitBps = resolveRequiredExitBps({
+        desiredNetExitBps,
+        feeBpsRoundTrip,
+        profitBufferBps,
+      });
+      const targetPrice = computeTargetSellPrice(state.entryPrice, requiredExitBps, tickSize);
       state.targetPrice = targetPrice;
       state.minNetProfitBps = minNetProfitBps;
       state.feeBpsRoundTrip = feeBpsRoundTrip;
       state.profitBufferBps = profitBufferBps;
+      state.desiredNetExitBps = desiredNetExitBps;
+      state.entryFeeBps = entryFeeBps;
+      state.exitFeeBps = exitFeeBps;
       const breakevenPrice = computeBreakevenPrice(state.entryPrice, minNetProfitBps);
       const roundedBreakeven = roundToTick(breakevenPrice, tickSize, 'up');
       const bidMeetsBreakeven = Number.isFinite(bid) && bid >= breakevenPrice;
@@ -3572,6 +3698,7 @@ async function submitOrder(order = {}) {
     client_order_id,
 
     reason,
+    desiredNetExitBps,
 
   } = order;
 
@@ -3638,6 +3765,10 @@ async function submitOrder(order = {}) {
   }
 
   if (sideLower === 'buy') {
+    const desiredNetExitBpsNum = Number(desiredNetExitBps);
+    if (Number.isFinite(desiredNetExitBpsNum)) {
+      desiredExitBpsBySymbol.set(normalizedSymbol, desiredNetExitBpsNum);
+    }
 
     const decision =
 
