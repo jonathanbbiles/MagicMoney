@@ -3785,8 +3785,9 @@ function validateOrderCandidate({
     minNotional: resolvedMinNotional,
   };
 }
-async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usableBP = null, decisionContext = null) {
+async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usableBP = null, decisionContext = null, desiredNetExitBps = null) {
   const normalizedSymbol = toInternalSymbol(symbol);
+  const desiredNetExitBpsNum = Number.isFinite(desiredNetExitBps) ? desiredNetExitBps : null;
   const emitDecisionSnapshot = typeof decisionContext?.emitDecisionSnapshot === 'function'
     ? decisionContext.emitDecisionSnapshot
     : null;
@@ -3910,6 +3911,9 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         limit_price: formatLimit(join),
         client_order_id: buildEntryClientOrderId(normalizedSymbol),
       };
+      if (Number.isFinite(desiredNetExitBpsNum)) {
+        order.desiredNetExitBps = desiredNetExitBpsNum;
+      }
       try {
         logOrderPayload('buy_limit', order);
         emitDecisionSnapshot?.('ATTEMPT', {
@@ -4019,6 +4023,9 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
       }
       const tif = isStock(symbol) ? 'day' : 'gtc';
       const order = { symbol: normalizedSymbol, qty: mQty, side: 'buy', type: 'market', time_in_force: tif, client_order_id: buildEntryClientOrderId(normalizedSymbol) };
+      if (Number.isFinite(desiredNetExitBpsNum)) {
+        order.desiredNetExitBps = desiredNetExitBpsNum;
+      }
       try {
         logOrderPayload('buy_market', order);
         emitDecisionSnapshot?.('ATTEMPT', {
@@ -6670,7 +6677,8 @@ export default function App() {
         minNotional,
         buyingPower,
         reserve: bpInfo.pending,
-      }
+      },
+      sig?.tpBps
     );
     if (!result.filled) {
       return {
