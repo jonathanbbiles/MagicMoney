@@ -1,3 +1,4 @@
+// frontend/src/api/tradeClient.js
 import Constants from 'expo-constants';
 
 function getBase() {
@@ -7,6 +8,7 @@ function getBase() {
   if (!base) throw new Error('BACKEND_BASE_URL missing in Expo extra');
   return String(base).replace(/\/+$/, '');
 }
+
 function getAuthHeader() {
   const token =
     (Constants.expoConfig && Constants.expoConfig.extra && Constants.expoConfig.extra.API_TOKEN) ||
@@ -15,8 +17,8 @@ function getAuthHeader() {
 }
 
 /**
- * Calls backend POST /trade {symbol} so the server attaches OCO (TP+SL).
- * Returns parsed JSON or {_fallback:true} if /trade is not available.
+ * POST /trade { symbol } so backend attaches OCO (TP+SL).
+ * Returns parsed JSON; returns {_fallback:true} if /trade is 404.
  */
 export async function buyViaTrade(symbolRaw) {
   const symbol = String(symbolRaw || '').trim();
