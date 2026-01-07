@@ -10,7 +10,6 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import Constants from 'expo-constants';
-import { buyViaTrade } from './src/api/tradeClient';
 
 function getBase() {
   const base =
@@ -30,6 +29,26 @@ function getHeaders() {
 async function getJson(url) {
   const res = await fetch(url, { headers: getHeaders() });
   if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
+  return res.json();
+}
+async function buyViaTrade(symbolRaw) {
+  const symbol = String(symbolRaw || '').trim();
+  if (!symbol) throw new Error('buyViaTrade: symbol required');
+
+  const BASE = getBase();
+  if (!BASE) throw new Error('BACKEND_BASE_URL missing in Expo extra');
+
+  const res = await fetch(`${BASE}/trade`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders() },
+    body: JSON.stringify({ symbol }),
+  });
+
+  if (res.status === 404) return { _fallback: true };
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`trade_buy_failed ${res.status} ${text}`);
+  }
   return res.json();
 }
 const normalizePair = (sym) => {
