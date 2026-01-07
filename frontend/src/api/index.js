@@ -1,0 +1,1 @@
+export { buyViaTrade } from './tradeClient';
