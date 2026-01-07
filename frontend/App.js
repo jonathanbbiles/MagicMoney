@@ -1,8 +1,14 @@
-// Minimal, valid App that can health-check, BUY via /trade, and list open orders.
-// No "..." placeholders; no module aliases needed.
-
 import React, { useEffect, useState } from 'react';
-import { SafeAreaView, View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet, ActivityIndicator } from 'react-native';
+import {
+  SafeAreaView,
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  ScrollView,
+  StyleSheet,
+  ActivityIndicator,
+} from 'react-native';
 import Constants from 'expo-constants';
 import { buyViaTrade } from './src/api/tradeClient';
 
@@ -10,7 +16,7 @@ function getBase() {
   const base =
     (Constants.expoConfig && Constants.expoConfig.extra && Constants.expoConfig.extra.BACKEND_BASE_URL) ||
     (Constants.manifest && Constants.manifest.extra && Constants.manifest.extra.BACKEND_BASE_URL) ||
-    'https://magicmoney.onrender.com';
+    '';
   return String(base).replace(/\/+$/, '');
 }
 function getHeaders() {
@@ -30,7 +36,7 @@ const normalizePair = (sym) => {
   if (!sym) return '';
   const raw = String(sym).trim().toUpperCase();
   if (raw.includes('/')) return raw;
-  if (raw.endsWith('USD') && raw.length > 3 && !raw.includes('-')) return `${raw.slice(0, -3)}/USD`;
+  if (raw.endsWith('USD') && raw.length > 3) return `${raw.slice(0, -3)}/USD`;
   return raw;
 };
 
@@ -70,9 +76,8 @@ export default function App() {
     setBusy(true);
     setErr('');
     try {
-      const res = await buyViaTrade(pair);
-      if (res && res._fallback) {
-        // Backend too old: fallback to legacy /orders BUY
+      const trade = await buyViaTrade(pair);
+      if (trade && trade._fallback) {
         const r = await fetch(`${BASE}/orders`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...getHeaders() },
@@ -109,6 +114,7 @@ export default function App() {
           autoCapitalize="characters"
           autoCorrect={false}
           placeholder="e.g., BTC/USD"
+          placeholderTextColor="#9aa4af"
         />
         <TouchableOpacity style={styles.btn} onPress={onBuy} disabled={busy}>
           <Text style={styles.btnText}>{busy ? 'Buying…' : 'Buy /trade'}</Text>
@@ -117,18 +123,25 @@ export default function App() {
 
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Open Orders</Text>
-        <TouchableOpacity onPress={refreshOrders} style={styles.smallBtn}><Text>Refresh</Text></TouchableOpacity>
+        <TouchableOpacity onPress={refreshOrders} style={styles.smallBtn}>
+          <Text style={styles.smallBtnText}>Refresh</Text>
+        </TouchableOpacity>
       </View>
 
       <ScrollView style={styles.list}>
         {orders.length === 0 && <Text style={styles.empty}>No open orders</Text>}
         {orders.map((o) => (
           <View key={o.id} style={styles.card}>
-            <Text style={styles.cardTitle}>{o.symbol} — {o.side} — {o.status}</Text>
-            {!!o.order_class && <Text>class: {o.order_class}</Text>}
-            {Array.isArray(o.legs) && o.legs.map((leg) => (
-              <Text key={leg.id} style={styles.leg}>↳ {leg.side} {leg.type} {leg.limit_price || leg.stop_price || ''}</Text>
-            ))}
+            <Text style={styles.cardTitle}>
+              {o.symbol} — {o.side} — {o.status}
+            </Text>
+            {!!o.order_class && <Text style={styles.cardText}>class: {o.order_class}</Text>}
+            {Array.isArray(o.legs) &&
+              o.legs.map((leg) => (
+                <Text key={leg.id} style={styles.cardText}>
+                  ↳ {leg.side} {leg.type} {leg.limit_price || leg.stop_price || ''}
+                </Text>
+              ))}
           </View>
         ))}
       </ScrollView>
@@ -145,15 +158,43 @@ const styles = StyleSheet.create({
   sub: { marginTop: 4, color: '#9aa4af' },
   err: { marginTop: 4, color: '#ff6b6b' },
   row: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, gap: 8 },
-  input: { flex: 1, backgroundColor: '#101418', color: 'white', padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#1b222b' },
-  btn: { paddingHorizontal: 14, paddingVertical: 12, backgroundColor: '#3b82f6', borderRadius: 8 },
+  input: {
+    flex: 1,
+    backgroundColor: '#101418',
+    color: 'white',
+    padding: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#1b222b',
+  },
+  btn: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    backgroundColor: '#3b82f6',
+    borderRadius: 8,
+    marginLeft: 8,
+  },
   btnText: { color: 'white', fontWeight: '600' },
-  section: { marginTop: 16, paddingHorizontal: 16, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  section: {
+    marginTop: 16,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
   sectionTitle: { color: 'white', fontWeight: '700' },
-  smallBtn: { padding: 6, backgroundColor: '#1f2937', borderRadius: 6 },
+  smallBtn: { paddingHorizontal: 10, paddingVertical: 6, backgroundColor: '#1f2937', borderRadius: 6 },
+  smallBtnText: { color: 'white' },
   list: { padding: 16 },
   empty: { color: '#9aa4af' },
-  card: { marginBottom: 12, padding: 12, backgroundColor: '#111418', borderRadius: 8, borderWidth: 1, borderColor: '#1b222b' },
+  card: {
+    marginBottom: 12,
+    padding: 12,
+    backgroundColor: '#111418',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#1b222b',
+  },
   cardTitle: { color: 'white', marginBottom: 6, fontWeight: '600' },
-  leg: { color: '#cbd5e1' },
+  cardText: { color: '#cbd5e1' },
 });
