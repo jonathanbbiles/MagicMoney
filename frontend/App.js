@@ -67,6 +67,7 @@ const isStock = (sym) => !isCrypto(sym);
 /* ──────────────────────────────── 1) VERSION / CONFIG ──────────────────────────────── */
 const VERSION = 'v1';
 const EX = Constants?.expoConfig?.extra || Constants?.manifest?.extra || {};
+const API_TOKEN = String(EX.API_TOKEN || '').trim();
 
 const RENDER_BACKEND_URL = 'https://magicmoney.onrender.com';
 // Dev-only override for physical devices: set to your LAN IP (e.g., 'http://192.168.x.x:10000').
@@ -83,6 +84,7 @@ const DATA_LOCATIONS = ['us'];
 const BACKEND_HEADERS = {
   Accept: 'application/json',
   'Content-Type': 'application/json',
+  ...(API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}),
 };
 const DRY_RUN_STOPS = false; // Set true to log stop actions without sending orders
 const MIN_ORDER_NOTIONAL_USD = 5;

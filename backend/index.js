@@ -2,6 +2,8 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const { requireApiToken } = require('./auth');
+const { rateLimit } = require('./rateLimit');
 
 const {
   placeMarketBuyThenSell,
@@ -43,14 +45,56 @@ const { getFailureSnapshot } = require('./symbolFailures');
 
 const app = express();
 
-app.use(cors());
-app.use(express.json());
+app.set('trust proxy', 1);
+
+const allowedOrigins = String(process.env.CORS_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin) {
+      return callback(null, true);
+    }
+    if (!allowedOrigins.length) {
+      return callback(null, true);
+    }
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+}));
+app.use(express.json({ limit: '100kb' }));
+
+const apiToken = String(process.env.API_TOKEN || '').trim();
+if (!apiToken) {
+  console.warn('SECURITY WARNING: API_TOKEN not set. Backend endpoints are unprotected.');
+}
 
 const VERSION =
   process.env.VERSION ||
   process.env.RENDER_GIT_COMMIT ||
   process.env.COMMIT_SHA ||
   'dev';
+
+app.use((req, res, next) => {
+  if (req.method === 'GET' && req.path === '/health') {
+    return next();
+  }
+  return rateLimit(req, res, next);
+});
+
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    return next();
+  }
+  if (req.method === 'GET' && req.path === '/health') {
+    return next();
+  }
+  return requireApiToken(req, res, next);
+});
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString(), version: VERSION });
