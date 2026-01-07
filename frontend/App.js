@@ -10,7 +10,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import Constants from 'expo-constants';
-import { buyViaTrade } from 'src/api/tradeClient';
+import { buyViaTrade } from './src/api/tradeClient';
 
 function getBase() {
   const base =
