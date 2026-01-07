@@ -18,6 +18,7 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
+import { buyViaTrade } from './src/api/tradeClient';
 const normalizePair = (sym) => {
   if (!sym) return '';
   const raw = String(sym).trim().toUpperCase();
@@ -2489,6 +2490,19 @@ const logOrderFailure = ({ order, endpoint, status, body, error }) => {
   recordOrderFailure(code);
 };
 
+const attemptTradeBuy = async (normalizedSymbol, { emitDecisionSnapshot } = {}) => {
+  try {
+    const tradeRes = await buyViaTrade(normalizedSymbol);
+    if (tradeRes && tradeRes._fallback) {
+      return { fallback: true };
+    }
+    emitDecisionSnapshot?.('ATTEMPT', { qty: null, computedNotional: null });
+    return { ok: true, data: tradeRes };
+  } catch (error) {
+    return { ok: false, error };
+  }
+};
+
 const RECENT_ORDER_TTL_MS = 10 * 60 * 1000;
 const recentOrders = new Map();
 
@@ -3799,6 +3813,55 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
   let ordersOpen = 0;
   let fillsCount = 0;
   await cancelOpenOrdersForSymbol(normalizedSymbol, 'buy');
+  const tradeAttempt = await attemptTradeBuy(normalizedSymbol, { emitDecisionSnapshot });
+  if (tradeAttempt?.ok) {
+    attempted = true;
+    attemptsSent += 1;
+    logTradeAction('buy_trade', normalizedSymbol, {
+      status: tradeAttempt.data?.status ?? tradeAttempt.data?.state ?? 'ok',
+      order_id: tradeAttempt.data?.orderId ?? tradeAttempt.data?.id ?? null,
+    });
+    const pos = await getPositionInfo(normalizedSymbol);
+    if (pos && pos.qty > 0) {
+      __positionsCache = { ts: 0, items: [] };
+      __openOrdersCache = { ts: 0, items: [] };
+      fillsCount = 1;
+      return {
+        filled: true,
+        entry: pos.basis ?? null,
+        qty: pos.qty,
+        liquidity: 'trade',
+        attempted,
+        attemptsSent,
+        attemptsFailed,
+        ordersOpen: 0,
+        fillsCount,
+      };
+    }
+    return {
+      filled: false,
+      attempted,
+      attemptsSent,
+      attemptsFailed,
+      ordersOpen,
+      fillsCount,
+      decisionReason: 'trade_submitted',
+    };
+  }
+  if (!tradeAttempt?.fallback) {
+    attempted = true;
+    attemptsSent += 1;
+    attemptsFailed += 1;
+    logOrderFailure({
+      order: { symbol: normalizedSymbol, side: 'buy', type: 'trade' },
+      endpoint: `${BACKEND_BASE_URL}/trade`,
+      status: null,
+      body: tradeAttempt?.error?.message || null,
+      error: tradeAttempt?.error,
+    });
+    logTradeAction('buy_trade_error', normalizedSymbol, { error: tradeAttempt?.error?.message || 'trade_failed' });
+    return { filled: false, attempted, attemptsSent, attemptsFailed, ordersOpen, fillsCount, decisionReason: 'trade_failed' };
+  }
   const meta = await fetchAssetMeta(normalizedSymbol);
   const rawTick = meta?._price_inc ?? (isStock(symbol) ? 0.01 : 1e-5);
   const TICK = Number.isFinite(rawTick) && rawTick > 0 ? rawTick : (isStock(symbol) ? 0.01 : 1e-5);
@@ -6354,6 +6417,36 @@ export default function App() {
       let ordersOpen = 0;
       let fillsCount = 0;
       try {
+        const tradeAttempt = await attemptTradeBuy(normalizedSymbol);
+        if (tradeAttempt?.ok) {
+          forceTestBuyUsed = true;
+          attemptsSent += 1;
+          logTradeAction('buy_trade', normalizedSymbol, {
+            status: tradeAttempt.data?.status ?? tradeAttempt.data?.state ?? 'ok',
+            order_id: tradeAttempt.data?.orderId ?? tradeAttempt.data?.id ?? null,
+          });
+          const pos = await getPositionInfo(normalizedSymbol);
+          if (pos && pos.qty > 0) {
+            fillsCount = 1;
+            __positionsCache = { ts: 0, items: [] };
+            __openOrdersCache = { ts: 0, items: [] };
+            return { attempted: true, filled: true, attemptsSent, attemptsFailed, ordersOpen, fillsCount, decisionReason: 'force_test_buy' };
+          }
+          return { attempted: true, filled: false, attemptsSent, attemptsFailed, ordersOpen, fillsCount, decisionReason: 'force_test_buy' };
+        }
+        if (!tradeAttempt?.fallback) {
+          attemptsSent += 1;
+          attemptsFailed += 1;
+          logOrderFailure({
+            order: { symbol: normalizedSymbol, side: 'buy', type: 'trade' },
+            endpoint: `${BACKEND_BASE_URL}/trade`,
+            status: null,
+            body: tradeAttempt?.error?.message || null,
+            error: tradeAttempt?.error,
+          });
+          logTradeAction('buy_trade_error', normalizedSymbol, { error: tradeAttempt?.error?.message || 'trade_failed' });
+          return { attempted: true, filled: false, attemptsSent, attemptsFailed, ordersOpen, fillsCount, decisionReason: 'force_test_buy_failed' };
+        }
         logOrderPayload('force_test_buy', order);
         forceTestBuyUsed = true;
         attemptsSent += 1;
