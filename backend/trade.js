@@ -136,20 +136,20 @@ const BUFFER_BPS = Number(process.env.BUFFER_BPS || 15);
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
 const PROFIT_BUFFER_BPS = Number(process.env.PROFIT_BUFFER_BPS || 2);
-const TAKER_EXIT_ON_TOUCH = readEnvFlag('TAKER_EXIT_ON_TOUCH', false);
+const TAKER_EXIT_ON_TOUCH = readFlag('TAKER_EXIT_ON_TOUCH', true);
 const REPLACE_THRESHOLD_BPS = Number(process.env.REPLACE_THRESHOLD_BPS || 8);
 const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
-const SELL_ORDER_TTL_MS = Number(process.env.SELL_ORDER_TTL_MS || 45000);
+const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
 const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 10000);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
-const MAX_SPREAD_BPS_TO_TRADE = Number(process.env.MAX_SPREAD_BPS_TO_TRADE || 60);
+const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 40);
 
 const MAX_HOLD_SECONDS = Number(process.env.MAX_HOLD_SECONDS || 300);
 const MAX_HOLD_MS = Number(process.env.MAX_HOLD_MS || MAX_HOLD_SECONDS * 1000);
 
-const REPRICE_EVERY_SECONDS = Number(process.env.REPRICE_EVERY_SECONDS || 20);
+const REPRICE_EVERY_SECONDS = readNumber('REPRICE_EVERY_SECONDS', 5);
 
-const FORCE_EXIT_SECONDS = Number(process.env.FORCE_EXIT_SECONDS || 600);
+const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 120);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 100);
@@ -869,6 +869,18 @@ function readEnvFlag(name, defaultValue = true) {
   const raw = process.env[name];
   if (raw == null || raw === '') return defaultValue;
   return String(raw).toLowerCase() === 'true';
+}
+
+function readFlag(name, defaultValue = false) {
+  const v = String(process.env[name] ?? '').trim().toLowerCase();
+  if (v === 'true' || v === '1' || v === 'yes') return true;
+  if (v === 'false' || v === '0' || v === 'no') return false;
+  return defaultValue;
+}
+
+function readNumber(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 function updateInventoryFromBuy(symbol, qty, price) {
@@ -2041,6 +2053,63 @@ async function cancelOrderSafe(orderId) {
 
 }
 
+async function submitOcoExit({
+
+  symbol,
+  qty,
+  entryPrice,
+  targetPrice,
+  clientOrderId,
+
+}) {
+
+  const stopBps = readNumber('STOP_LOSS_BPS', 60);
+  const offBps = readNumber('STOP_LIMIT_OFFSET_BPS', 10);
+
+  const stopPrice = Number(entryPrice) * (1 - stopBps / 10000);
+  const stopLimit = stopPrice * (1 - offBps / 10000);
+
+  const payload = {
+    side: 'sell',
+    symbol: toTradeSymbol(symbol),
+    type: 'limit',
+    qty: String(qty),
+    time_in_force: 'gtc',
+    order_class: 'oco',
+    client_order_id: clientOrderId,
+    take_profit: { limit_price: roundToTick(targetPrice, symbol, 'up') },
+    stop_loss: {
+      stop_price: roundToTick(stopPrice, symbol, 'down'),
+      limit_price: roundToTick(stopLimit, symbol, 'down'),
+    },
+  };
+
+  if (!payload.client_order_id) {
+    delete payload.client_order_id;
+  }
+
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_oco_exit' });
+
+  try {
+    const res = await requestJson({
+      method: 'POST',
+      url,
+      headers: alpacaJsonHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const id = res?.id || res?.data?.id;
+    if (!id) {
+      console.warn('oco_exit_rejected', { symbol, reason: 'missing_order_id' });
+      return null;
+    }
+    return res;
+  } catch (err) {
+    console.warn('oco_exit_rejected', { symbol, err: err?.response?.data || err?.message });
+    return null;
+  }
+
+}
+
 async function submitLimitSell({
 
   symbol,
@@ -2129,7 +2198,8 @@ async function submitLimitSell({
     limit_price: roundedLimit,
     client_order_id: clientOrderId,
   };
-  if (postOnly && isCryptoSymbol(symbol)) {
+  const postOnlyPref = readFlag('POST_ONLY_SELL', Boolean(postOnly));
+  if (postOnlyPref && isCryptoSymbol(symbol)) {
     payload.post_only = true;
   }
   console.log('tp_sell_attempt', {
@@ -2340,6 +2410,7 @@ async function handleBuyFill({
   });
   const targetPrice = computeTargetSellPrice(entryPriceNum, requiredExitBps, tickSize);
   const postOnly = true;
+  const wantOco = (process.env.EXIT_ORDER_CLASS || '').toLowerCase() === 'oco';
 
   console.log('tp_attach_plan', {
     symbol,
@@ -2352,6 +2423,26 @@ async function handleBuyFill({
     takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
     postOnly,
   });
+
+  if (wantOco) {
+    const oco = await submitOcoExit({
+      symbol,
+      qty: qtyNum,
+      entryPrice: entryPriceNum,
+      targetPrice,
+      clientOrderId: buildIntentClientOrderId({
+        symbol,
+        side: 'SELL',
+        intent: 'EXIT_OCO',
+        ref: entryOrderId || getOrderIntentBucket(),
+      }),
+    });
+    if (oco && (oco.id || oco.client_order_id)) {
+      console.log('oco_exit_attached', { symbol, tp: targetPrice, sl_bps: readNumber('STOP_LOSS_BPS', 60) });
+      return oco;
+    }
+    console.warn('oco_exit_fallback_to_legacy', { symbol });
+  }
 
   const sellOrder = await submitLimitSell({
 
@@ -3057,6 +3148,150 @@ async function manageExitStates() {
           }
         }
 
+        const takerOnTouch = readFlag('TAKER_EXIT_ON_TOUCH', true);
+        const ttlMs = readNumber('SELL_ORDER_TTL_MS', 12000);
+        const lastSubmittedAt = Number.isFinite(state.sellOrderSubmittedAt) ? state.sellOrderSubmittedAt : null;
+        const shouldReplace = !state.sellOrderId || (!lastSubmittedAt || now - lastSubmittedAt >= ttlMs);
+
+        if (takerOnTouch && Number.isFinite(ask) && ask >= targetPrice && shouldReplace) {
+          if (state.sellOrderId) {
+            await cancelOrderSafe(state.sellOrderId);
+          }
+          const iocResult = await submitIocLimitSell({
+            symbol,
+            qty: state.qty,
+            limitPrice: ask,
+            reason: 'target_touch',
+          });
+          console.log('target_touch_taker', { symbol, targetPrice, ask, qty: state.qty });
+          if (!iocResult?.skipped) {
+            const requestedQty = iocResult.requestedQty;
+            const filledQty = normalizeFilledQty(iocResult.order);
+            const remainingQty =
+              Number.isFinite(requestedQty) && Number.isFinite(filledQty)
+                ? Math.max(requestedQty - filledQty, 0)
+                : null;
+            if (remainingQty && remainingQty > 0) {
+              await submitMarketSell({ symbol, qty: remainingQty, reason: 'target_touch_fallback' });
+            }
+            exitState.delete(symbol);
+            actionTaken = 'target_touch_taker';
+            reasonCode = 'target_touch_taker';
+            lastActionAt.set(symbol, now);
+            logExitDecision({
+              symbol,
+              heldSeconds,
+              entryPrice: state.entryPrice,
+              targetPrice,
+              bid,
+              ask,
+              minNetProfitBps,
+              actionTaken,
+            });
+            console.log('exit_scan', {
+              symbol,
+              heldQty: state.qty,
+              entryPrice: state.entryPrice,
+              bid,
+              ask,
+              spreadBps,
+              openBuyCount,
+              openSellCount,
+              existingOrderAgeMs: null,
+              feeBpsRoundTrip,
+              profitBufferBps,
+              minNetProfitBps,
+              targetPrice,
+              breakevenPrice,
+              desiredLimit,
+              decisionPath: 'target_touch_taker',
+              lastRepriceAgeMs: lastRepriceAgeMs,
+              lastCancelReplaceAt: lastCancelReplaceAtMs,
+              actionTaken,
+              reasonCode,
+              iocRequestedQty: requestedQty ?? null,
+              iocFilledQty: filledQty ?? null,
+              iocFallbackReason: remainingQty && remainingQty > 0 ? 'target_touch_fallback' : null,
+            });
+            continue;
+          }
+        }
+
+        const slBps = readNumber('STOP_LOSS_BPS', 0);
+        if (slBps > 0 && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) {
+          const stopTrigger = state.entryPrice * (1 - slBps / 10000);
+          if (bid <= stopTrigger) {
+            console.log('hard_stop_trigger', { symbol, entryPrice: state.entryPrice, bid, slBps });
+            if (state.sellOrderId) {
+              await cancelOrderSafe(state.sellOrderId);
+            }
+            const ioc = await submitIocLimitSell({
+              symbol,
+              qty: state.qty,
+              limitPrice: bid,
+              reason: 'hard_stop',
+            });
+            const iocStatus = String(ioc?.order?.status || '').toLowerCase();
+            const requestedQty = ioc?.requestedQty;
+            const filledQty = normalizeFilledQty(ioc?.order);
+            const remainingQty =
+              Number.isFinite(requestedQty) && Number.isFinite(filledQty)
+                ? Math.max(requestedQty - filledQty, 0)
+                : null;
+            if (
+              ioc?.skipped ||
+              remainingQty == null ||
+              remainingQty > 0 ||
+              ['canceled', 'expired', 'rejected'].includes(iocStatus)
+            ) {
+              await submitMarketSell({
+                symbol,
+                qty: Number.isFinite(remainingQty) && remainingQty > 0 ? remainingQty : state.qty,
+                reason: 'hard_stop_market',
+              });
+            }
+            exitState.delete(symbol);
+            actionTaken = 'hard_stop_exit';
+            reasonCode = 'hard_stop';
+            lastActionAt.set(symbol, now);
+            logExitDecision({
+              symbol,
+              heldSeconds,
+              entryPrice: state.entryPrice,
+              targetPrice,
+              bid,
+              ask,
+              minNetProfitBps,
+              actionTaken,
+            });
+            console.log('exit_scan', {
+              symbol,
+              heldQty: state.qty,
+              entryPrice: state.entryPrice,
+              bid,
+              ask,
+              spreadBps,
+              openBuyCount,
+              openSellCount,
+              existingOrderAgeMs: null,
+              feeBpsRoundTrip,
+              profitBufferBps,
+              minNetProfitBps,
+              targetPrice,
+              breakevenPrice,
+              desiredLimit,
+              decisionPath: 'hard_stop',
+              lastRepriceAgeMs: lastRepriceAgeMs,
+              lastCancelReplaceAt: lastCancelReplaceAtMs,
+              actionTaken,
+              reasonCode,
+              iocRequestedQty: requestedQty ?? null,
+              iocFilledQty: filledQty ?? null,
+              iocFallbackReason: remainingQty && remainingQty > 0 ? 'hard_stop_market' : null,
+            });
+            continue;
+          }
+        }
 
       if (heldSeconds >= FORCE_EXIT_SECONDS) {
 
@@ -3073,6 +3308,7 @@ async function manageExitStates() {
         actionTaken = 'forced_exit_timeout';
         reasonCode = 'kill_switch';
         lastActionAt.set(symbol, now);
+        console.log('forced_exit_elapsed', { symbol, heldSeconds, limitSeconds: FORCE_EXIT_SECONDS });
         const decisionPath = bidMeetsBreakeven ? 'taker_ioc' : (askMeetsBreakeven ? 'maker_post_only' : 'hold_not_profitable');
         const loggedLastCancelReplaceAt = lastCancelReplaceAt.get(symbol) || lastCancelReplaceAtMs;
         const loggedLastRepriceAgeMs = Number.isFinite(loggedLastCancelReplaceAt) ? now - loggedLastCancelReplaceAt : null;
