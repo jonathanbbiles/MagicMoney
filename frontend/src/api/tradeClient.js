@@ -1,4 +1,3 @@
-// frontend/src/api/tradeClient.js
 import Constants from 'expo-constants';
 
 function getBase() {
@@ -16,10 +15,7 @@ function getAuthHeader() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-/**
- * POST /trade { symbol } so backend attaches OCO (TP+SL).
- * Returns parsed JSON; returns {_fallback:true} if /trade is 404.
- */
+/** POST /trade {symbol}; returns JSON; {_fallback:true} if 404 */
 export async function buyViaTrade(symbolRaw) {
   const symbol = String(symbolRaw || '').trim();
   if (!symbol) throw new Error('buyViaTrade: symbol required');
