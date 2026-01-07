@@ -155,7 +155,7 @@ const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 100);
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
-const QUOTE_CACHE_MAX_AGE_MS = 60000;
+const QUOTE_CACHE_MAX_AGE_MS = MAX_QUOTE_AGE_MS;
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
@@ -172,6 +172,7 @@ const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
+let exitManagerRunning = false;
 const positionsSnapshot = {
   tsMs: 0,
   mapBySymbol: new Map(),
@@ -1659,6 +1660,20 @@ function normalizeOrderLimitPrice(order) {
   return Number.isFinite(num) ? num : null;
 }
 
+function normalizeOrderQty(order) {
+  const raw = order?.qty ?? order?.quantity ?? order?.qty_available ?? order?.remaining_qty ?? order?.remainingQty;
+  const num = Number(raw);
+  return Number.isFinite(num) ? num : null;
+}
+
+function hasExitIntentOrder(order, symbol) {
+  const clientOrderId = String(order?.client_order_id ?? order?.clientOrderId ?? '');
+  if (!clientOrderId) return false;
+  const tpPrefix = buildIntentPrefix({ symbol, side: 'SELL', intent: 'TP' });
+  const exitPrefix = buildIntentPrefix({ symbol, side: 'SELL', intent: 'EXIT' });
+  return clientOrderId.startsWith(tpPrefix) || clientOrderId.startsWith(exitPrefix);
+}
+
 function normalizeFilledQty(order) {
   const raw = order?.filled_qty ?? order?.filledQty ?? order?.filled_quantity ?? order?.filledQuantity;
   const num = Number(raw);
@@ -2042,20 +2057,6 @@ async function submitLimitSell({
 }) {
 
   const open = openOrders || (await fetchOrders({ status: 'open' }));
-  const hasOpenSell = (Array.isArray(open) ? open : []).some((order) => {
-    const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
-    const side = String(order.side || '').toLowerCase();
-    return orderSymbol === normalizePair(symbol) && side === 'sell';
-  });
-  if (hasOpenSell) {
-    console.log('hold_existing_order', { symbol, side: 'sell', reason: 'existing_sell_open' });
-    return { skipped: true, reason: 'existing_sell_open' };
-  }
-  if (hasOpenOrderForIntent(open, { symbol, side: 'SELL', intent: 'TP' })) {
-    console.log('hold_existing_order', { symbol, side: 'sell', reason: 'existing_tp_intent' });
-    return { skipped: true, reason: 'existing_tp_intent' };
-  }
-
   const availableQty = await getAvailablePositionQty(symbol);
   if (!(availableQty > 0)) {
     logSkip('no_position_qty', { symbol, qty, availableQty, context: 'limit_sell' });
@@ -2065,6 +2066,46 @@ async function submitLimitSell({
   const adjustedQty = Number.isFinite(qtyNum) && qtyNum > 0 ? Math.min(qtyNum, availableQty) : availableQty;
 
   const roundedLimit = roundToTick(Number(limitPrice), symbol, 'up');
+  const openList = Array.isArray(open) ? open : [];
+  const normalizedSymbol = normalizePair(symbol);
+  const requiredQty = Number.isFinite(adjustedQty) && adjustedQty > 0 ? adjustedQty : availableQty;
+  const openSellCandidates = openList.filter((order) => {
+    const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
+    const side = String(order.side || '').toLowerCase();
+    if (orderSymbol !== normalizedSymbol || side !== 'sell') return false;
+    const orderQty = normalizeOrderQty(order);
+    return Number.isFinite(orderQty) && orderQty >= requiredQty;
+  });
+  if (openSellCandidates.length) {
+    const taggedCandidates = openSellCandidates.filter((order) => hasExitIntentOrder(order, normalizedSymbol));
+    const desiredLimit = roundedLimit;
+    const pool = taggedCandidates.length ? taggedCandidates : openSellCandidates;
+    const bestOrder = pool.reduce((best, candidate) => {
+      const bestPrice = normalizeOrderLimitPrice(best);
+      const candidatePrice = normalizeOrderLimitPrice(candidate);
+      const bestDiff = Number.isFinite(bestPrice) ? Math.abs(bestPrice - desiredLimit) : Number.POSITIVE_INFINITY;
+      const candidateDiff = Number.isFinite(candidatePrice)
+        ? Math.abs(candidatePrice - desiredLimit)
+        : Number.POSITIVE_INFINITY;
+      return candidateDiff < bestDiff ? candidate : best;
+    }, pool[0]);
+    const adoptedId = bestOrder?.id || bestOrder?.order_id || null;
+    const adoptedLimit = normalizeOrderLimitPrice(bestOrder);
+    console.log('adopt_existing_sell', {
+      symbol,
+      orderId: adoptedId,
+      limitPrice: adoptedLimit,
+      matchedQty: requiredQty,
+      intentTagged: hasExitIntentOrder(bestOrder, normalizedSymbol),
+    });
+    return {
+      id: adoptedId,
+      limitPrice: adoptedLimit,
+      submittedAt: bestOrder?.submitted_at || bestOrder?.submittedAt || bestOrder?.created_at || bestOrder?.createdAt,
+      adopted: true,
+    };
+  }
+
   const sizeGuard = guardTradeSize({
     symbol,
     qty: adjustedQty,
@@ -2327,6 +2368,11 @@ async function handleBuyFill({
   });
 
   const now = Date.now();
+  const sellOrderId = sellOrder?.id || sellOrder?.order_id || null;
+  const sellOrderLimit = normalizeOrderLimitPrice(sellOrder) ?? targetPrice;
+  const sellOrderSubmittedAtRaw = sellOrder?.submittedAt || sellOrder?.submitted_at || null;
+  const sellOrderSubmittedAt =
+    typeof sellOrderSubmittedAtRaw === 'string' ? Date.parse(sellOrderSubmittedAtRaw) : sellOrderSubmittedAtRaw;
 
   exitState.set(symbol, {
 
@@ -2350,11 +2396,11 @@ async function handleBuyFill({
     exitFeeBps,
     entryOrderId: entryOrderId || null,
 
-    sellOrderId: sellOrder.id,
+    sellOrderId,
 
-    sellOrderSubmittedAt: now,
+    sellOrderSubmittedAt: Number.isFinite(sellOrderSubmittedAt) ? sellOrderSubmittedAt : now,
 
-    sellOrderLimit: targetPrice,
+    sellOrderLimit,
 
     takerAttempted: false,
   });
@@ -2830,159 +2876,186 @@ async function repairOrphanExits() {
 
 async function manageExitStates() {
 
-  const now = Date.now();
-
-  await repairOrphanExits();
-  let openOrders = [];
-  try {
-    openOrders = await fetchOrders({ status: 'open' });
-  } catch (err) {
-    console.warn('exit_manager_open_orders_failed', { error: err?.message || err });
+  if (exitManagerRunning) {
+    console.warn('exit_manager_skip_concurrent');
+    return;
   }
-  const openOrdersList = Array.isArray(openOrders) ? openOrders : [];
-  const openOrdersBySymbol = openOrdersList.reduce((acc, order) => {
-    const symbol = normalizePair(order.symbol || order.rawSymbol);
-    if (!acc.has(symbol)) {
-      acc.set(symbol, []);
-    }
-    acc.get(symbol).push(order);
-    return acc;
-  }, new Map());
-  const maxHoldMs = Number.isFinite(MAX_HOLD_MS) && MAX_HOLD_MS > 0 ? MAX_HOLD_MS : MAX_HOLD_SECONDS * 1000;
+  exitManagerRunning = true;
 
-  for (const [symbol, state] of exitState.entries()) {
-    if (symbolLocks.get(symbol)) {
-      console.log('exit_manager_symbol_locked', { symbol });
-      continue;
-    }
-    symbolLocks.set(symbol, true);
+  try {
+    const now = Date.now();
+
+    await repairOrphanExits();
+    let openOrders = [];
     try {
-      const heldMs = now - state.entryTime;
-      const heldSeconds = heldMs / 1000;
-      const symbolOrders = openOrdersBySymbol.get(normalizePair(symbol)) || [];
-      const openBuyCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'buy').length;
-      const openSellCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell').length;
-
-      let bid = null;
-
-      let ask = null;
-      let quoteFetchFailed = false;
-
-      try {
-
-        const quote = await getLatestQuote(symbol);
-
-        bid = quote.bid;
-
-        ask = quote.ask;
-
-      } catch (err) {
-
-        console.warn('quote_fetch_failed', { symbol, error: err?.message || err });
-        quoteFetchFailed = isNetworkError(err);
-
+      openOrders = await fetchOrders({ status: 'open' });
+    } catch (err) {
+      console.warn('exit_manager_open_orders_failed', { error: err?.message || err });
+    }
+    const openOrdersList = Array.isArray(openOrders) ? openOrders : [];
+    const openOrdersBySymbol = openOrdersList.reduce((acc, order) => {
+      const symbol = normalizePair(order.symbol || order.rawSymbol);
+      if (!acc.has(symbol)) {
+        acc.set(symbol, []);
       }
+      acc.get(symbol).push(order);
+      return acc;
+    }, new Map());
+    const maxHoldMs = Number.isFinite(MAX_HOLD_MS) && MAX_HOLD_MS > 0 ? MAX_HOLD_MS : MAX_HOLD_SECONDS * 1000;
 
-      if (quoteFetchFailed) {
-        console.warn('exit_manager_skip_orders', { symbol, reason: 'quote_network_error' });
+    for (const [symbol, state] of exitState.entries()) {
+      if (symbolLocks.get(symbol)) {
+        console.log('exit_manager_symbol_locked', { symbol });
         continue;
       }
+      symbolLocks.set(symbol, true);
+      try {
+        const heldMs = now - state.entryTime;
+        const heldSeconds = heldMs / 1000;
+        const symbolOrders = openOrdersBySymbol.get(normalizePair(symbol)) || [];
+        const openBuyCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'buy').length;
+        const openSellCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell').length;
 
-      let actionTaken = 'none';
-      let reasonCode = 'hold';
-      const spreadBps =
-        Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
-      const entryFeeBps = Number.isFinite(state.entryFeeBps)
-        ? state.entryFeeBps
-        : inferEntryFeeBps({ symbol, orderType: 'limit', postOnly: true });
-      const exitFeeBps = Number.isFinite(state.exitFeeBps)
-        ? state.exitFeeBps
-        : inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
-      const feeBpsRoundTrip = Number.isFinite(state.feeBpsRoundTrip)
-        ? state.feeBpsRoundTrip
-        : entryFeeBps + exitFeeBps;
-      const profitBufferBps = Number.isFinite(state.profitBufferBps) ? state.profitBufferBps : PROFIT_BUFFER_BPS;
-      const desiredNetExitBps = Number.isFinite(state.desiredNetExitBps) ? state.desiredNetExitBps : null;
-      const minNetProfitBps = computeMinNetProfitBps({
-        feeBpsRoundTrip,
-        profitBufferBps,
-        desiredNetExitBps,
-      });
-      const tickSize = getTickSize({ symbol, price: state.entryPrice });
-      const requiredExitBps = resolveRequiredExitBps({
-        desiredNetExitBps,
-        feeBpsRoundTrip,
-        profitBufferBps,
-      });
-      const targetPrice = computeTargetSellPrice(state.entryPrice, requiredExitBps, tickSize);
-      state.targetPrice = targetPrice;
-      state.minNetProfitBps = minNetProfitBps;
-      state.feeBpsRoundTrip = feeBpsRoundTrip;
-      state.profitBufferBps = profitBufferBps;
-      state.desiredNetExitBps = desiredNetExitBps;
-      state.entryFeeBps = entryFeeBps;
-      state.exitFeeBps = exitFeeBps;
-      const breakevenPrice = computeBreakevenPrice(state.entryPrice, minNetProfitBps);
-      const roundedBreakeven = roundToTick(breakevenPrice, tickSize, 'up');
-      const bidMeetsBreakeven = Number.isFinite(bid) && bid >= breakevenPrice;
-      const askMeetsBreakeven = Number.isFinite(ask) && ask >= breakevenPrice;
-      const roundedAsk = Number.isFinite(ask) ? roundToTick(ask, tickSize, 'down') : null;
-      const askMinusTick = Number.isFinite(ask) ? roundToTick(ask - tickSize, tickSize, 'down') : null;
-      const makerDesiredLimit =
-        askMeetsBreakeven &&
-        Number.isFinite(roundedBreakeven) &&
-        Number.isFinite(roundedAsk) &&
-        roundedBreakeven <= roundedAsk
-          ? Math.min(roundedAsk, Math.max(roundedBreakeven, askMinusTick))
-          : null;
-      const desiredLimit = Number.isFinite(makerDesiredLimit) ? makerDesiredLimit : roundedBreakeven;
-      const lastCancelReplaceAtMs = lastCancelReplaceAt.get(symbol) || null;
-      const lastRepriceAgeMs = Number.isFinite(lastCancelReplaceAtMs) ? now - lastCancelReplaceAtMs : null;
-      const openSellOrders = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell');
-      if (!state.sellOrderId && openSellOrders.length === 1) {
-        const onlyOrder = openSellOrders[0];
-        state.sellOrderId = onlyOrder?.id || onlyOrder?.order_id || null;
-        const limitPrice = normalizeOrderLimitPrice(onlyOrder);
-        state.sellOrderLimit = Number.isFinite(limitPrice) ? limitPrice : state.sellOrderLimit;
-        const orderAgeMs = getOrderAgeMs(onlyOrder);
-        const normalizedOrderAgeMs = Number.isFinite(orderAgeMs) ? Math.max(0, orderAgeMs) : null;
-        if (!state.sellOrderSubmittedAt && Number.isFinite(normalizedOrderAgeMs)) {
-          state.sellOrderSubmittedAt = now - normalizedOrderAgeMs;
+        let bid = null;
+
+        let ask = null;
+        let quoteFetchFailed = false;
+
+        try {
+
+          const quote = await getLatestQuote(symbol);
+
+          bid = quote.bid;
+
+          ask = quote.ask;
+
+        } catch (err) {
+
+          console.warn('quote_fetch_failed', { symbol, error: err?.message || err });
+          quoteFetchFailed = isNetworkError(err);
+
         }
-      }
-      if (openSellOrders.length > 1) {
-        const desiredForSelect = Number.isFinite(desiredLimit) ? desiredLimit : state.sellOrderLimit;
-        let keepOrder = openSellOrders[0];
-        if (Number.isFinite(desiredForSelect)) {
-          keepOrder = openSellOrders.reduce((best, candidate) => {
-            const bestPrice = normalizeOrderLimitPrice(best);
-            const candidatePrice = normalizeOrderLimitPrice(candidate);
-            const bestDiff = Number.isFinite(bestPrice) ? Math.abs(bestPrice - desiredForSelect) : Number.POSITIVE_INFINITY;
-            const candidateDiff = Number.isFinite(candidatePrice)
-              ? Math.abs(candidatePrice - desiredForSelect)
-              : Number.POSITIVE_INFINITY;
-            return candidateDiff < bestDiff ? candidate : best;
-          }, keepOrder);
+
+        if (quoteFetchFailed) {
+          console.warn('exit_manager_skip_orders', { symbol, reason: 'quote_network_error' });
+          continue;
         }
-        const keepId = keepOrder?.id || keepOrder?.order_id;
-        for (const order of openSellOrders) {
-          const orderId = order?.id || order?.order_id;
-          if (orderId && orderId !== keepId) {
-            await cancelOrderSafe(orderId);
+
+        let actionTaken = 'none';
+        let reasonCode = 'hold';
+        const spreadBps =
+          Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
+        const entryFeeBps = Number.isFinite(state.entryFeeBps)
+          ? state.entryFeeBps
+          : inferEntryFeeBps({ symbol, orderType: 'limit', postOnly: true });
+        const exitFeeBps = Number.isFinite(state.exitFeeBps)
+          ? state.exitFeeBps
+          : inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
+        const feeBpsRoundTrip = Number.isFinite(state.feeBpsRoundTrip)
+          ? state.feeBpsRoundTrip
+          : entryFeeBps + exitFeeBps;
+        const profitBufferBps = Number.isFinite(state.profitBufferBps) ? state.profitBufferBps : PROFIT_BUFFER_BPS;
+        const desiredNetExitBps = Number.isFinite(state.desiredNetExitBps) ? state.desiredNetExitBps : null;
+        const minNetProfitBps = computeMinNetProfitBps({
+          feeBpsRoundTrip,
+          profitBufferBps,
+          desiredNetExitBps,
+        });
+        const tickSize = getTickSize({ symbol, price: state.entryPrice });
+        const requiredExitBps = resolveRequiredExitBps({
+          desiredNetExitBps,
+          feeBpsRoundTrip,
+          profitBufferBps,
+        });
+        const targetPrice = computeTargetSellPrice(state.entryPrice, requiredExitBps, tickSize);
+        state.targetPrice = targetPrice;
+        state.minNetProfitBps = minNetProfitBps;
+        state.feeBpsRoundTrip = feeBpsRoundTrip;
+        state.profitBufferBps = profitBufferBps;
+        state.desiredNetExitBps = desiredNetExitBps;
+        state.entryFeeBps = entryFeeBps;
+        state.exitFeeBps = exitFeeBps;
+        const breakevenPrice = computeBreakevenPrice(state.entryPrice, minNetProfitBps);
+        const roundedBreakeven = roundToTick(breakevenPrice, tickSize, 'up');
+        const bidMeetsBreakeven = Number.isFinite(bid) && bid >= breakevenPrice;
+        const askMeetsBreakeven = Number.isFinite(ask) && ask >= breakevenPrice;
+        const roundedAsk = Number.isFinite(ask) ? roundToTick(ask, tickSize, 'down') : null;
+        const askMinusTick = Number.isFinite(ask) ? roundToTick(ask - tickSize, tickSize, 'down') : null;
+        const makerDesiredLimit =
+          askMeetsBreakeven &&
+          Number.isFinite(roundedBreakeven) &&
+          Number.isFinite(roundedAsk) &&
+          roundedBreakeven <= roundedAsk
+            ? Math.min(roundedAsk, Math.max(roundedBreakeven, askMinusTick))
+            : null;
+        const desiredLimit = Number.isFinite(makerDesiredLimit) ? makerDesiredLimit : roundedBreakeven;
+        const lastCancelReplaceAtMs = lastCancelReplaceAt.get(symbol) || null;
+        const lastRepriceAgeMs = Number.isFinite(lastCancelReplaceAtMs) ? now - lastCancelReplaceAtMs : null;
+        const openSellOrders = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell');
+        if (!state.sellOrderId && openSellOrders.length === 1) {
+          const onlyOrder = openSellOrders[0];
+          state.sellOrderId = onlyOrder?.id || onlyOrder?.order_id || null;
+          const limitPrice = normalizeOrderLimitPrice(onlyOrder);
+          state.sellOrderLimit = Number.isFinite(limitPrice) ? limitPrice : state.sellOrderLimit;
+          const orderAgeMs = getOrderAgeMs(onlyOrder);
+          const normalizedOrderAgeMs = Number.isFinite(orderAgeMs) ? Math.max(0, orderAgeMs) : null;
+          if (!state.sellOrderSubmittedAt && Number.isFinite(normalizedOrderAgeMs)) {
+            state.sellOrderSubmittedAt = now - normalizedOrderAgeMs;
           }
         }
-        if (keepId) {
-          state.sellOrderId = keepId;
-          const limitPrice = normalizeOrderLimitPrice(keepOrder);
-          state.sellOrderLimit = Number.isFinite(limitPrice) ? limitPrice : state.sellOrderLimit;
-          const keepOrderAgeMs = getOrderAgeMs(keepOrder);
-          const normalizedKeepOrderAgeMs = Number.isFinite(keepOrderAgeMs) ? Math.max(0, keepOrderAgeMs) : null;
-          state.sellOrderSubmittedAt =
-            state.sellOrderSubmittedAt ||
-            (Number.isFinite(normalizedKeepOrderAgeMs) ? now - normalizedKeepOrderAgeMs : null);
+        if (openSellOrders.length > 1) {
+          const desiredForSelect = Number.isFinite(desiredLimit) ? desiredLimit : state.sellOrderLimit;
+          let keepOrder = openSellOrders[0];
+          if (Number.isFinite(desiredForSelect)) {
+            keepOrder = openSellOrders.reduce((best, candidate) => {
+              const bestPrice = normalizeOrderLimitPrice(best);
+              const candidatePrice = normalizeOrderLimitPrice(candidate);
+              const bestDiff = Number.isFinite(bestPrice) ? Math.abs(bestPrice - desiredForSelect) : Number.POSITIVE_INFINITY;
+              const candidateDiff = Number.isFinite(candidatePrice)
+                ? Math.abs(candidatePrice - desiredForSelect)
+                : Number.POSITIVE_INFINITY;
+              return candidateDiff < bestDiff ? candidate : best;
+            }, keepOrder);
+          }
+          const keepId = keepOrder?.id || keepOrder?.order_id;
+          for (const order of openSellOrders) {
+            const orderId = order?.id || order?.order_id;
+            if (orderId && orderId !== keepId) {
+              await cancelOrderSafe(orderId);
+            }
+          }
+          if (keepId) {
+            state.sellOrderId = keepId;
+            const limitPrice = normalizeOrderLimitPrice(keepOrder);
+            state.sellOrderLimit = Number.isFinite(limitPrice) ? limitPrice : state.sellOrderLimit;
+            const keepOrderAgeMs = getOrderAgeMs(keepOrder);
+            const normalizedKeepOrderAgeMs = Number.isFinite(keepOrderAgeMs) ? Math.max(0, keepOrderAgeMs) : null;
+            state.sellOrderSubmittedAt =
+              state.sellOrderSubmittedAt ||
+              (Number.isFinite(normalizedKeepOrderAgeMs) ? now - normalizedKeepOrderAgeMs : null);
+          }
+          lastCancelReplaceAt.set(symbol, now);
         }
-        lastCancelReplaceAt.set(symbol, now);
-      }
+
+        if (!state.sellOrderId && state.qty > 0) {
+          const replacement = await submitLimitSell({
+            symbol,
+            qty: state.qty,
+            limitPrice: targetPrice,
+            reason: 'missing_sell_order',
+            intentRef: state.entryOrderId || getOrderIntentBucket(),
+            postOnly: true,
+            openOrders: symbolOrders,
+          });
+          if (!replacement?.skipped && replacement?.id) {
+            state.sellOrderId = replacement.id;
+            state.sellOrderSubmittedAt = Date.now();
+            state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? targetPrice;
+            actionTaken = 'recreate_limit_sell';
+            reasonCode = 'missing_sell_order';
+            lastActionAt.set(symbol, now);
+          }
+        }
 
 
       if (heldSeconds >= FORCE_EXIT_SECONDS) {
@@ -3443,12 +3516,14 @@ async function manageExitStates() {
         iocFilledQty,
         iocFallbackReason,
       });
-    } finally {
-      symbolLocks.delete(symbol);
+      } finally {
+        symbolLocks.delete(symbol);
+      }
+
     }
-
+  } finally {
+    exitManagerRunning = false;
   }
-
 }
 
 function startExitManager() {

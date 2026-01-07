@@ -1,9 +1,7 @@
 import {
-  ALPACA_BASE_URL,
   BACKEND_BASE_URL,
   BACKEND_HEADERS,
   DATA_LOCATIONS,
-  HEADERS,
 } from '../config/alpaca';
 import { getSettings } from '../state/settingsStore';
 import { isoDaysAgo, isFresh, parseTsMs } from '../utils/format';
@@ -161,8 +159,12 @@ const buildURLCrypto = (loc, what, symbols = [], params = {}) => {
 };
 
 export const getPortfolioHistory = async ({ period = '1M', timeframe = '1D' } = {}) => {
-  const url = `${ALPACA_BASE_URL}/account/portfolio/history?period=${encodeURIComponent(period)}&timeframe=${encodeURIComponent(timeframe)}&extended_hours=true`;
-  const res = await fetchWithBudget(url, { headers: HEADERS });
+  const url = buildBackendUrl({
+    path: 'account/portfolio/history',
+    params: { period, timeframe, extended_hours: true },
+    label: 'portfolio_history',
+  });
+  const res = await fetchWithBudget(url, { headers: BACKEND_HEADERS });
   if (!res.ok) return null;
   return res.json().catch(() => null);
 };
@@ -177,15 +179,23 @@ export const getActivities = async ({ afterISO, untilISO, pageToken, types } = {
   if (untilISO) params.set('until', untilISO);
   if (pageToken) params.set('page_token', pageToken);
 
-  const url = `${ALPACA_BASE_URL}/account/activities?${params.toString()}`;
-  const res = await fetchWithBudget(url, { headers: HEADERS });
+  const url = buildBackendUrl({
+    path: 'account/activities',
+    params: Object.fromEntries(params.entries()),
+    label: 'activities',
+  });
+  const res = await fetchWithBudget(url, { headers: BACKEND_HEADERS });
   let items = [];
+  let next = res.headers?.get?.('x-next-page-token') || null;
   try {
-    items = await res.json();
+    const body = await res.json();
+    items = body?.items ?? body;
+    if (!next) {
+      next = body?.nextPageToken ?? null;
+    }
   } catch (err) {
     log('activities_parse_error', 'ACTIVITIES', { message: err?.message });
   }
-  const next = res.headers?.get?.('x-next-page-token') || null;
   return { items: Array.isArray(items) ? items : [], next };
 };
 
@@ -232,7 +242,7 @@ export const getPnLAndFeesSnapshot = async () => {
 
 export const getStockClock = async () => {
   try {
-    const res = await fetchWithBudget(`${ALPACA_BASE_URL}/clock`, { headers: HEADERS });
+    const res = await fetchWithBudget(`${BACKEND_BASE_URL}/clock`, { headers: BACKEND_HEADERS });
     if (!res.ok) return { is_open: false };
     const body = await res.json();
     return { is_open: !!body.is_open, next_open: body.next_open, next_close: body.next_close };
@@ -512,7 +522,7 @@ export const getQuoteSmart = async (symbol, preloadedMap = null) => {
 };
 
 export const getAccountSummaryRaw = async () => {
-  const res = await fetchWithBudget(`${ALPACA_BASE_URL}/account`, { headers: HEADERS });
+  const res = await fetchWithBudget(`${BACKEND_BASE_URL}/account`, { headers: BACKEND_HEADERS });
   if (!res.ok) throw new Error(`Account ${res.status}`);
   const body = await res.json();
   const num = (x) => {
@@ -562,7 +572,7 @@ export const getAccountSummaryRaw = async () => {
 
 export const getAllPositions = async () => {
   try {
-    const res = await fetchWithBudget(`${ALPACA_BASE_URL}/positions`, { headers: HEADERS });
+    const res = await fetchWithBudget(`${BACKEND_BASE_URL}/positions`, { headers: BACKEND_HEADERS });
     if (!res.ok) return [];
     const arr = await res.json();
     return Array.isArray(arr)
