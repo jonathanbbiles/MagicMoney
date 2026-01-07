@@ -14,8 +14,6 @@ module.exports = {
     slug: "bullish-or-bust",
     plugins: ["react-native-svg"],
     extra: {
-      APCA_API_KEY_ID: process.env.APCA_API_KEY_ID || "",
-      APCA_API_SECRET_KEY: process.env.APCA_API_SECRET_KEY || "",
       APCA_API_BASE: process.env.APCA_API_BASE || "https://api.alpaca.markets/v2",
       BACKEND_BASE_URL: process.env.BACKEND_BASE_URL || "https://magicmoney.onrender.com"
     }

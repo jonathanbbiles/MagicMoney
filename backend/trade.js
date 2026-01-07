@@ -2875,6 +2875,16 @@ async function repairOrphanExits() {
 }
 
 async function manageExitStates() {
+  const autoTradeEnabled = readEnvFlag('AUTO_TRADE', true);
+  const autoSellEnabled = readEnvFlag('AUTO_SELL', true);
+  const exitsEnabled = readEnvFlag('EXITS_ENABLED', true);
+  const liveMode = readEnvFlag('LIVE', readEnvFlag('LIVE_MODE', readEnvFlag('LIVE_TRADING', true)));
+  const gateFlags = { autoTradeEnabled, autoSellEnabled, exitsEnabled, liveMode };
+
+  if (!autoTradeEnabled || !autoSellEnabled || !exitsEnabled || !liveMode) {
+    console.log('exit_manager_skip_gated', { gates: gateFlags });
+    return;
+  }
 
   if (exitManagerRunning) {
     console.warn('exit_manager_skip_concurrent');
