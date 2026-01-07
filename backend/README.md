@@ -5,5 +5,25 @@ This Node.js backend handles Alpaca API trades via a `/buy` endpoint.
 ## Setup
 
 1. `npm install`
-2. Create a `.env` file with your Alpaca API keys.
+2. Create a `.env` file with your Alpaca API keys and API token.
 3. `npm start`
+
+## Environment Variables
+
+Required:
+- `ALPACA_API_KEY`
+- `ALPACA_SECRET_KEY`
+- `ALPACA_API_BASE`
+
+Recommended:
+- `API_TOKEN` (shared token used by the frontend; include it as `Authorization: Bearer <token>` or `x-api-key`.)
+
+Optional:
+- `CORS_ALLOWED_ORIGINS` (comma-separated list; leave empty to allow all origins during development)
+- `RATE_LIMIT_WINDOW_MS` (default `60000`)
+- `RATE_LIMIT_MAX` (default `120`)
+
+## Notes
+
+- `GET /health` remains public for uptime checks.
+- All other routes require a valid API token.
