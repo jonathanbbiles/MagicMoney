@@ -1,5 +1,7 @@
-const MAX_QUOTE_AGE_MS = Number(process.env.MAX_QUOTE_AGE_MS || 30000);
-const ABSURD_AGE_MS = Number(process.env.ABSURD_AGE_MS || 86400 * 1000);
+const ENV =
+  (typeof process !== 'undefined' && process && process.env) ? process.env : {};
+const MAX_QUOTE_AGE_MS = Number(ENV.MAX_QUOTE_AGE_MS || 30000);
+const ABSURD_AGE_MS = Number(ENV.ABSURD_AGE_MS || 86400 * 1000);
 const MAX_CLOCK_SKEW_MS = 5000;
 
 function normalizeEpochNumber(rawTs) {
@@ -69,17 +71,4 @@ const exportsObject = {
   isFresh,
 };
 
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = exportsObject;
-}
-
-export {
-  MAX_QUOTE_AGE_MS,
-  ABSURD_AGE_MS,
-  MAX_CLOCK_SKEW_MS,
-  normalizeQuoteTsMs,
-  computeQuoteAgeMs,
-  normalizeQuoteAgeMs,
-  isStaleQuoteAge,
-  isFresh,
-};
+module.exports = exportsObject;

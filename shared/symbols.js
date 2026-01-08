@@ -73,21 +73,4 @@ const exportsObject = {
   isStock,
 };
 
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = exportsObject;
-}
-
-export {
-  canonicalPair,
-  canonicalAsset,
-  normalizePair,
-  toAlpacaSymbol,
-  alpacaSymbol,
-  toInternalSymbol,
-  toAlpacaCryptoSymbol,
-  normalizeCryptoSymbol,
-  toTradeSymbol,
-  toDataSymbol,
-  isCrypto,
-  isStock,
-};
+module.exports = exportsObject;

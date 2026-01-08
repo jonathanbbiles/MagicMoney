@@ -9,38 +9,18 @@ import {
   StyleSheet,
   ActivityIndicator,
 } from 'react-native';
-import Constants from 'expo-constants';
-
-function getBase() {
-  const base =
-    (Constants.expoConfig && Constants.expoConfig.extra && Constants.expoConfig.extra.BACKEND_BASE_URL) ||
-    (Constants.manifest && Constants.manifest.extra && Constants.manifest.extra.BACKEND_BASE_URL) ||
-    '';
-  return String(base).replace(/\/+$/, '');
-}
-function getHeaders() {
-  const token =
-    (Constants.expoConfig && Constants.expoConfig.extra && Constants.expoConfig.extra.API_TOKEN) ||
-    (Constants.manifest && Constants.manifest.extra && Constants.manifest.extra.API_TOKEN);
-  const h = { Accept: 'application/json' };
-  if (token) h.Authorization = `Bearer ${token}`;
-  return h;
-}
-async function getJson(url) {
-  const res = await fetch(url, { headers: getHeaders() });
-  if (!res.ok) throw new Error(`GET ${url} -> ${res.status}`);
-  return res.json();
-}
+import { getBackendBaseUrl, getBackendHeaders } from './src/config/alpaca';
+import { normalizePair } from './src/utils/symbols';
 async function buyViaTrade(symbolRaw) {
   const symbol = String(symbolRaw || '').trim();
   if (!symbol) throw new Error('buyViaTrade: symbol required');
 
-  const BASE = getBase();
+  const BASE = getBackendBaseUrl();
   if (!BASE) throw new Error('BACKEND_BASE_URL missing in Expo extra');
 
   const res = await fetch(`${BASE}/trade`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...getHeaders() },
+    headers: getBackendHeaders(),
     body: JSON.stringify({ symbol }),
   });
 
@@ -51,14 +31,6 @@ async function buyViaTrade(symbolRaw) {
   }
   return res.json();
 }
-const normalizePair = (sym) => {
-  if (!sym) return '';
-  const raw = String(sym).trim().toUpperCase();
-  if (raw.includes('/')) return raw;
-  if (raw.endsWith('USD') && raw.length > 3) return `${raw.slice(0, -3)}/USD`;
-  return raw;
-};
-
 export default function App() {
   const [symbol, setSymbol] = useState('BTC/USD');
   const [status, setStatus] = useState('Checking backend…');
@@ -66,12 +38,12 @@ export default function App() {
   const [orders, setOrders] = useState([]);
   const [err, setErr] = useState('');
 
-  const BASE = getBase();
+  const BASE = getBackendBaseUrl();
 
   async function refreshHealth() {
     setErr('');
     try {
-      const res = await fetch(`${BASE}/health`);
+      const res = await fetch(`${BASE}/health`, { headers: getBackendHeaders() });
       setStatus(res.ok ? 'Backend: OK' : `Backend: ${res.status}`);
     } catch (e) {
       setStatus('Backend: unreachable');
@@ -82,7 +54,9 @@ export default function App() {
   async function refreshOrders() {
     setErr('');
     try {
-      const data = await getJson(`${BASE}/orders?status=open&nested=true`);
+      const res = await fetch(`${BASE}/orders?status=open&nested=true`, { headers: getBackendHeaders() });
+      if (!res.ok) throw new Error(`GET ${BASE}/orders -> ${res.status}`);
+      const data = await res.json();
       setOrders(Array.isArray(data) ? data : []);
     } catch (e) {
       setErr(String(e?.message || e));
@@ -99,7 +73,7 @@ export default function App() {
       if (trade && trade._fallback) {
         const r = await fetch(`${BASE}/orders`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...getHeaders() },
+          headers: getBackendHeaders(),
           body: JSON.stringify({ side: 'buy', symbol: pair, type: 'market', time_in_force: 'gtc' }),
         });
         if (!r.ok) throw new Error(`legacy_buy_failed ${r.status}`);

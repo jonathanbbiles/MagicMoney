@@ -1,4 +1,6 @@
-import { normalizeQuoteTsMs, isFresh as isFreshQuote } from '../../../shared/quoteUtils';
+const quoteUtils = require('../../../shared/quoteUtils');
+const normalizeQuoteTsMs = quoteUtils.normalizeQuoteTsMs;
+const isFreshQuote = quoteUtils.isFresh;
 
 export const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 
