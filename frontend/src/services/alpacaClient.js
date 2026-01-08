@@ -1,7 +1,7 @@
 import {
   BACKEND_BASE_URL,
-  BACKEND_HEADERS,
   DATA_LOCATIONS,
+  getBackendHeaders,
 } from '../config/alpaca';
 import { getSettings } from '../state/settingsStore';
 import { isoDaysAgo, isFresh, parseTsMs } from '../utils/format';
@@ -78,7 +78,8 @@ const fetchMarketData = async (type, url) => {
   }
 
   try {
-    const res = await fetchWithBudget(url, { headers: BACKEND_HEADERS }, MARKET_DATA_TIMEOUT_MS, MARKET_DATA_RETRIES);
+    const headers = getBackendHeaders();
+    const res = await fetchWithBudget(url, { headers }, MARKET_DATA_TIMEOUT_MS, MARKET_DATA_RETRIES);
     const status = res?.status;
     if (!res?.ok) {
       const body = await res.text().catch(() => '');
@@ -164,7 +165,8 @@ export const getPortfolioHistory = async ({ period = '1M', timeframe = '1D' } = 
     params: { period, timeframe, extended_hours: true },
     label: 'portfolio_history',
   });
-  const res = await fetchWithBudget(url, { headers: BACKEND_HEADERS });
+  const headers = getBackendHeaders();
+  const res = await fetchWithBudget(url, { headers });
   if (!res.ok) return null;
   return res.json().catch(() => null);
 };
@@ -184,7 +186,8 @@ export const getActivities = async ({ afterISO, untilISO, pageToken, types } = {
     params: Object.fromEntries(params.entries()),
     label: 'activities',
   });
-  const res = await fetchWithBudget(url, { headers: BACKEND_HEADERS });
+  const headers = getBackendHeaders();
+  const res = await fetchWithBudget(url, { headers });
   let items = [];
   let next = res.headers?.get?.('x-next-page-token') || null;
   try {
@@ -242,7 +245,8 @@ export const getPnLAndFeesSnapshot = async () => {
 
 export const getStockClock = async () => {
   try {
-    const res = await fetchWithBudget(`${BACKEND_BASE_URL}/clock`, { headers: BACKEND_HEADERS });
+    const headers = getBackendHeaders();
+    const res = await fetchWithBudget(`${BACKEND_BASE_URL}/clock`, { headers });
     if (!res.ok) return { is_open: false };
     const body = await res.json();
     return { is_open: !!body.is_open, next_open: body.next_open, next_close: body.next_close };
@@ -522,7 +526,8 @@ export const getQuoteSmart = async (symbol, preloadedMap = null) => {
 };
 
 export const getAccountSummaryRaw = async () => {
-  const res = await fetchWithBudget(`${BACKEND_BASE_URL}/account`, { headers: BACKEND_HEADERS });
+  const headers = getBackendHeaders();
+  const res = await fetchWithBudget(`${BACKEND_BASE_URL}/account`, { headers });
   if (!res.ok) throw new Error(`Account ${res.status}`);
   const body = await res.json();
   const num = (x) => {
@@ -572,7 +577,8 @@ export const getAccountSummaryRaw = async () => {
 
 export const getAllPositions = async () => {
   try {
-    const res = await fetchWithBudget(`${BACKEND_BASE_URL}/positions`, { headers: BACKEND_HEADERS });
+    const headers = getBackendHeaders();
+    const res = await fetchWithBudget(`${BACKEND_BASE_URL}/positions`, { headers });
     if (!res.ok) return [];
     const arr = await res.json();
     return Array.isArray(arr)
@@ -600,7 +606,7 @@ export const getAllPositionsCached = async (ttlMs = 2000) => {
 export const getOpenOrders = async () => {
   try {
     const res = await fetchWithBudget(`${BACKEND_BASE_URL}/orders?status=open&nested=true&limit=100`, {
-      headers: BACKEND_HEADERS,
+      headers: getBackendHeaders(),
     });
     if (!res.ok) return [];
     const arr = await res.json();
@@ -639,7 +645,7 @@ export const cancelOpenOrdersForSymbol = async (symbol, side = null) => {
       targets.map((o) =>
         fetchWithBudget(`${BACKEND_BASE_URL}/orders/${o.id}`, {
           method: 'DELETE',
-          headers: BACKEND_HEADERS,
+          headers: getBackendHeaders(),
         }).catch(() => null)
       )
     );
@@ -654,7 +660,7 @@ export const cancelAllOrders = async () => {
     const orders = await getOpenOrdersCached();
     await Promise.all(
       (orders || []).map((o) =>
-        fetchWithBudget(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: BACKEND_HEADERS }).catch(() => null)
+        fetchWithBudget(`${BACKEND_BASE_URL}/orders/${o.id}`, { method: 'DELETE', headers: getBackendHeaders() }).catch(() => null)
       )
     );
     openOrdersCache = { ts: 0, items: [] };

@@ -15,6 +15,14 @@ export const BACKEND_HEADERS = {
   'Content-Type': 'application/json',
 };
 
+export const getBackendBaseUrl = () => String(BACKEND_BASE_URL || '').replace(/\/+$/, '');
+export const getBackendHeaders = () => {
+  const token = EX.API_TOKEN || '';
+  const h = { Accept: 'application/json', 'Content-Type': 'application/json' };
+  if (token) h.Authorization = `Bearer ${token}`;
+  return h;
+};
+
 export const FEE_BPS_MAKER = 15;
 export const FEE_BPS_TAKER = 25;
 export const EQUITY_SEC_FEE_BPS = 0.35;
