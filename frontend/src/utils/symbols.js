@@ -1,4 +1,4 @@
-const sym = require('../../../shared/symbols');
+const sym = require('shared/symbols');
 
 export const normalizePair = sym.normalizePair;
 export const toAlpacaSymbol = sym.toAlpacaSymbol;
