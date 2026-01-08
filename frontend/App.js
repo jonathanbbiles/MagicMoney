@@ -9,7 +9,7 @@ import {
   StyleSheet,
   ActivityIndicator,
 } from 'react-native';
-import { getBackendBaseUrl, getBackendHeaders } from './src/config/alpaca';
+import { getApiToken, getBackendBaseUrl, getBackendHeaders } from './src/config/alpaca';
 import { normalizePair } from './src/utils/symbols';
 async function buyViaTrade(symbolRaw) {
   const symbol = String(symbolRaw || '').trim();
@@ -39,6 +39,7 @@ export default function App() {
   const [err, setErr] = useState('');
 
   const BASE = getBackendBaseUrl();
+  const tokenSet = Boolean(getApiToken());
 
   async function refreshHealth() {
     setErr('');
@@ -96,6 +97,7 @@ export default function App() {
       <View style={styles.header}>
         <Text style={styles.title}>Bullish or Bust</Text>
         <Text style={styles.sub}>{status}</Text>
+        <Text style={styles.debug}>Debug: baseUrl {BASE} · apiTokenSet {tokenSet ? 'true' : 'false'}</Text>
         {!!err && <Text style={styles.err}>{err}</Text>}
       </View>
 
@@ -149,6 +151,7 @@ const styles = StyleSheet.create({
   header: { padding: 16 },
   title: { fontSize: 22, fontWeight: '700', color: 'white' },
   sub: { marginTop: 4, color: '#9aa4af' },
+  debug: { marginTop: 4, color: '#64748b', fontSize: 12 },
   err: { marginTop: 4, color: '#ff6b6b' },
   row: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, gap: 8 },
   input: {
