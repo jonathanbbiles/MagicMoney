@@ -3,7 +3,26 @@ import Constants from 'expo-constants';
 export const VERSION = 'v1';
 const EX = Constants?.expoConfig?.extra || Constants?.manifest?.extra || {};
 
-export const BACKEND_BASE_URL = EX.BACKEND_BASE_URL || 'http://localhost:3000';
+const getEnvValue = (value) => {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  return trimmed ? trimmed : '';
+};
+
+const getExtraValue = (value) => {
+  if (value == null) return '';
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : '';
+};
+
+export const getBackendBaseUrl = () => {
+  const extraUrl = getExtraValue(EX.BACKEND_BASE_URL);
+  const envUrl = getEnvValue(typeof process !== 'undefined' ? process?.env?.BACKEND_BASE_URL : '');
+  const baseUrl = extraUrl || envUrl || 'https://magicmoney.onrender.com';
+  return String(baseUrl || '').replace(/\/+$/, '');
+};
+
+export const BACKEND_BASE_URL = getBackendBaseUrl();
 
 export const DATA_ROOT_CRYPTO = 'https://data.alpaca.markets/v1beta3/crypto';
 // IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
@@ -15,11 +34,19 @@ export const BACKEND_HEADERS = {
   'Content-Type': 'application/json',
 };
 
-export const getBackendBaseUrl = () => String(BACKEND_BASE_URL || '').replace(/\/+$/, '');
+export const getApiToken = () => {
+  const extraToken = getExtraValue(EX.API_TOKEN);
+  const envToken = getEnvValue(typeof process !== 'undefined' ? process?.env?.API_TOKEN : '');
+  return extraToken || envToken || '';
+};
+
 export const getBackendHeaders = () => {
-  const token = EX.API_TOKEN || '';
+  const token = getApiToken();
   const h = { Accept: 'application/json', 'Content-Type': 'application/json' };
-  if (token) h.Authorization = `Bearer ${token}`;
+  if (token) {
+    h.Authorization = `Bearer ${token}`;
+    h['x-api-key'] = token;
+  }
   return h;
 };
 
