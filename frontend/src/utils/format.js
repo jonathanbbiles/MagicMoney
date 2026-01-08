@@ -1,3 +1,5 @@
+import { normalizeQuoteTsMs, isFresh as isFreshQuote } from '../../../shared/quoteUtils';
+
 export const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
 
 export const fmtUSD = (n) =>
@@ -7,35 +9,11 @@ export const fmtUSD = (n) =>
 
 export const fmtPct = (n) => (Number.isFinite(n) ? `${n.toFixed(2)}%` : '—');
 
-export const normalizeQuoteTsMs = (rawTs) => {
-  if (rawTs == null) return null;
-  if (rawTs instanceof Date) {
-    const ts = rawTs.getTime();
-    return Number.isFinite(ts) ? ts : null;
-  }
-  if (typeof rawTs === 'string') {
-    const trimmed = rawTs.trim();
-    if (!trimmed) return null;
-    const numeric = Number(trimmed);
-    if (Number.isFinite(numeric)) return normalizeEpochNumber(numeric);
-    const parsed = Date.parse(trimmed);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  if (typeof rawTs === 'number') {
-    return normalizeEpochNumber(rawTs);
-  }
-  return null;
-};
-
-const normalizeEpochNumber = (rawTs) => {
-  if (!Number.isFinite(rawTs)) return null;
-  const abs = Math.abs(rawTs);
-  return abs < 2e10 ? abs * 1000 : abs;
-};
+export { normalizeQuoteTsMs };
 
 export const parseTsMs = normalizeQuoteTsMs;
 
-export const isFresh = (tsMs, ttlMs) => Number.isFinite(tsMs) && Date.now() - tsMs <= ttlMs;
+export const isFresh = isFreshQuote;
 
 export const emaArr = (arr, span) => {
   if (!arr?.length) return [];

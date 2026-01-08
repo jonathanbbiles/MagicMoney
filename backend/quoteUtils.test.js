@@ -3,7 +3,7 @@ const assert = require('assert/strict');
 const {
   normalizeQuoteTsMs,
   computeQuoteAgeMs,
-} = require('./quoteUtils');
+} = require('../shared/quoteUtils');
 
 const NOW_MS = 1_700_000_000_000;
 
