@@ -9,8 +9,8 @@ import {
   StyleSheet,
   ActivityIndicator,
 } from 'react-native';
-import { getBackendBaseUrl, getBackendHeaders } from './src/config/alpaca';
-import { normalizePair } from './src/utils/symbols';
+import { getBackendBaseUrl, getBackendHeaders } from 'src/config/alpaca';
+import { normalizePair } from 'src/utils/symbols';
 async function buyViaTrade(symbolRaw) {
   const symbol = String(symbolRaw || '').trim();
   if (!symbol) throw new Error('buyViaTrade: symbol required');

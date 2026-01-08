@@ -1,4 +1,4 @@
-const quoteUtils = require('../../../shared/quoteUtils');
+const quoteUtils = require('shared/quoteUtils');
 const normalizeQuoteTsMs = quoteUtils.normalizeQuoteTsMs;
 const isFreshQuote = quoteUtils.isFresh;
 
