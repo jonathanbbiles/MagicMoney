@@ -6,7 +6,7 @@ const { requireApiToken } = require('./auth');
 const { rateLimit } = require('./rateLimit');
 
 const {
-  placeMarketBuyThenSell,
+  placeMakerLimitBuyThenSell,
   initializeInventoryFromPositions,
   submitOrder,
   fetchOrders,
@@ -192,7 +192,7 @@ app.post('/trade', async (req, res) => {
 
   try {
 
-    const result = await placeMarketBuyThenSell(symbol);
+    const result = await placeMakerLimitBuyThenSell(symbol);
 
     res.json(result);
 
