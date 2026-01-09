@@ -120,7 +120,7 @@ function alpacaJsonHeaders() {
 
  
 
-const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 15);
+const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 25);
 const MIN_TRADE_QTY = Number(process.env.MIN_TRADE_QTY || 1e-6);
 const MARKET_DATA_TIMEOUT_MS = Number(process.env.MARKET_DATA_TIMEOUT_MS || 9000);
 const MARKET_DATA_RETRIES = Number(process.env.MARKET_DATA_RETRIES || 2);
@@ -142,14 +142,19 @@ const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
 const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
 const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 10000);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
-const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 40);
+const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
 
 const MAX_HOLD_SECONDS = Number(process.env.MAX_HOLD_SECONDS || 300);
 const MAX_HOLD_MS = Number(process.env.MAX_HOLD_MS || MAX_HOLD_SECONDS * 1000);
 
 const REPRICE_EVERY_SECONDS = readNumber('REPRICE_EVERY_SECONDS', 5);
 
-const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 120);
+const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 600);
+const ENTRY_FILL_TIMEOUT_SECONDS = readNumber('ENTRY_FILL_TIMEOUT_SECONDS', 30);
+const POST_ONLY_BUY = readFlag('POST_ONLY_BUY', true);
+const ENTRY_FALLBACK_MARKET = readFlag('ENTRY_FALLBACK_MARKET', false);
+const ALLOW_TAKER_BEFORE_TARGET = readFlag('ALLOW_TAKER_BEFORE_TARGET', false);
+const TAKER_TOUCH_MIN_INTERVAL_MS = readNumber('TAKER_TOUCH_MIN_INTERVAL_MS', 5000);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 100);
@@ -1118,7 +1123,12 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
     return { skipped: true, reason: 'spread_too_wide', spreadBps };
   }
 
-  const intendedNotional = Number(qty) * Number(limitPrice);
+  const qtyNum = Number(qty);
+  if (!Number.isFinite(qtyNum) || qtyNum <= 0) {
+    logSkip('invalid_qty', { symbol: normalizedSymbol, qty });
+    return { skipped: true, reason: 'invalid_qty' };
+  }
+  const intendedNotional = qtyNum * Number(limitPrice);
 
   const decision = Number.isFinite(intendedNotional) && intendedNotional >= MIN_ORDER_NOTIONAL_USD ? 'BUY' : 'SKIP';
 
@@ -1142,7 +1152,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
   const sizeGuard = guardTradeSize({
     symbol: normalizedSymbol,
-    qty,
+    qty: qtyNum,
     notional: intendedNotional,
     price: Number(limitPrice),
     side: 'buy',
@@ -1151,7 +1161,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
   if (sizeGuard.skip) {
     return { skipped: true, reason: 'below_min_trade', notionalUsd: sizeGuard.notional };
   }
-  const finalQty = sizeGuard.qty ?? adjustedQty;
+  const finalQty = sizeGuard.qty ?? qtyNum;
 
   // submit the limit buy order
 
@@ -1249,6 +1259,9 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
 
     entryPrice: avgPrice,
     entryOrderId: filledOrder.id || buyOrder?.id,
+    entryBid: bid,
+    entryAsk: ask,
+    entrySpreadBps: spreadBps,
 
   });
 
@@ -1694,6 +1707,86 @@ function normalizeFilledQty(order) {
   const raw = order?.filled_qty ?? order?.filledQty ?? order?.filled_quantity ?? order?.filledQuantity;
   const num = Number(raw);
   return Number.isFinite(num) ? num : 0;
+}
+
+async function waitForFilledOrder({ orderId, timeoutMs = 10000, pollIntervalMs = 1000 }) {
+  if (!orderId) return { order: null, filledQty: null, filledAvgPrice: null };
+  const start = Date.now();
+  let lastOrder = null;
+  let filledQty = null;
+  let filledAvgPrice = null;
+  while (Date.now() - start < timeoutMs) {
+    try {
+      lastOrder = await fetchOrderById(orderId);
+    } catch (err) {
+      console.warn('exit_order_fetch_failed', { orderId, error: err?.message || err });
+      await sleep(pollIntervalMs);
+      continue;
+    }
+    const qty = normalizeFilledQty(lastOrder);
+    const avgPrice = Number(lastOrder?.filled_avg_price ?? lastOrder?.filledAvgPrice ?? lastOrder?.filled_price);
+    if (Number.isFinite(qty) && qty > 0) {
+      filledQty = qty;
+    }
+    if (Number.isFinite(avgPrice) && avgPrice > 0) {
+      filledAvgPrice = avgPrice;
+    }
+    if (Number.isFinite(filledQty) && Number.isFinite(filledAvgPrice)) {
+      break;
+    }
+    await sleep(pollIntervalMs);
+  }
+  return { order: lastOrder, filledQty, filledAvgPrice };
+}
+
+async function logExitRealized({
+  symbol,
+  entryPrice,
+  feeBpsRoundTrip,
+  entrySpreadBpsUsed,
+  heldSeconds,
+  reasonCode,
+  orderId,
+}) {
+  if (!orderId) {
+    console.warn('exit_realized_missing_order', { symbol, reasonCode });
+    return;
+  }
+  const { filledQty, filledAvgPrice } = await waitForFilledOrder({ orderId });
+  const qtyFilled = Number.isFinite(filledQty) ? filledQty : null;
+  const exitPrice = Number.isFinite(filledAvgPrice) ? filledAvgPrice : null;
+  const entryPriceNum = Number(entryPrice);
+  const hasCalcInputs =
+    Number.isFinite(entryPriceNum) &&
+    entryPriceNum > 0 &&
+    Number.isFinite(exitPrice) &&
+    exitPrice > 0 &&
+    Number.isFinite(qtyFilled) &&
+    qtyFilled > 0;
+  const grossPnlUsd = hasCalcInputs ? (exitPrice - entryPriceNum) * qtyFilled : null;
+  const grossPnlBps = hasCalcInputs ? ((exitPrice - entryPriceNum) / entryPriceNum) * 10000 : null;
+  const feeBps = Number.isFinite(feeBpsRoundTrip) ? feeBpsRoundTrip : 0;
+  const spreadBps = Number.isFinite(entrySpreadBpsUsed) ? entrySpreadBpsUsed : 0;
+  const feeEstimateUsd = hasCalcInputs ? (feeBps / 10000) * entryPriceNum * qtyFilled : null;
+  const spreadEstimateUsd = hasCalcInputs ? (spreadBps / 10000) * entryPriceNum * qtyFilled : null;
+  const netPnlEstimateUsd =
+    hasCalcInputs && Number.isFinite(feeEstimateUsd) && Number.isFinite(spreadEstimateUsd)
+      ? grossPnlUsd - feeEstimateUsd - spreadEstimateUsd
+      : null;
+
+  console.log('exit_realized', {
+    symbol,
+    entryPrice: Number.isFinite(entryPriceNum) ? entryPriceNum : null,
+    exitPrice,
+    qtyFilled,
+    grossPnlUsd,
+    grossPnlBps,
+    feeEstimateUsd,
+    spreadEstimateUsd,
+    netPnlEstimateUsd,
+    heldSeconds,
+    reasonCode,
+  });
 }
 
 function isProfitableExit(entryPrice, exitPrice, feeBpsRoundTrip, profitBufferBps) {
@@ -2365,6 +2458,9 @@ async function handleBuyFill({
   entryPrice,
   entryOrderId,
   desiredNetExitBps,
+  entryBid,
+  entryAsk,
+  entrySpreadBps,
 
 }) {
 
@@ -2387,6 +2483,31 @@ async function handleBuyFill({
       console.warn('entry_order_fetch_failed', { symbol, entryOrderId, error: err?.message || err });
     }
   }
+  let entrySpreadBpsUsed = Number(entrySpreadBps);
+  if (!Number.isFinite(entrySpreadBpsUsed)) {
+    const bidNum = Number(entryBid);
+    const askNum = Number(entryAsk);
+    if (Number.isFinite(bidNum) && Number.isFinite(askNum) && bidNum > 0) {
+      entrySpreadBpsUsed = ((askNum - bidNum) / bidNum) * 10000;
+    }
+  }
+  if (!Number.isFinite(entrySpreadBpsUsed)) {
+    try {
+      const quote = await getLatestQuote(symbol);
+      const bidNum = Number(quote.bid);
+      const askNum = Number(quote.ask);
+      if (Number.isFinite(bidNum) && Number.isFinite(askNum) && bidNum > 0) {
+        entrySpreadBpsUsed = ((askNum - bidNum) / bidNum) * 10000;
+      }
+    } catch (err) {
+      console.warn('entry_spread_fetch_failed', { symbol, error: err?.message || err });
+    }
+  }
+  if (!Number.isFinite(entrySpreadBpsUsed)) {
+    entrySpreadBpsUsed = 0;
+    console.warn('entry_spread_unknown', { symbol });
+  }
+
   const entryFeeBps = inferEntryFeeBps({
     symbol,
     orderType: entryOrderType,
@@ -2394,25 +2515,34 @@ async function handleBuyFill({
   });
   const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
   const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
-  const desiredNetExitBpsValue = Number.isFinite(desiredNetExitBps)
+  let desiredNetExitBpsValue = Number.isFinite(desiredNetExitBps)
     ? Number(desiredNetExitBps)
     : (Number.isFinite(desiredExitBpsBySymbol.get(symbol)) ? desiredExitBpsBySymbol.get(symbol) : null);
   if (desiredNetExitBpsValue != null) {
     desiredExitBpsBySymbol.delete(symbol);
   }
   const profitBufferBps = PROFIT_BUFFER_BPS;
+  const slippageBpsUsed = SLIPPAGE_BPS;
+  const frictionBps = entrySpreadBpsUsed + slippageBpsUsed;
+  if (desiredNetExitBpsValue == null) {
+    desiredNetExitBpsValue = Math.max(USER_MIN_PROFIT_BPS, frictionBps);
+  } else if (Number.isFinite(desiredNetExitBpsValue) && desiredNetExitBpsValue < frictionBps) {
+    console.log('desired_exit_bps_raised', {
+      symbol,
+      desiredNetExitBps: desiredNetExitBpsValue,
+      frictionBps,
+    });
+    desiredNetExitBpsValue = frictionBps;
+  }
   const minNetProfitBps = computeMinNetProfitBps({
     feeBpsRoundTrip,
     profitBufferBps,
     desiredNetExitBps: desiredNetExitBpsValue,
   });
   const tickSize = getTickSize({ symbol, price: entryPriceNum });
-  const requiredExitBps = resolveRequiredExitBps({
-    desiredNetExitBps: desiredNetExitBpsValue,
-    feeBpsRoundTrip,
-    profitBufferBps,
-  });
+  const requiredExitBps = desiredNetExitBpsValue + feeBpsRoundTrip + profitBufferBps;
   const targetPrice = computeTargetSellPrice(entryPriceNum, requiredExitBps, tickSize);
+  const breakevenPrice = computeBreakevenPrice(entryPriceNum, minNetProfitBps);
   const postOnly = true;
   const wantOco = (process.env.EXIT_ORDER_CLASS || '').toLowerCase() === 'oco';
 
@@ -2423,6 +2553,10 @@ async function handleBuyFill({
     exitFeeBps,
     feeBpsRoundTrip,
     desiredNetExitBps: desiredNetExitBpsValue,
+    entrySpreadBpsUsed,
+    slippageBpsUsed,
+    requiredExitBps,
+    breakevenPrice,
     targetPrice,
     takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
     postOnly,
@@ -2487,6 +2621,9 @@ async function handleBuyFill({
     feeBpsRoundTrip,
     profitBufferBps,
     desiredNetExitBps: desiredNetExitBpsValue,
+    entrySpreadBpsUsed,
+    slippageBpsUsed,
+    requiredExitBps,
     entryFeeBps,
     exitFeeBps,
     entryOrderId: entryOrderId || null,
@@ -3057,17 +3194,20 @@ async function manageExitStates() {
           desiredNetExitBps,
         });
         const tickSize = getTickSize({ symbol, price: state.entryPrice });
-        const requiredExitBps = resolveRequiredExitBps({
-          desiredNetExitBps,
-          feeBpsRoundTrip,
-          profitBufferBps,
-        });
+        const requiredExitBps = Number.isFinite(state.requiredExitBps)
+          ? state.requiredExitBps
+          : resolveRequiredExitBps({
+            desiredNetExitBps,
+            feeBpsRoundTrip,
+            profitBufferBps,
+          });
         const targetPrice = computeTargetSellPrice(state.entryPrice, requiredExitBps, tickSize);
         state.targetPrice = targetPrice;
         state.minNetProfitBps = minNetProfitBps;
         state.feeBpsRoundTrip = feeBpsRoundTrip;
         state.profitBufferBps = profitBufferBps;
         state.desiredNetExitBps = desiredNetExitBps;
+        state.requiredExitBps = requiredExitBps;
         state.entryFeeBps = entryFeeBps;
         state.exitFeeBps = exitFeeBps;
         const breakevenPrice = computeBreakevenPrice(state.entryPrice, minNetProfitBps);
@@ -3153,11 +3293,14 @@ async function manageExitStates() {
         }
 
         const takerOnTouch = readFlag('TAKER_EXIT_ON_TOUCH', true);
-        const ttlMs = readNumber('SELL_ORDER_TTL_MS', 12000);
-        const lastSubmittedAt = Number.isFinite(state.sellOrderSubmittedAt) ? state.sellOrderSubmittedAt : null;
-        const shouldReplace = !state.sellOrderId || (!lastSubmittedAt || now - lastSubmittedAt >= ttlMs);
+        const lastActionAtMs = lastActionAt.get(symbol);
+        const takerTouchCooldownActive =
+          Number.isFinite(TAKER_TOUCH_MIN_INTERVAL_MS) &&
+          TAKER_TOUCH_MIN_INTERVAL_MS > 0 &&
+          Number.isFinite(lastActionAtMs) &&
+          now - lastActionAtMs < TAKER_TOUCH_MIN_INTERVAL_MS;
 
-        if (takerOnTouch && Number.isFinite(bid) && bid >= targetPrice && shouldReplace) {
+        if (takerOnTouch && Number.isFinite(bid) && bid >= targetPrice && !takerTouchCooldownActive) {
           if (state.sellOrderId) {
             await cancelOrderSafe(state.sellOrderId);
           }
@@ -3176,13 +3319,24 @@ async function manageExitStates() {
               Number.isFinite(requestedQty) && Number.isFinite(filledQty)
                 ? Math.max(requestedQty - filledQty, 0)
                 : null;
+            let realizedOrderId = iocResult?.order?.id || iocResult?.order?.order_id || null;
             if (remainingQty && remainingQty > 0) {
-              await submitMarketSell({ symbol, qty: remainingQty, reason: 'target_touch_fallback' });
+              const marketOrder = await submitMarketSell({ symbol, qty: remainingQty, reason: 'target_touch_fallback' });
+              realizedOrderId = marketOrder?.id || marketOrder?.order_id || realizedOrderId;
             }
             exitState.delete(symbol);
             actionTaken = 'target_touch_taker';
             reasonCode = 'target_touch_taker';
             lastActionAt.set(symbol, now);
+            await logExitRealized({
+              symbol,
+              entryPrice: state.entryPrice,
+              feeBpsRoundTrip,
+              entrySpreadBpsUsed: state.entrySpreadBpsUsed,
+              heldSeconds,
+              reasonCode,
+              orderId: realizedOrderId,
+            });
             logExitDecision({
               symbol,
               heldSeconds,
@@ -3243,22 +3397,33 @@ async function manageExitStates() {
               Number.isFinite(requestedQty) && Number.isFinite(filledQty)
                 ? Math.max(requestedQty - filledQty, 0)
                 : null;
+            let realizedOrderId = ioc?.order?.id || ioc?.order?.order_id || null;
             if (
               ioc?.skipped ||
               remainingQty == null ||
               remainingQty > 0 ||
               ['canceled', 'expired', 'rejected'].includes(iocStatus)
             ) {
-              await submitMarketSell({
+              const marketOrder = await submitMarketSell({
                 symbol,
                 qty: Number.isFinite(remainingQty) && remainingQty > 0 ? remainingQty : state.qty,
                 reason: 'hard_stop_market',
               });
+              realizedOrderId = marketOrder?.id || marketOrder?.order_id || realizedOrderId;
             }
             exitState.delete(symbol);
             actionTaken = 'hard_stop_exit';
             reasonCode = 'hard_stop';
             lastActionAt.set(symbol, now);
+            await logExitRealized({
+              symbol,
+              entryPrice: state.entryPrice,
+              feeBpsRoundTrip,
+              entrySpreadBpsUsed: state.entrySpreadBpsUsed,
+              heldSeconds,
+              reasonCode,
+              orderId: realizedOrderId,
+            });
             logExitDecision({
               symbol,
               heldSeconds,
@@ -3306,13 +3471,22 @@ async function manageExitStates() {
 
         }
 
-        await submitMarketSell({ symbol, qty: state.qty, reason: 'kill_switch' });
+        const marketOrder = await submitMarketSell({ symbol, qty: state.qty, reason: 'kill_switch' });
 
         exitState.delete(symbol);
 
         actionTaken = 'forced_exit_timeout';
         reasonCode = 'kill_switch';
         lastActionAt.set(symbol, now);
+        await logExitRealized({
+          symbol,
+          entryPrice: state.entryPrice,
+          feeBpsRoundTrip,
+          entrySpreadBpsUsed: state.entrySpreadBpsUsed,
+          heldSeconds,
+          reasonCode,
+          orderId: marketOrder?.id || marketOrder?.order_id || null,
+        });
         console.log('forced_exit_elapsed', { symbol, heldSeconds, limitSeconds: FORCE_EXIT_SECONDS });
         const decisionPath = bidMeetsBreakeven ? 'taker_ioc' : (askMeetsBreakeven ? 'maker_post_only' : 'hold_not_profitable');
         const loggedLastCancelReplaceAt = lastCancelReplaceAt.get(symbol) || lastCancelReplaceAtMs;
@@ -3381,13 +3555,22 @@ async function manageExitStates() {
 
           }
 
-          await submitMarketSell({ symbol, qty: state.qty, reason: 'max_hold' });
+          const marketOrder = await submitMarketSell({ symbol, qty: state.qty, reason: 'max_hold' });
 
           exitState.delete(symbol);
 
           actionTaken = 'max_hold_exit';
           reasonCode = 'max_hold';
           lastActionAt.set(symbol, now);
+          await logExitRealized({
+            symbol,
+            entryPrice: state.entryPrice,
+            feeBpsRoundTrip,
+            entrySpreadBpsUsed: state.entrySpreadBpsUsed,
+            heldSeconds,
+            reasonCode,
+            orderId: marketOrder?.id || marketOrder?.order_id || null,
+          });
           const decisionPath = bidMeetsBreakeven ? 'taker_ioc' : (askMeetsBreakeven ? 'maker_post_only' : 'hold_not_profitable');
           const loggedLastCancelReplaceAt = lastCancelReplaceAt.get(symbol) || lastCancelReplaceAtMs;
           const loggedLastRepriceAgeMs = Number.isFinite(loggedLastCancelReplaceAt) ? now - loggedLastCancelReplaceAt : null;
@@ -3450,7 +3633,7 @@ async function manageExitStates() {
       const repriceCooldownActive =
         Number.isFinite(lastRepriceAgeMs) && lastRepriceAgeMs < MIN_REPRICE_INTERVAL_MS;
 
-      if (bidMeetsBreakeven && Number.isFinite(bid)) {
+      if (ALLOW_TAKER_BEFORE_TARGET && bidMeetsBreakeven && Number.isFinite(bid)) {
         if (state.sellOrderId) {
           await cancelOrderSafe(state.sellOrderId);
           lastCancelReplaceAt.set(symbol, now);
@@ -3478,6 +3661,15 @@ async function manageExitStates() {
           reasonCode = 'taker_ioc';
           decisionPath = 'taker_ioc';
           lastActionAt.set(symbol, now);
+          await logExitRealized({
+            symbol,
+            entryPrice: state.entryPrice,
+            feeBpsRoundTrip,
+            entrySpreadBpsUsed: state.entrySpreadBpsUsed,
+            heldSeconds,
+            reasonCode,
+            orderId: iocResult?.order?.id || iocResult?.order?.order_id || null,
+          });
         } else {
           actionTaken = 'hold_existing_order';
           reasonCode = iocResult?.reason || 'taker_ioc_skipped';
@@ -3789,6 +3981,166 @@ function startExitManager() {
 
 // covering taker fees and profit target
 
+async function placeMakerLimitBuyThenSell(symbol) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const openOrders = await fetchOrders({ status: 'open' });
+  if (hasOpenOrderForIntent(openOrders, { symbol: normalizedSymbol, side: 'BUY', intent: 'ENTRY' })) {
+    console.log('hold_existing_order', { symbol: normalizedSymbol, side: 'buy', reason: 'existing_entry_intent' });
+    return { skipped: true, reason: 'existing_entry_intent' };
+  }
+  let bid = null;
+  let ask = null;
+  let spreadBps = null;
+  try {
+    const quote = await getLatestQuote(normalizedSymbol);
+    bid = quote.bid;
+    ask = quote.ask;
+    if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
+      spreadBps = ((ask - bid) / bid) * 10000;
+    }
+  } catch (err) {
+    console.warn('entry_quote_failed', { symbol: normalizedSymbol, error: err?.message || err });
+  }
+  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
+    logSkip('spread_too_wide', { symbol: normalizedSymbol, bid, ask, spreadBps });
+    return { skipped: true, reason: 'spread_too_wide', spreadBps };
+  }
+
+  const account = await getAccountInfo();
+  const portfolioValue = account.portfolioValue;
+  const buyingPower = account.buyingPower;
+  const targetTradeAmount = portfolioValue * 0.1;
+  const amountToSpend = Math.min(targetTradeAmount, buyingPower);
+  const decision = Number.isFinite(amountToSpend) && amountToSpend >= MIN_ORDER_NOTIONAL_USD ? 'BUY' : 'SKIP';
+
+  logBuyDecision(normalizedSymbol, amountToSpend, decision);
+
+  if (decision === 'SKIP') {
+    logSkip('notional_too_small', {
+      symbol: normalizedSymbol,
+      intendedNotional: amountToSpend,
+      minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
+    });
+    return { skipped: true, reason: 'notional_too_small', notionalUsd: amountToSpend };
+  }
+
+  const tickSize = getTickSize({ symbol: normalizedSymbol, price: bid });
+  const limitBuyPrice = roundToTick(Number(bid), tickSize, 'down');
+  if (!Number.isFinite(limitBuyPrice) || limitBuyPrice <= 0) {
+    logSkip('invalid_quote', { symbol: normalizedSymbol, bid, ask });
+    return { skipped: true, reason: 'invalid_quote' };
+  }
+
+  const qty = roundQty(amountToSpend / limitBuyPrice);
+  if (!Number.isFinite(qty) || qty <= 0) {
+    logSkip('invalid_qty', { symbol: normalizedSymbol, qty });
+    return { skipped: true, reason: 'invalid_qty' };
+  }
+
+  const sizeGuard = guardTradeSize({
+    symbol: normalizedSymbol,
+    qty,
+    notional: amountToSpend,
+    price: limitBuyPrice,
+    side: 'buy',
+    context: 'maker_limit_buy',
+  });
+  if (sizeGuard.skip) {
+    return { skipped: true, reason: 'below_min_trade', notionalUsd: sizeGuard.notional };
+  }
+  const finalQty = sizeGuard.qty ?? qty;
+
+  const buyOrderUrl = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'orders',
+    label: 'orders_limit_buy',
+  });
+  const buyPayload = {
+    symbol: toTradeSymbol(normalizedSymbol),
+    qty: finalQty,
+    side: 'buy',
+    type: 'limit',
+    time_in_force: 'gtc',
+    limit_price: limitBuyPrice,
+    client_order_id: buildEntryClientOrderId(normalizedSymbol),
+  };
+  if (POST_ONLY_BUY && isCryptoSymbol(normalizedSymbol)) {
+    buyPayload.post_only = true;
+  }
+  const buyOrder = await placeOrderUnified({
+    symbol: normalizedSymbol,
+    url: buyOrderUrl,
+    payload: buyPayload,
+    label: 'orders_limit_buy',
+    reason: 'maker_limit_buy',
+    context: 'maker_limit_buy',
+  });
+
+  const timeoutMs = ENTRY_FILL_TIMEOUT_SECONDS * 1000;
+  const start = Date.now();
+  let filledOrder = buyOrder;
+  while (Date.now() - start < timeoutMs) {
+    const checkUrl = buildAlpacaUrl({
+      baseUrl: ALPACA_BASE_URL,
+      path: `orders/${buyOrder.id}`,
+      label: 'orders_limit_buy_check',
+    });
+    let check;
+    try {
+      check = await requestJson({
+        method: 'GET',
+        url: checkUrl,
+        headers: alpacaHeaders(),
+      });
+    } catch (err) {
+      logHttpError({
+        symbol: normalizedSymbol,
+        label: 'orders',
+        url: checkUrl,
+        error: err,
+      });
+      throw err;
+    }
+    filledOrder = check;
+    if (filledOrder.status === 'filled') break;
+    if (['canceled', 'expired', 'rejected'].includes(String(filledOrder.status || '').toLowerCase())) {
+      break;
+    }
+    await sleep(1000);
+  }
+
+  if (filledOrder.status !== 'filled') {
+    if (buyOrder?.id) {
+      await cancelOrderSafe(buyOrder.id);
+    }
+    if (ENTRY_FALLBACK_MARKET && Number.isFinite(spreadBps) && spreadBps <= MAX_SPREAD_BPS_TO_TRADE) {
+      console.log('entry_fallback_market', { symbol: normalizedSymbol, spreadBps });
+      return placeMarketBuyThenSell(normalizedSymbol);
+    }
+    return { skipped: true, reason: 'entry_not_filled' };
+  }
+
+  const avgPrice = parseFloat(filledOrder.filled_avg_price);
+  updateInventoryFromBuy(normalizedSymbol, filledOrder.filled_qty, avgPrice);
+  const inventory = inventoryState.get(normalizedSymbol);
+  if (!inventory || inventory.qty <= 0) {
+    logSkip('no_inventory_for_sell', { symbol: normalizedSymbol, qty: filledOrder.filled_qty });
+    return { buy: filledOrder, sell: null, sellError: 'No inventory to sell' };
+  }
+
+  const sellOrder = await handleBuyFill({
+    symbol: normalizedSymbol,
+    qty: filledOrder.filled_qty,
+    entryPrice: avgPrice,
+    entryOrderId: filledOrder.id || buyOrder?.id,
+    entryBid: bid,
+    entryAsk: ask,
+    entrySpreadBps: spreadBps,
+  });
+
+  return { buy: filledOrder, sell: sellOrder };
+}
+
 async function placeMarketBuyThenSell(symbol) {
 
   const normalizedSymbol = normalizeSymbol(symbol);
@@ -3978,6 +4330,9 @@ async function placeMarketBuyThenSell(symbol) {
 
       entryPrice: avgPrice,
       entryOrderId: filled.id || buyOrder?.id,
+      entryBid: bid,
+      entryAsk: ask,
+      entrySpreadBps: spreadBps,
 
     });
 
@@ -4482,6 +4837,8 @@ async function getAlpacaConnectivityStatus() {
 module.exports = {
 
   placeLimitBuyThenSell,
+
+  placeMakerLimitBuyThenSell,
 
   placeMarketBuyThenSell,
 
