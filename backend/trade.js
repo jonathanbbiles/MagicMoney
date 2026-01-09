@@ -7,7 +7,6 @@ const {
   normalizeQuoteTsMs,
   computeQuoteAgeMs,
   normalizeQuoteAgeMs,
-  isStaleQuoteAge,
 } = require('./quoteUtils');
 const { canonicalAsset, normalizePair, alpacaSymbol } = require('./symbolUtils');
 
@@ -163,7 +162,7 @@ const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS |
 const OPEN_POSITIONS_CACHE_TTL_MS = 1500;
 const OPEN_ORDERS_CACHE_TTL_MS = 1500;
 const ACCOUNT_CACHE_TTL_MS = 2000;
-const QUOTE_CACHE_MAX_AGE_MS = MAX_QUOTE_AGE_MS;
+const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
@@ -1855,7 +1854,8 @@ function isProfitableExit(entryPrice, exitPrice, feeBpsRoundTrip, profitBufferBp
   return netBps >= computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps });
 }
 
-async function fetchFallbackTradeQuote(symbol, nowMs) {
+async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
+  const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
   const isCrypto = isCryptoSymbol(symbol);
   const dataSymbol = isCrypto ? toDataSymbol(symbol) : symbol;
   const url = isCrypto
@@ -1903,7 +1903,7 @@ async function fetchFallbackTradeQuote(symbol, nowMs) {
     logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(rawAgeMs) });
     return null;
   }
-  if (isStaleQuoteAge(ageMs)) {
+  if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMs) {
     logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(ageMs) });
     return null;
   }
@@ -1918,9 +1918,10 @@ async function fetchFallbackTradeQuote(symbol, nowMs) {
   };
 }
 
-async function getLatestQuote(rawSymbol) {
+async function getLatestQuote(rawSymbol, opts = {}) {
 
   const symbol = normalizeSymbol(rawSymbol);
+  const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
 
   const nowMs = Date.now();
   const cached = quoteCache.get(symbol);
@@ -1932,7 +1933,7 @@ async function getLatestQuote(rawSymbol) {
   if (Number.isFinite(cachedAgeMsRaw)) {
     logQuoteAgeWarning({ symbol, ageMs: cachedAgeMsRaw, source: cached?.source || 'cache', tsMs: cachedTsMs });
   }
-  if (Number.isFinite(cachedAgeMs) && cachedAgeMs <= QUOTE_CACHE_MAX_AGE_MS) {
+  if (Number.isFinite(cachedAgeMs) && cachedAgeMs <= effectiveMaxAgeMs) {
     recordLastQuoteAt(symbol, { tsMs: cachedTsMs, source: 'cache' });
     return {
       bid: cached.bid,
@@ -1971,7 +1972,7 @@ async function getLatestQuote(rawSymbol) {
   }
 
   const tryFallbackTradeQuote = async () => {
-    const fallback = await fetchFallbackTradeQuote(symbol, nowMs);
+    const fallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMs });
     if (!fallback) return null;
     quoteCache.set(symbol, fallback);
     recordLastQuoteAt(symbol, { tsMs: fallback.tsMs, source: fallback.source });
@@ -2069,7 +2070,7 @@ async function getLatestQuote(rawSymbol) {
     throw new Error(`Quote age absurd for ${symbol}`);
   }
 
-  if (isStaleQuoteAge(ageMs)) {
+  if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMs) {
     const fallbackQuote = await tryFallbackTradeQuote();
     if (fallbackQuote) {
       return fallbackQuote;
@@ -2551,7 +2552,7 @@ async function handleBuyFill({
   }
   if (!Number.isFinite(entrySpreadBpsUsed)) {
     try {
-      const quote = await getLatestQuote(symbol);
+      const quote = await getLatestQuote(symbol, { maxAgeMs: EXIT_QUOTE_MAX_AGE_MS });
       const bidNum = Number(quote.bid);
       const askNum = Number(quote.ask);
       if (Number.isFinite(bidNum) && Number.isFinite(askNum) && bidNum > 0) {
@@ -2765,6 +2766,7 @@ async function repairOrphanExits() {
   let placed = 0;
   let skipped = 0;
   let failed = 0;
+  let adopted = 0;
 
   console.log('exit_repair_pass_start', {
     positions: Array.isArray(positions) ? positions.length : 0,
@@ -2805,17 +2807,44 @@ async function repairOrphanExits() {
     let ask = null;
 
     try {
-      const quote = await getLatestQuote(symbol);
+      const quote = await getLatestQuote(symbol, { maxAgeMs: EXIT_QUOTE_MAX_AGE_MS });
       bid = quote.bid;
       ask = quote.ask;
     } catch (err) {
       console.warn('exit_repair_quote_failed', { symbol, error: err?.message || err });
     }
 
-    const hasOpenSell = openSellSymbols.has(symbol);
+    let openSellOrders = openSellsBySymbol.get(symbol) || [];
+    let hasOpenSell = openSellOrders.length > 0;
     const hasTrackedExit = exitState.has(symbol);
     let decision = 'SKIP:unknown';
     let targetPrice = null;
+
+    if (hasOpenSell) {
+      const openSellQty = openSellOrders.reduce((sum, order) => {
+        const orderQty = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
+        return Number.isFinite(orderQty) ? sum + orderQty : sum;
+      }, 0);
+      const hasValidLimit = openSellOrders.some((order) => {
+        const limitPrice = Number(order?.limit_price ?? order?.limitPrice ?? order?.limit);
+        return Number.isFinite(limitPrice) && limitPrice > 0;
+      });
+      const unusableOpenSell =
+        !Number.isFinite(openSellQty) ||
+        openSellQty <= 0 ||
+        isDustQty(openSellQty) ||
+        !hasValidLimit;
+      if (unusableOpenSell) {
+        for (const order of openSellOrders) {
+          const orderId = order?.id || order?.order_id;
+          if (orderId) {
+            await cancelOrderSafe(orderId);
+          }
+        }
+        openSellOrders = [];
+        hasOpenSell = false;
+      }
+    }
 
     if (!Number.isFinite(qty) || qty <= 0) {
       decision = 'SKIP:non_positive_qty';
@@ -2895,8 +2924,8 @@ async function repairOrphanExits() {
       });
     }
 
-    if (hasOpenSell) {
-      decision = 'SKIP:open_sell';
+    if (!Number.isFinite(avgEntryPrice) || avgEntryPrice <= 0) {
+      decision = 'SKIP:missing_cost_basis';
       skipped += 1;
       logExitRepairDecision({
         symbol,
@@ -2915,10 +2944,114 @@ async function repairOrphanExits() {
       continue;
     }
 
-    console.warn('exit_orphan_detected', { symbol, qty });
+    const notionalUsd = qty * avgEntryPrice;
+    const entryFeeBps = inferEntryFeeBps({ symbol, orderType, postOnly: true });
+    const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
+    const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
+    const exitFloorBps = computeExitFloorBps({ exitFeeBps });
+    const slippageBps = Number.isFinite(SLIPPAGE_BPS) ? SLIPPAGE_BPS : null;
+    const desiredNetExitBps = Number.isFinite(desiredExitBpsBySymbol.get(symbol))
+      ? desiredExitBpsBySymbol.get(symbol)
+      : Math.max(
+        USER_MIN_PROFIT_BPS,
+        Number.isFinite(exitFloorBps) ? exitFloorBps + (Number.isFinite(slippageBps) ? slippageBps : 0) : USER_MIN_PROFIT_BPS
+      );
+    const profitBufferBps = PROFIT_BUFFER_BPS;
+    const minNetProfitBps = computeMinNetProfitBps({
+      feeBpsRoundTrip,
+      profitBufferBps,
+      desiredNetExitBps,
+    });
+    const tickSize = getTickSize({ symbol, price: avgEntryPrice });
+    const requiredExitBps = resolveRequiredExitBps({
+      desiredNetExitBps,
+      feeBpsRoundTrip,
+      profitBufferBps,
+    });
+    targetPrice = computeTargetSellPrice(avgEntryPrice, requiredExitBps, tickSize);
+    const postOnly = true;
 
-    if (!Number.isFinite(avgEntryPrice) || avgEntryPrice <= 0) {
-      decision = 'SKIP:missing_cost_basis';
+    if (hasOpenSell && !hasTrackedExit) {
+      const bestOrder = openSellOrders
+        .map((order) => {
+          const orderQty = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
+          const limitPrice = Number(order?.limit_price ?? order?.limitPrice ?? order?.limit);
+          return { order, orderQty, limitPrice };
+        })
+        .filter((item) => Number.isFinite(item.orderQty) && item.orderQty > 0 && Number.isFinite(item.limitPrice))
+        .reduce((best, current) => {
+          if (!best) return current;
+          if (current.orderQty > best.orderQty) return current;
+          if (current.orderQty < best.orderQty) return best;
+          if (!Number.isFinite(targetPrice)) return best;
+          const bestDiff = Math.abs(best.limitPrice - targetPrice);
+          const currentDiff = Math.abs(current.limitPrice - targetPrice);
+          return currentDiff < bestDiff ? current : best;
+        }, null);
+      if (bestOrder) {
+        const adoptedOrder = bestOrder.order;
+        const adoptedOrderId = adoptedOrder?.id || adoptedOrder?.order_id || null;
+        const sellOrderSubmittedAtRaw =
+          adoptedOrder?.submitted_at ||
+          adoptedOrder?.submittedAt ||
+          adoptedOrder?.created_at ||
+          adoptedOrder?.createdAt ||
+          null;
+        const sellOrderSubmittedAt = sellOrderSubmittedAtRaw ? Date.parse(sellOrderSubmittedAtRaw) : null;
+        const now = Date.now();
+        const sellOrderSubmittedAtMs = Number.isFinite(sellOrderSubmittedAt) ? sellOrderSubmittedAt : now;
+        const entryTime = Number.isFinite(sellOrderSubmittedAt) ? sellOrderSubmittedAt : now;
+        exitState.set(symbol, {
+          symbol,
+          qty,
+          entryPrice: avgEntryPrice,
+          entryTime,
+          notionalUsd,
+          minNetProfitBps,
+          targetPrice,
+          feeBpsRoundTrip,
+          profitBufferBps,
+          desiredNetExitBps,
+          entryFeeBps,
+          exitFeeBps,
+          requiredExitBps,
+          sellOrderId: adoptedOrderId,
+          sellOrderSubmittedAt: sellOrderSubmittedAtMs,
+          sellOrderLimit: bestOrder.limitPrice,
+          takerAttempted: false,
+          entryOrderId: null,
+        });
+        desiredExitBpsBySymbol.delete(symbol);
+        console.log('exit_repair_adopt_open_sell', {
+          symbol,
+          adoptedOrderId,
+          adoptedLimitPrice: bestOrder.limitPrice,
+          qty,
+          entryPrice: avgEntryPrice,
+          targetPrice,
+        });
+        decision = 'ADOPT:open_sell_untracked';
+        adopted += 1;
+        logExitRepairDecision({
+          symbol,
+          qty,
+          avgEntryPrice,
+          costBasis,
+          bid,
+          ask,
+          targetPrice,
+          timeInForce,
+          orderType,
+          hasOpenSell,
+          gates: gateFlags,
+          decision,
+        });
+        continue;
+      }
+    }
+
+    if (hasOpenSell) {
+      decision = 'SKIP:open_sell';
       skipped += 1;
       logExitRepairDecision({
         symbol,
@@ -3017,32 +3150,7 @@ async function repairOrphanExits() {
       continue;
     }
 
-    const notionalUsd = qty * avgEntryPrice;
-    const entryFeeBps = inferEntryFeeBps({ symbol, orderType, postOnly: true });
-    const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
-    const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
-    const exitFloorBps = computeExitFloorBps({ exitFeeBps });
-    const slippageBps = Number.isFinite(SLIPPAGE_BPS) ? SLIPPAGE_BPS : null;
-    const desiredNetExitBps = Number.isFinite(desiredExitBpsBySymbol.get(symbol))
-      ? desiredExitBpsBySymbol.get(symbol)
-      : Math.max(
-        USER_MIN_PROFIT_BPS,
-        Number.isFinite(exitFloorBps) ? exitFloorBps + (Number.isFinite(slippageBps) ? slippageBps : 0) : USER_MIN_PROFIT_BPS
-      );
-    const profitBufferBps = PROFIT_BUFFER_BPS;
-    const minNetProfitBps = computeMinNetProfitBps({
-      feeBpsRoundTrip,
-      profitBufferBps,
-      desiredNetExitBps,
-    });
-    const tickSize = getTickSize({ symbol, price: avgEntryPrice });
-    const requiredExitBps = resolveRequiredExitBps({
-      desiredNetExitBps,
-      feeBpsRoundTrip,
-      profitBufferBps,
-    });
-    targetPrice = computeTargetSellPrice(avgEntryPrice, requiredExitBps, tickSize);
-    const postOnly = true;
+    console.warn('exit_orphan_detected', { symbol, qty });
 
     console.log('tp_attach_plan', {
       symbol,
@@ -3160,8 +3268,8 @@ async function repairOrphanExits() {
     }
   }
 
-  console.log('exit_repair_pass_done', { placed, skipped, failed });
-  return { placed, skipped, failed };
+  console.log('exit_repair_pass_done', { placed, skipped, failed, adopted });
+  return { placed, skipped, failed, adopted };
 }
 
 async function manageExitStates() {
@@ -3213,7 +3321,7 @@ async function manageExitStates() {
 
         try {
 
-          const quote = await getLatestQuote(symbol);
+          const quote = await getLatestQuote(symbol, { maxAgeMs: EXIT_QUOTE_MAX_AGE_MS });
 
           bid = quote.bid;
 
