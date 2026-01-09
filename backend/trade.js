@@ -160,6 +160,9 @@ const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 100);
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
+const OPEN_POSITIONS_CACHE_TTL_MS = 1500;
+const OPEN_ORDERS_CACHE_TTL_MS = 1500;
+const ACCOUNT_CACHE_TTL_MS = 2000;
 const QUOTE_CACHE_MAX_AGE_MS = MAX_QUOTE_AGE_MS;
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
@@ -183,6 +186,21 @@ const positionsSnapshot = {
   mapBySymbol: new Map(),
   mapByRaw: new Map(),
   loggedNoneSymbols: new Set(),
+  pending: null,
+};
+const openOrdersCache = {
+  tsMs: 0,
+  data: null,
+  pending: null,
+};
+const openPositionsCache = {
+  tsMs: 0,
+  data: null,
+  pending: null,
+};
+const accountCache = {
+  tsMs: 0,
+  data: null,
   pending: null,
 };
 let lastHttpError = null;
@@ -751,8 +769,9 @@ function buildIntentClientOrderId({ symbol, side, intent, ref }) {
   const normalized = canonicalAsset(symbol) || 'UNKNOWN';
   const safeSide = String(side || '').toUpperCase();
   const safeIntent = String(intent || '').toUpperCase();
-  const suffix = ref || getOrderIntentBucket();
-  return `BOT:${normalized}:${safeSide}:${safeIntent}:${suffix}`;
+  const bucket = ref ?? getOrderIntentBucket();
+  const nonce = randomUUID().slice(0, 8);
+  return `BOT:${normalized}:${safeSide}:${safeIntent}:${bucket}:${nonce}`;
 }
 
 function buildEntryClientOrderId(symbol) {
@@ -1368,12 +1387,29 @@ async function getAccountInfo() {
 }
 
 async function fetchAccount() {
+  const nowMs = Date.now();
+  if (accountCache.data && nowMs - accountCache.tsMs < ACCOUNT_CACHE_TTL_MS) {
+    return accountCache.data;
+  }
+  if (accountCache.pending) {
+    return accountCache.pending;
+  }
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'account', label: 'account_raw' });
-  return requestJson({
-    method: 'GET',
-    url,
-    headers: alpacaHeaders(),
-  });
+  accountCache.pending = (async () => {
+    const data = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+    accountCache.data = data;
+    accountCache.tsMs = Date.now();
+    return data;
+  })();
+  try {
+    return await accountCache.pending;
+  } finally {
+    accountCache.pending = null;
+  }
 }
 
 async function fetchPortfolioHistory(params = {}) {
@@ -4577,57 +4613,91 @@ async function fetchOrders(params = {}) {
 }
 
 async function fetchOpenPositions() {
-  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions_list' });
-  let res;
-  try {
-    res = await requestJson({
-      method: 'GET',
-      url,
-      headers: alpacaHeaders(),
-    });
-  } catch (err) {
-    logHttpError({ label: 'positions', url, error: err });
-    throw err;
+  const nowMs = Date.now();
+  if (openPositionsCache.data && nowMs - openPositionsCache.tsMs < OPEN_POSITIONS_CACHE_TTL_MS) {
+    return openPositionsCache.data;
   }
-  const positions = Array.isArray(res) ? res : [];
-  updatePositionsSnapshot(
-    positions.map((pos) => ({
-      ...pos,
-      rawSymbol: pos.symbol,
-      pairSymbol: normalizeSymbol(pos.symbol),
-      symbol: normalizeSymbol(pos.symbol),
-    }))
-  );
-  return positions
-    .map((pos) => {
-      const qty = Number(pos.qty ?? pos.quantity ?? 0);
-      const pairSymbol = normalizeSymbol(pos.symbol);
-      return {
+  if (openPositionsCache.pending) {
+    return openPositionsCache.pending;
+  }
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions_list' });
+  openPositionsCache.pending = (async () => {
+    let res;
+    try {
+      res = await requestJson({
+        method: 'GET',
+        url,
+        headers: alpacaHeaders(),
+      });
+    } catch (err) {
+      logHttpError({ label: 'positions', url, error: err });
+      throw err;
+    }
+    const positions = Array.isArray(res) ? res : [];
+    updatePositionsSnapshot(
+      positions.map((pos) => ({
+        ...pos,
         rawSymbol: pos.symbol,
-        pairSymbol,
-        symbol: pairSymbol,
-        qty,
-        isDust: isDustQty(qty),
-      };
-    })
-    .filter((pos) => Number.isFinite(pos.qty) && pos.qty !== 0);
+        pairSymbol: normalizeSymbol(pos.symbol),
+        symbol: normalizeSymbol(pos.symbol),
+      }))
+    );
+    const normalized = positions
+      .map((pos) => {
+        const qty = Number(pos.qty ?? pos.quantity ?? 0);
+        const pairSymbol = normalizeSymbol(pos.symbol);
+        return {
+          rawSymbol: pos.symbol,
+          pairSymbol,
+          symbol: pairSymbol,
+          qty,
+          isDust: isDustQty(qty),
+        };
+      })
+      .filter((pos) => Number.isFinite(pos.qty) && pos.qty !== 0);
+    openPositionsCache.data = normalized;
+    openPositionsCache.tsMs = Date.now();
+    return normalized;
+  })();
+  try {
+    return await openPositionsCache.pending;
+  } finally {
+    openPositionsCache.pending = null;
+  }
 }
 
 async function fetchOpenOrders() {
-  const orders = await fetchOrders({ status: 'open' });
-  const list = Array.isArray(orders) ? orders : [];
-  return list.map((order) => ({
-    id: order.id || order.order_id,
-    client_order_id: order.client_order_id,
-    rawSymbol: order.rawSymbol ?? order.symbol,
-    pairSymbol: normalizeSymbol(order.symbol),
-    symbol: normalizeSymbol(order.symbol),
-    side: order.side,
-    status: order.status,
-    limit_price: order.limit_price,
-    submitted_at: order.submitted_at,
-    created_at: order.created_at,
-  }));
+  const nowMs = Date.now();
+  if (openOrdersCache.data && nowMs - openOrdersCache.tsMs < OPEN_ORDERS_CACHE_TTL_MS) {
+    return openOrdersCache.data;
+  }
+  if (openOrdersCache.pending) {
+    return openOrdersCache.pending;
+  }
+  openOrdersCache.pending = (async () => {
+    const orders = await fetchOrders({ status: 'open' });
+    const list = Array.isArray(orders) ? orders : [];
+    const normalized = list.map((order) => ({
+      id: order.id || order.order_id,
+      client_order_id: order.client_order_id,
+      rawSymbol: order.rawSymbol ?? order.symbol,
+      pairSymbol: normalizeSymbol(order.symbol),
+      symbol: normalizeSymbol(order.symbol),
+      side: order.side,
+      status: order.status,
+      limit_price: order.limit_price,
+      submitted_at: order.submitted_at,
+      created_at: order.created_at,
+    }));
+    openOrdersCache.data = normalized;
+    openOrdersCache.tsMs = Date.now();
+    return normalized;
+  })();
+  try {
+    return await openOrdersCache.pending;
+  } finally {
+    openOrdersCache.pending = null;
+  }
 }
 
 async function getConcurrencyGuardStatus() {

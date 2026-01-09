@@ -63,6 +63,15 @@ function getBackoffDelayMs(attempt, error) {
   const base = baseDelays[Math.min(attempt, baseDelays.length - 1)];
   const jitter = Math.floor(Math.random() * 120);
   if (Number.isFinite(error?.statusCode) && error.statusCode === 429) {
+    const resetRaw = error?.rateLimit?.reset;
+    const resetSeconds = Number(resetRaw);
+    if (Number.isFinite(resetSeconds)) {
+      const nowSeconds = Date.now() / 1000;
+      const targetSeconds = resetSeconds < 1000000000 ? nowSeconds + resetSeconds : resetSeconds;
+      const delayMs = Math.max(0, (targetSeconds - nowSeconds) * 1000);
+      const clamped = Math.min(Math.max(delayMs, 250), 10000);
+      return clamped + jitter;
+    }
     const rateLimitDelays = [250, 500, 1000, 2000, 5000];
     return rateLimitDelays[Math.min(attempt, rateLimitDelays.length - 1)];
   }
