@@ -1608,6 +1608,10 @@ function roundToTick(price, symbolOrTick = PRICE_TICK, direction = 'up') {
   return Math.ceil(price / tickSize) * tickSize;
 }
 
+function roundDownToTick(price, symbolOrTick = PRICE_TICK) {
+  return roundToTick(price, symbolOrTick, 'down');
+}
+
 function getFeeBps({ orderType, isMaker }) {
   const typeLower = String(orderType || '').toLowerCase();
   if (typeLower === 'market') {
@@ -1618,9 +1622,9 @@ function getFeeBps({ orderType, isMaker }) {
 
 function resolveRequiredExitBps({ desiredNetExitBps, feeBpsRoundTrip, profitBufferBps }) {
   const desired = Number(desiredNetExitBps);
-  if (Number.isFinite(desired) && desired > 0) return desired;
   const feeBps = Number.isFinite(feeBpsRoundTrip) ? feeBpsRoundTrip : 0;
   const bufferBps = Number.isFinite(profitBufferBps) ? profitBufferBps : 0;
+  if (Number.isFinite(desired) && desired > 0) return desired + feeBps + bufferBps;
   return feeBps + bufferBps;
 }
 
@@ -1628,7 +1632,7 @@ function computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps, desiredNetEx
   return resolveRequiredExitBps({ desiredNetExitBps, feeBpsRoundTrip, profitBufferBps });
 }
 
-// requiredExitBps is the total net move (fees + buffer or desiredNetExitBps) above entry.
+// requiredExitBps is the total move above entry (fees + buffer + desired net profit when provided).
 function computeTargetSellPrice(entryPrice, requiredExitBps, tickSize) {
   const minBps = Number.isFinite(requiredExitBps) ? requiredExitBps : 0;
   const rawTarget = Number(entryPrice) * (1 + minBps / 10000);
@@ -3153,17 +3157,18 @@ async function manageExitStates() {
         const lastSubmittedAt = Number.isFinite(state.sellOrderSubmittedAt) ? state.sellOrderSubmittedAt : null;
         const shouldReplace = !state.sellOrderId || (!lastSubmittedAt || now - lastSubmittedAt >= ttlMs);
 
-        if (takerOnTouch && Number.isFinite(ask) && ask >= targetPrice && shouldReplace) {
+        if (takerOnTouch && Number.isFinite(bid) && bid >= targetPrice && shouldReplace) {
           if (state.sellOrderId) {
             await cancelOrderSafe(state.sellOrderId);
           }
+          const iocLimitPrice = roundDownToTick(bid, symbol);
           const iocResult = await submitIocLimitSell({
             symbol,
             qty: state.qty,
-            limitPrice: ask,
+            limitPrice: iocLimitPrice,
             reason: 'target_touch',
           });
-          console.log('target_touch_taker', { symbol, targetPrice, ask, qty: state.qty });
+          console.log('target_touch_taker', { symbol, targetPrice, bid, qty: state.qty, iocLimitPrice });
           if (!iocResult?.skipped) {
             const requestedQty = iocResult.requestedQty;
             const filledQty = normalizeFilledQty(iocResult.order);
