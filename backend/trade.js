@@ -1,4 +1,4 @@
-const { randomUUID } = require('crypto');
+const { randomUUID, randomBytes } = require('crypto');
 
 const { httpJson } = require('./httpClient');
 const {
@@ -189,6 +189,11 @@ const positionsSnapshot = {
   pending: null,
 };
 const openOrdersCache = {
+  tsMs: 0,
+  data: null,
+  pending: null,
+};
+const positionsListCache = {
   tsMs: 0,
   data: null,
   pending: null,
@@ -757,7 +762,12 @@ function buildUrlWithParams(baseUrl, params = {}) {
 
 function buildClientOrderId(symbol, purpose) {
   const normalized = canonicalAsset(symbol) || 'UNKNOWN';
-  return `${normalized}-${purpose}-${randomUUID()}`;
+  return `${normalized}-${purpose}-${generateOrderNonce()}`;
+}
+
+function generateOrderNonce() {
+  if (typeof randomUUID === 'function') return randomUUID();
+  return randomBytes(6).toString('hex');
 }
 
 function getOrderIntentBucket() {
@@ -770,7 +780,7 @@ function buildIntentClientOrderId({ symbol, side, intent, ref }) {
   const safeSide = String(side || '').toUpperCase();
   const safeIntent = String(intent || '').toUpperCase();
   const bucket = ref ?? getOrderIntentBucket();
-  const nonce = randomUUID().slice(0, 8);
+  const nonce = generateOrderNonce();
   return `BOT:${normalized}:${safeSide}:${safeIntent}:${bucket}:${nonce}`;
 }
 
@@ -1359,15 +1369,11 @@ async function getLatestPrice(symbol) {
 // Get portfolio value and buying power from the Alpaca account
 
 async function getAccountInfo() {
-  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'account', label: 'account' });
   let res;
   try {
-    res = await requestJson({
-      method: 'GET',
-      url,
-      headers: alpacaHeaders(),
-    });
+    res = await fetchAccount();
   } catch (err) {
+    const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'account', label: 'account' });
     logHttpError({ label: 'account', url, error: err });
     throw err;
   }
@@ -1454,21 +1460,37 @@ async function fetchClock() {
 }
 
 async function fetchPositions() {
+  const nowMs = Date.now();
+  if (positionsListCache.data && nowMs - positionsListCache.tsMs < OPEN_POSITIONS_CACHE_TTL_MS) {
+    return positionsListCache.data;
+  }
+  if (positionsListCache.pending) {
+    return positionsListCache.pending;
+  }
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions' });
-  const res = await requestJson({
-    method: 'GET',
-    url,
-    headers: alpacaHeaders(),
-  });
-  const positions = Array.isArray(res) ? res : [];
-  const normalized = positions.map((pos) => ({
-    ...pos,
-    rawSymbol: pos.symbol,
-    pairSymbol: normalizeSymbol(pos.symbol),
-    symbol: normalizeSymbol(pos.symbol),
-  }));
-  updatePositionsSnapshot(normalized);
-  return normalized;
+  positionsListCache.pending = (async () => {
+    const res = await requestJson({
+      method: 'GET',
+      url,
+      headers: alpacaHeaders(),
+    });
+    const positions = Array.isArray(res) ? res : [];
+    const normalized = positions.map((pos) => ({
+      ...pos,
+      rawSymbol: pos.symbol,
+      pairSymbol: normalizeSymbol(pos.symbol),
+      symbol: normalizeSymbol(pos.symbol),
+    }));
+    updatePositionsSnapshot(normalized);
+    positionsListCache.data = normalized;
+    positionsListCache.tsMs = Date.now();
+    return normalized;
+  })();
+  try {
+    return await positionsListCache.pending;
+  } finally {
+    positionsListCache.pending = null;
+  }
 }
 
 async function fetchPosition(symbol) {
@@ -4573,8 +4595,18 @@ async function replaceOrder(orderId, payload = {}) {
 
 async function fetchOrders(params = {}) {
   const resolvedParams = { ...(params || {}) };
-  if (String(resolvedParams.status || '').toLowerCase() === 'open') {
+  const isOpenStatus = String(resolvedParams.status || '').toLowerCase() === 'open';
+  if (isOpenStatus) {
     delete resolvedParams.symbol;
+  }
+  if (isOpenStatus) {
+    const nowMs = Date.now();
+    if (openOrdersCache.data && nowMs - openOrdersCache.tsMs < OPEN_ORDERS_CACHE_TTL_MS) {
+      return openOrdersCache.data;
+    }
+    if (openOrdersCache.pending) {
+      return openOrdersCache.pending;
+    }
   }
   const url = buildAlpacaUrl({
     baseUrl: ALPACA_BASE_URL,
@@ -4582,33 +4614,50 @@ async function fetchOrders(params = {}) {
     params: resolvedParams,
     label: 'orders_list',
   });
-  let response;
+  const fetcher = async () => {
+    let response;
+    try {
+      response = await requestJson({
+        method: 'GET',
+        url,
+        headers: alpacaHeaders(),
+      });
+    } catch (err) {
+      logHttpError({ label: 'orders', url, error: err });
+      throw err;
+    }
+
+    if (Array.isArray(response)) {
+      const normalized = response.map((order) => ({
+        ...order,
+        rawSymbol: order.symbol,
+        pairSymbol: normalizeSymbol(order.symbol),
+        symbol: normalizeSymbol(order.symbol),
+      }));
+      if (isOpenStatus) {
+        openOrdersCache.data = normalized;
+        openOrdersCache.tsMs = Date.now();
+      }
+      return normalized;
+    }
+
+    if (isOpenStatus) {
+      openOrdersCache.data = response;
+      openOrdersCache.tsMs = Date.now();
+    }
+    return response;
+  };
+
+  if (!isOpenStatus) {
+    return fetcher();
+  }
+
+  openOrdersCache.pending = fetcher();
   try {
-    response = await requestJson({
-      method: 'GET',
-      url,
-      headers: alpacaHeaders(),
-    });
-  } catch (err) {
-    logHttpError({ label: 'orders', url, error: err });
-    throw err;
+    return await openOrdersCache.pending;
+  } finally {
+    openOrdersCache.pending = null;
   }
-
-  if (Array.isArray(response)) {
-
-    return response.map((order) => ({
-
-      ...order,
-
-      rawSymbol: order.symbol,
-      pairSymbol: normalizeSymbol(order.symbol),
-      symbol: normalizeSymbol(order.symbol),
-
-    }));
-
-  }
-
-  return response;
 
 }
 
@@ -4620,29 +4669,9 @@ async function fetchOpenPositions() {
   if (openPositionsCache.pending) {
     return openPositionsCache.pending;
   }
-  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'positions', label: 'positions_list' });
   openPositionsCache.pending = (async () => {
-    let res;
-    try {
-      res = await requestJson({
-        method: 'GET',
-        url,
-        headers: alpacaHeaders(),
-      });
-    } catch (err) {
-      logHttpError({ label: 'positions', url, error: err });
-      throw err;
-    }
-    const positions = Array.isArray(res) ? res : [];
-    updatePositionsSnapshot(
-      positions.map((pos) => ({
-        ...pos,
-        rawSymbol: pos.symbol,
-        pairSymbol: normalizeSymbol(pos.symbol),
-        symbol: normalizeSymbol(pos.symbol),
-      }))
-    );
-    const normalized = positions
+    const positions = await fetchPositions();
+    const normalized = (Array.isArray(positions) ? positions : [])
       .map((pos) => {
         const qty = Number(pos.qty ?? pos.quantity ?? 0);
         const pairSymbol = normalizeSymbol(pos.symbol);
@@ -4667,37 +4696,20 @@ async function fetchOpenPositions() {
 }
 
 async function fetchOpenOrders() {
-  const nowMs = Date.now();
-  if (openOrdersCache.data && nowMs - openOrdersCache.tsMs < OPEN_ORDERS_CACHE_TTL_MS) {
-    return openOrdersCache.data;
-  }
-  if (openOrdersCache.pending) {
-    return openOrdersCache.pending;
-  }
-  openOrdersCache.pending = (async () => {
-    const orders = await fetchOrders({ status: 'open' });
-    const list = Array.isArray(orders) ? orders : [];
-    const normalized = list.map((order) => ({
-      id: order.id || order.order_id,
-      client_order_id: order.client_order_id,
-      rawSymbol: order.rawSymbol ?? order.symbol,
-      pairSymbol: normalizeSymbol(order.symbol),
-      symbol: normalizeSymbol(order.symbol),
-      side: order.side,
-      status: order.status,
-      limit_price: order.limit_price,
-      submitted_at: order.submitted_at,
-      created_at: order.created_at,
-    }));
-    openOrdersCache.data = normalized;
-    openOrdersCache.tsMs = Date.now();
-    return normalized;
-  })();
-  try {
-    return await openOrdersCache.pending;
-  } finally {
-    openOrdersCache.pending = null;
-  }
+  const orders = await fetchOrders({ status: 'open' });
+  const list = Array.isArray(orders) ? orders : [];
+  return list.map((order) => ({
+    id: order.id || order.order_id,
+    client_order_id: order.client_order_id,
+    rawSymbol: order.rawSymbol ?? order.symbol,
+    pairSymbol: normalizeSymbol(order.symbol),
+    symbol: normalizeSymbol(order.symbol),
+    side: order.side,
+    status: order.status,
+    limit_price: order.limit_price,
+    submitted_at: order.submitted_at,
+    created_at: order.created_at,
+  }));
 }
 
 async function getConcurrencyGuardStatus() {
