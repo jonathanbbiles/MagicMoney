@@ -127,6 +127,8 @@ const MARKET_DATA_FAILURE_LIMIT = Number(process.env.MARKET_DATA_FAILURE_LIMIT |
 const MARKET_DATA_COOLDOWN_MS = Number(process.env.MARKET_DATA_COOLDOWN_MS || 60000);
 
 const USER_MIN_PROFIT_BPS = Number(process.env.USER_MIN_PROFIT_BPS || 5);
+const DESIRED_NET_PROFIT_BASIS_POINTS = readNumber('DESIRED_NET_PROFIT_BASIS_POINTS', 100);
+const MAX_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MAX_GROSS_TAKE_PROFIT_BASIS_POINTS', 220);
 
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 10);
 
@@ -139,7 +141,7 @@ const TAKER_EXIT_ON_TOUCH = readFlag('TAKER_EXIT_ON_TOUCH', true);
 const REPLACE_THRESHOLD_BPS = Number(process.env.REPLACE_THRESHOLD_BPS || 8);
 const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
 const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
-const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 10000);
+const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 20000);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
 const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
 const STOP_LOSS_BPS = readNumber('STOP_LOSS_BPS', 60);
@@ -152,12 +154,12 @@ const RISK_LEVEL = readNumber('RISK_LEVEL', 2);
 const ENTRY_SCAN_INTERVAL_MS = readNumber('ENTRY_SCAN_INTERVAL_MS', 4000);
 const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
-const MAX_HOLD_SECONDS = Number(process.env.MAX_HOLD_SECONDS || 300);
+const MAX_HOLD_SECONDS = readNumber('MAX_HOLD_SECONDS', 180);
 const MAX_HOLD_MS = Number(process.env.MAX_HOLD_MS || MAX_HOLD_SECONDS * 1000);
 
 const REPRICE_EVERY_SECONDS = readNumber('REPRICE_EVERY_SECONDS', 5);
 
-const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 600);
+const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 300);
 const ENTRY_FILL_TIMEOUT_SECONDS = readNumber('ENTRY_FILL_TIMEOUT_SECONDS', 30);
 const POST_ONLY_BUY = readFlag('POST_ONLY_BUY', true);
 const ENTRY_FALLBACK_MARKET = readFlag('ENTRY_FALLBACK_MARKET', false);
@@ -172,6 +174,7 @@ const OPEN_POSITIONS_CACHE_TTL_MS = 1500;
 const OPEN_ORDERS_CACHE_TTL_MS = 1500;
 const ACCOUNT_CACHE_TTL_MS = 2000;
 const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
+const EXIT_STALE_QUOTE_MAX_AGE_MS = Math.min(EXIT_QUOTE_MAX_AGE_MS, 15000);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
@@ -233,12 +236,18 @@ function expectedValueBps({ pUp, winBps, loseBps, feeBps, spreadBps, slippageBps
   return p * win - (1 - p) * lose - fees - spread - slip;
 }
 
-function requiredProfitBpsForSymbol({ spreadBps, slippageBps, feeBps, userMinBps }) {
-  const base = Number.isFinite(userMinBps) ? userMinBps : USER_MIN_PROFIT_BPS;
-  const spread = Number.isFinite(spreadBps) ? spreadBps : 0;
-  const slip = Number.isFinite(slippageBps) ? slippageBps : 0;
+function requiredProfitBpsForSymbol({ slippageBps, feeBps, desiredNetExitBps }) {
+  const desiredNet = Number.isFinite(desiredNetExitBps) ? desiredNetExitBps : DESIRED_NET_PROFIT_BASIS_POINTS;
+  const slip = Number.isFinite(slippageBps) ? slippageBps : SLIPPAGE_BPS;
   const fees = Number.isFinite(feeBps) ? feeBps : feeBpsRoundTrip();
-  return Math.max(0, base + PROFIT_BUFFER_BPS + spread + slip + fees);
+  return resolveRequiredExitBps({
+    desiredNetExitBps: desiredNet,
+    feeBpsRoundTrip: fees,
+    slippageBps: slip,
+    spreadBufferBps: BUFFER_BPS,
+    profitBufferBps: PROFIT_BUFFER_BPS,
+    maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
+  });
 }
 
 /* 18) SIGNAL / ENTRY MATH */
@@ -339,40 +348,37 @@ async function computeEntrySignal(symbol) {
 
   const stopBps = Math.max(STOP_LOSS_BPS, sigmaEwma * STOP_VOL_MULT);
   const needBpsVol = Math.max(1, sigmaEwma * TP_VOL_SCALE);
-  const baseNeed = requiredProfitBpsForSymbol({
-    spreadBps: spreadEwma,
-    slippageBps: slipEwma,
+  const desiredNetExitBps = DESIRED_NET_PROFIT_BASIS_POINTS;
+  const slippageBpsForExit = SLIPPAGE_BPS;
+  const requiredGrossExitBps = requiredProfitBpsForSymbol({
+    slippageBps: slippageBpsForExit,
     feeBps: feeBpsRoundTrip(),
-    userMinBps: USER_MIN_PROFIT_BPS,
+    desiredNetExitBps,
   });
   const riskScale = [1.25, 1.1, 1.0, 0.9, 0.8][riskLvl] ?? 1.0;
-  const needDyn = Math.max(baseNeed, needBpsVol * riskScale) + momentumPenaltyBps;
-  const needBpsCapped = Math.min(needDyn, stopBps);
-
-  const pUpBarrier = barrierPTouchUpDriftless(needBpsCapped, stopBps);
+  const needDyn = Math.max(requiredGrossExitBps, needBpsVol * riskScale) + momentumPenaltyBps;
+  const pUpBarrier = barrierPTouchUpDriftless(requiredGrossExitBps, stopBps);
   let pUp = 0.5 + micro.microBias + momBias + (pUpBarrier - 0.5) * 0.65;
   pUp = clamp(pUp, 0.05, 0.95);
 
   const expectedBps = expectedValueBps({
     pUp,
-    winBps: needBpsCapped,
+    winBps: requiredGrossExitBps,
     loseBps: stopBps,
     feeBps: feeBpsRoundTrip(),
     spreadBps: spreadEwma,
-    slippageBps: slipEwma,
+    slippageBps: slippageBpsForExit,
   });
 
   if (EV_GUARD_ENABLED && expectedBps < EV_MIN_BPS) {
     return {
       entryReady: false,
       why: 'ev_guard',
-      meta: { symbol: asset.symbol, expectedBps, pUp, needBpsCapped, stopBps },
+      meta: { symbol: asset.symbol, expectedBps, pUp, requiredGrossExitBps, stopBps },
     };
   }
 
-  const grossTpBps = needBpsCapped;
-  const grossFees = FEE_BPS_MAKER + (TAKER_EXIT_ON_TOUCH ? FEE_BPS_TAKER : FEE_BPS_MAKER) + PROFIT_BUFFER_BPS;
-  const desiredNetExitBpsForV22 = Math.max(0, grossTpBps - grossFees);
+  const desiredNetExitBpsForV22 = desiredNetExitBps;
 
   symStats[asset.symbol] = {
     lastMid: mid,
@@ -385,7 +391,7 @@ async function computeEntrySignal(symbol) {
   return {
     entryReady: true,
     symbol: asset.symbol,
-    grossTpBps,
+    grossTpBps: requiredGrossExitBps,
     desiredNetExitBpsForV22,
     stopBps,
     spreadBps: spreadEwma,
@@ -399,7 +405,7 @@ async function computeEntrySignal(symbol) {
       momentumBps,
       needBpsVol,
       needDyn,
-      needBpsCapped,
+      requiredGrossExitBps,
       feeBps: feeBpsRoundTrip(),
     },
   };
@@ -479,6 +485,11 @@ function logNetworkError({ type, symbol, attempts, context }) {
 
 function isNetworkError(err) {
   return Boolean(err?.isNetworkError || err?.isTimeout || err?.errorCode === 'NETWORK');
+}
+
+function isStaleQuoteError(err) {
+  const message = String(err?.message || err || '').toLowerCase();
+  return message.includes('stale') || message.includes('absurd') || message.includes('timestamp');
 }
 
 function buildAlpacaUrl({ baseUrl, path, params, label }) {
@@ -1303,7 +1314,7 @@ async function feeAwareMinProfitBps(symbol, notionalUsd) {
 
   if (!Number.isFinite(notionalUsd) || notionalUsd <= 0) {
 
-    return USER_MIN_PROFIT_BPS;
+    return DESIRED_NET_PROFIT_BASIS_POINTS;
 
   }
 
@@ -1347,9 +1358,9 @@ async function feeAwareMinProfitBps(symbol, notionalUsd) {
 
   const feeFloor = feeBps + SLIPPAGE_BPS + BUFFER_BPS;
 
-  const minBps = Math.max(USER_MIN_PROFIT_BPS, feeFloor);
+  const minBps = Math.max(DESIRED_NET_PROFIT_BASIS_POINTS, feeFloor);
 
-  console.log('feeAwareMinProfitBps', {
+  console.log('feeAwareMinProfitBasisPoints', {
     symbol: normalizedSymbol,
     notionalUsd,
     feeUsd,
@@ -1930,19 +1941,44 @@ function getFeeBps({ orderType, isMaker }) {
   return isMaker ? FEE_BPS_MAKER : FEE_BPS_TAKER;
 }
 
-function resolveRequiredExitBps({ desiredNetExitBps, feeBpsRoundTrip, profitBufferBps }) {
-  const desired = Number(desiredNetExitBps);
+function resolveRequiredExitBps({
+  desiredNetExitBps,
+  feeBpsRoundTrip,
+  slippageBps,
+  spreadBufferBps,
+  profitBufferBps,
+  maxGrossTakeProfitBps,
+}) {
+  const desired = Number.isFinite(desiredNetExitBps) ? desiredNetExitBps : DESIRED_NET_PROFIT_BASIS_POINTS;
   const feeBps = Number.isFinite(feeBpsRoundTrip) ? feeBpsRoundTrip : 0;
-  const bufferBps = Number.isFinite(profitBufferBps) ? profitBufferBps : 0;
-  if (Number.isFinite(desired) && desired > 0) return desired + feeBps + bufferBps;
-  return feeBps + bufferBps;
+  const slipBps = Number.isFinite(slippageBps) ? slippageBps : SLIPPAGE_BPS;
+  const spreadBuffer = Number.isFinite(spreadBufferBps) ? spreadBufferBps : BUFFER_BPS;
+  const bufferBps = Number.isFinite(profitBufferBps) ? profitBufferBps : PROFIT_BUFFER_BPS;
+  const rawRequired = Math.max(0, desired) + feeBps + slipBps + spreadBuffer + bufferBps;
+  const cap = Number.isFinite(maxGrossTakeProfitBps) ? maxGrossTakeProfitBps : MAX_GROSS_TAKE_PROFIT_BASIS_POINTS;
+  if (Number.isFinite(cap) && cap > 0) return Math.min(rawRequired, cap);
+  return rawRequired;
 }
 
-function computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps, desiredNetExitBps }) {
-  return resolveRequiredExitBps({ desiredNetExitBps, feeBpsRoundTrip, profitBufferBps });
+function computeMinNetProfitBps({
+  feeBpsRoundTrip,
+  profitBufferBps,
+  desiredNetExitBps,
+  slippageBps,
+  spreadBufferBps,
+  maxGrossTakeProfitBps,
+}) {
+  return resolveRequiredExitBps({
+    desiredNetExitBps,
+    feeBpsRoundTrip,
+    slippageBps,
+    spreadBufferBps,
+    profitBufferBps,
+    maxGrossTakeProfitBps,
+  });
 }
 
-// requiredExitBps is the total move above entry (fees + buffer + desired net profit when provided).
+// requiredExitBps is the total move above entry (fees + slippage + spread buffer + profit buffer + desired net profit).
 function computeTargetSellPrice(entryPrice, requiredExitBps, tickSize) {
   const minBps = Number.isFinite(requiredExitBps) ? requiredExitBps : 0;
   const rawTarget = Number(entryPrice) * (1 + minBps / 10000);
@@ -2332,6 +2368,80 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   recordLastQuoteAt(symbol, { tsMs, source: 'fresh' });
   return normalizedQuote;
 
+}
+
+async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
+  const symbol = normalizeSymbol(rawSymbol);
+  const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
+  const nowMs = Date.now();
+  const isCrypto = isCryptoSymbol(symbol);
+  const dataSymbol = isCrypto ? toDataSymbol(symbol) : symbol;
+  const url = isCrypto
+    ? buildAlpacaUrl({
+      baseUrl: CRYPTO_DATA_URL,
+      path: 'us/latest/quotes',
+      params: { symbols: dataSymbol },
+      label: 'crypto_latest_quotes_direct',
+    })
+    : buildAlpacaUrl({
+      baseUrl: STOCKS_DATA_URL,
+      path: 'quotes/latest',
+      params: { symbols: symbol },
+      label: 'stock_latest_quotes_direct',
+    });
+
+  let res;
+  try {
+    res = await requestMarketDataJson({ type: 'QUOTE', url, symbol });
+  } catch (err) {
+    logHttpError({ symbol, label: 'quotes_direct', url, error: err });
+    throw err;
+  }
+
+  const quoteKey = isCrypto ? dataSymbol : symbol;
+  const quote = res.quotes && res.quotes[quoteKey];
+  if (!quote) {
+    throw new Error(`Quote not available for ${symbol}`);
+  }
+
+  const tsMs = parseQuoteTimestamp({ quote, symbol, source: 'alpaca_quote_direct' });
+  const bid = Number(quote.bp ?? quote.bid_price ?? quote.bid);
+  const ask = Number(quote.ap ?? quote.ask_price ?? quote.ask);
+  const normalizedBid = Number.isFinite(bid) ? bid : null;
+  const normalizedAsk = Number.isFinite(ask) ? ask : null;
+  const rawAgeMs = Number.isFinite(tsMs) ? computeQuoteAgeMs({ nowMs, tsMs }) : null;
+  const ageMs = normalizeQuoteAgeMs(rawAgeMs);
+  if (Number.isFinite(rawAgeMs)) {
+    logQuoteAgeWarning({ symbol, ageMs: rawAgeMs, source: 'alpaca_direct', tsMs });
+  }
+
+  if (!Number.isFinite(normalizedBid) || !Number.isFinite(normalizedAsk) || normalizedBid <= 0 || normalizedAsk <= 0) {
+    throw new Error(`Quote bid/ask missing for ${symbol}`);
+  }
+
+  if (!Number.isFinite(tsMs)) {
+    throw new Error(`Quote timestamp missing for ${symbol}`);
+  }
+
+  if (Number.isFinite(rawAgeMs) && !Number.isFinite(ageMs)) {
+    throw new Error(`Quote age absurd for ${symbol}`);
+  }
+
+  if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMs) {
+    throw new Error(`Quote stale for ${symbol}`);
+  }
+
+  const normalizedQuote = {
+    bid: normalizedBid,
+    ask: normalizedAsk,
+    mid: (normalizedBid + normalizedAsk) / 2,
+    tsMs,
+    receivedAtMs: nowMs,
+    source: 'alpaca_direct',
+  };
+  quoteCache.set(symbol, normalizedQuote);
+  recordLastQuoteAt(symbol, { tsMs, source: 'alpaca_direct' });
+  return normalizedQuote;
 }
 
 function normalizeSymbolsParam(rawSymbols) {
@@ -2822,24 +2932,35 @@ async function handleBuyFill({
   }
   const profitBufferBps = PROFIT_BUFFER_BPS;
   const slippageBpsUsed = SLIPPAGE_BPS;
-  const frictionBps = entrySpreadBpsUsed + slippageBpsUsed;
-  if (desiredNetExitBpsValue == null) {
-    desiredNetExitBpsValue = Math.max(USER_MIN_PROFIT_BPS, frictionBps);
-  } else if (Number.isFinite(desiredNetExitBpsValue) && desiredNetExitBpsValue < frictionBps) {
-    console.log('desired_exit_bps_raised', {
+  const spreadBufferBps = BUFFER_BPS;
+  if (!Number.isFinite(desiredNetExitBpsValue)) {
+    desiredNetExitBpsValue = DESIRED_NET_PROFIT_BASIS_POINTS;
+  }
+  if (Number.isFinite(desiredNetExitBpsValue) && desiredNetExitBpsValue < 0) {
+    console.log('desired_exit_basis_points_raised', {
       symbol,
-      desiredNetExitBps: desiredNetExitBpsValue,
-      frictionBps,
+      desiredNetExitBasisPoints: desiredNetExitBpsValue,
+      floorBasisPoints: 0,
     });
-    desiredNetExitBpsValue = frictionBps;
+    desiredNetExitBpsValue = 0;
   }
   const minNetProfitBps = computeMinNetProfitBps({
     feeBpsRoundTrip,
     profitBufferBps,
     desiredNetExitBps: desiredNetExitBpsValue,
+    slippageBps: slippageBpsUsed,
+    spreadBufferBps,
+    maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
   });
   const tickSize = getTickSize({ symbol, price: entryPriceNum });
-  const requiredExitBps = desiredNetExitBpsValue + feeBpsRoundTrip + profitBufferBps;
+  const requiredExitBps = resolveRequiredExitBps({
+    desiredNetExitBps: desiredNetExitBpsValue,
+    feeBpsRoundTrip,
+    slippageBps: slippageBpsUsed,
+    spreadBufferBps,
+    profitBufferBps,
+    maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
+  });
   const targetPrice = computeTargetSellPrice(entryPriceNum, requiredExitBps, tickSize);
   const breakevenPrice = computeBreakevenPrice(entryPriceNum, minNetProfitBps);
   const postOnly = true;
@@ -2854,7 +2975,9 @@ async function handleBuyFill({
     desiredNetExitBps: desiredNetExitBpsValue,
     entrySpreadBpsUsed,
     slippageBpsUsed,
+    spreadBufferBps,
     requiredExitBps,
+    maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
     breakevenPrice,
     targetPrice,
     takerExitOnTouch: TAKER_EXIT_ON_TOUCH,
@@ -2875,7 +2998,7 @@ async function handleBuyFill({
       }),
     });
     if (oco && (oco.id || oco.client_order_id)) {
-      console.log('oco_exit_attached', { symbol, tp: targetPrice, sl_bps: readNumber('STOP_LOSS_BPS', 60) });
+      console.log('oco_exit_attached', { symbol, tp: targetPrice, sl_basis_points: readNumber('STOP_LOSS_BPS', 60) });
       return oco;
     }
     console.warn('oco_exit_fallback_to_legacy', { symbol });
@@ -2922,6 +3045,7 @@ async function handleBuyFill({
     desiredNetExitBps: desiredNetExitBpsValue,
     entrySpreadBpsUsed,
     slippageBpsUsed,
+    spreadBufferBps,
     requiredExitBps,
     entryFeeBps,
     exitFeeBps,
@@ -3188,25 +3312,28 @@ async function repairOrphanExits() {
     const entryFeeBps = inferEntryFeeBps({ symbol, orderType, postOnly: true });
     const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
     const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
-    const exitFloorBps = computeExitFloorBps({ exitFeeBps });
     const slippageBps = Number.isFinite(SLIPPAGE_BPS) ? SLIPPAGE_BPS : null;
     const desiredNetExitBps = Number.isFinite(desiredExitBpsBySymbol.get(symbol))
       ? desiredExitBpsBySymbol.get(symbol)
-      : Math.max(
-        USER_MIN_PROFIT_BPS,
-        Number.isFinite(exitFloorBps) ? exitFloorBps + (Number.isFinite(slippageBps) ? slippageBps : 0) : USER_MIN_PROFIT_BPS
-      );
+      : DESIRED_NET_PROFIT_BASIS_POINTS;
     const profitBufferBps = PROFIT_BUFFER_BPS;
+    const spreadBufferBps = BUFFER_BPS;
     const minNetProfitBps = computeMinNetProfitBps({
       feeBpsRoundTrip,
       profitBufferBps,
       desiredNetExitBps,
+      slippageBps,
+      spreadBufferBps,
+      maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
     });
     const tickSize = getTickSize({ symbol, price: avgEntryPrice });
     const requiredExitBps = resolveRequiredExitBps({
       desiredNetExitBps,
       feeBpsRoundTrip,
       profitBufferBps,
+      slippageBps,
+      spreadBufferBps,
+      maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
     });
     targetPrice = computeTargetSellPrice(avgEntryPrice, requiredExitBps, tickSize);
     const postOnly = true;
@@ -3252,6 +3379,8 @@ async function repairOrphanExits() {
           feeBpsRoundTrip,
           profitBufferBps,
           desiredNetExitBps,
+          slippageBpsUsed: slippageBps,
+          spreadBufferBps,
           entryFeeBps,
           exitFeeBps,
           requiredExitBps,
@@ -3466,6 +3595,8 @@ async function repairOrphanExits() {
         desiredNetExitBps,
         entryFeeBps,
         exitFeeBps,
+        slippageBpsUsed: slippageBps,
+        spreadBufferBps,
         sellOrderId: repairOrder.id,
         sellOrderSubmittedAt: now,
         sellOrderLimit: targetPrice,
@@ -3558,19 +3689,29 @@ async function manageExitStates() {
 
         let ask = null;
         let quoteFetchFailed = false;
+        let quoteStale = false;
 
         try {
 
-          const quote = await getLatestQuote(symbol, { maxAgeMs: EXIT_QUOTE_MAX_AGE_MS });
+          const quote = await getLatestQuote(symbol, { maxAgeMs: EXIT_STALE_QUOTE_MAX_AGE_MS });
 
           bid = quote.bid;
 
           ask = quote.ask;
+          state.lastBid = Number.isFinite(bid) ? bid : state.lastBid;
+          state.lastAsk = Number.isFinite(ask) ? ask : state.lastAsk;
+          if (Number.isFinite(bid) && Number.isFinite(ask)) {
+            state.lastMid = (bid + ask) / 2;
+          }
+          state.lastQuoteTsMs = Number.isFinite(quote.tsMs) ? quote.tsMs : state.lastQuoteTsMs;
+          state.lastQuoteSource = quote.source || state.lastQuoteSource;
+          state.staleQuoteSkipAt = null;
 
         } catch (err) {
 
           console.warn('quote_fetch_failed', { symbol, error: err?.message || err });
           quoteFetchFailed = isNetworkError(err);
+          quoteStale = !quoteFetchFailed && isStaleQuoteError(err);
 
         }
 
@@ -3593,11 +3734,16 @@ async function manageExitStates() {
           ? state.feeBpsRoundTrip
           : entryFeeBps + exitFeeBps;
         const profitBufferBps = Number.isFinite(state.profitBufferBps) ? state.profitBufferBps : PROFIT_BUFFER_BPS;
+        const slippageBps = Number.isFinite(state.slippageBpsUsed) ? state.slippageBpsUsed : SLIPPAGE_BPS;
+        const spreadBufferBps = Number.isFinite(state.spreadBufferBps) ? state.spreadBufferBps : BUFFER_BPS;
         const desiredNetExitBps = Number.isFinite(state.desiredNetExitBps) ? state.desiredNetExitBps : null;
         const minNetProfitBps = computeMinNetProfitBps({
           feeBpsRoundTrip,
           profitBufferBps,
           desiredNetExitBps,
+          slippageBps,
+          spreadBufferBps,
+          maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
         });
         const tickSize = getTickSize({ symbol, price: state.entryPrice });
         const requiredExitBps = Number.isFinite(state.requiredExitBps)
@@ -3605,13 +3751,18 @@ async function manageExitStates() {
           : resolveRequiredExitBps({
             desiredNetExitBps,
             feeBpsRoundTrip,
+            slippageBps,
+            spreadBufferBps,
             profitBufferBps,
+            maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
           });
         const targetPrice = computeTargetSellPrice(state.entryPrice, requiredExitBps, tickSize);
         state.targetPrice = targetPrice;
         state.minNetProfitBps = minNetProfitBps;
         state.feeBpsRoundTrip = feeBpsRoundTrip;
         state.profitBufferBps = profitBufferBps;
+        state.slippageBpsUsed = slippageBps;
+        state.spreadBufferBps = spreadBufferBps;
         state.desiredNetExitBps = desiredNetExitBps;
         state.requiredExitBps = requiredExitBps;
         state.entryFeeBps = entryFeeBps;
@@ -3633,6 +3784,183 @@ async function manageExitStates() {
         const lastCancelReplaceAtMs = lastCancelReplaceAt.get(symbol) || null;
         const lastRepriceAgeMs = Number.isFinite(lastCancelReplaceAtMs) ? now - lastCancelReplaceAtMs : null;
         const openSellOrders = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'sell');
+        const hasOpenSell = openSellOrders.length > 0 || Boolean(state.sellOrderId);
+
+        if (quoteStale) {
+          const lastKnownBid = Number.isFinite(state.lastBid) ? state.lastBid : null;
+          const lastKnownAsk = Number.isFinite(state.lastAsk) ? state.lastAsk : null;
+          const lastKnownMid = Number.isFinite(state.lastMid)
+            ? state.lastMid
+            : (Number.isFinite(lastKnownBid) && Number.isFinite(lastKnownAsk) ? (lastKnownBid + lastKnownAsk) / 2 : null);
+          let fallbackBase = Number.isFinite(lastKnownAsk) ? lastKnownAsk : lastKnownMid;
+
+          if (hasOpenSell) {
+            actionTaken = 'hold_existing_order';
+            reasonCode = 'stale_quote_keep_order';
+            logExitDecision({
+              symbol,
+              heldSeconds,
+              entryPrice: state.entryPrice,
+              targetPrice,
+              bid,
+              ask,
+              minNetProfitBps,
+              actionTaken,
+            });
+            console.log('exit_scan', {
+              symbol,
+              heldQty: state.qty,
+              entryPrice: state.entryPrice,
+              bid,
+              ask,
+              spreadBps,
+              openBuyCount,
+              openSellCount,
+              existingOrderAgeMs: null,
+              feeBpsRoundTrip,
+              profitBufferBps,
+              minNetProfitBps,
+              targetPrice,
+              breakevenPrice,
+              desiredLimit,
+              decisionPath: 'stale_quote_keep_order',
+              lastRepriceAgeMs: lastRepriceAgeMs,
+              lastCancelReplaceAt: lastCancelReplaceAtMs,
+              actionTaken,
+              reasonCode,
+              iocRequestedQty: null,
+              iocFilledQty: null,
+              iocFallbackReason: null,
+            });
+            continue;
+          }
+
+          if (!Number.isFinite(fallbackBase) && state.staleQuoteSkipAt) {
+            try {
+              const directQuote = await getLatestQuoteFromQuotesOnly(symbol, { maxAgeMs: EXIT_QUOTE_MAX_AGE_MS });
+              bid = directQuote.bid;
+              ask = directQuote.ask;
+              state.lastBid = Number.isFinite(bid) ? bid : state.lastBid;
+              state.lastAsk = Number.isFinite(ask) ? ask : state.lastAsk;
+              if (Number.isFinite(bid) && Number.isFinite(ask)) {
+                state.lastMid = (bid + ask) / 2;
+              }
+              state.lastQuoteTsMs = Number.isFinite(directQuote.tsMs) ? directQuote.tsMs : state.lastQuoteTsMs;
+              state.lastQuoteSource = directQuote.source || state.lastQuoteSource;
+              fallbackBase = Number.isFinite(ask) ? ask : state.lastMid;
+            } catch (err) {
+              console.warn('exit_stale_quote_retry_failed', { symbol, error: err?.message || err });
+            }
+          }
+
+          if (Number.isFinite(fallbackBase)) {
+            const conservativeLimit = roundToTick(fallbackBase, tickSize, 'up');
+            const replacement = await submitLimitSell({
+              symbol,
+              qty: state.qty,
+              limitPrice: conservativeLimit,
+              reason: 'stale_quote_fallback',
+              intentRef: state.entryOrderId || getOrderIntentBucket(),
+              postOnly: true,
+              openOrders: symbolOrders,
+            });
+            if (!replacement?.skipped && replacement?.id) {
+              state.sellOrderId = replacement.id;
+              state.sellOrderSubmittedAt = Date.now();
+              state.sellOrderLimit = normalizeOrderLimitPrice(replacement) ?? conservativeLimit;
+              actionTaken = 'placed_stale_fallback';
+              reasonCode = 'stale_quote_fallback';
+              lastActionAt.set(symbol, now);
+            } else {
+              actionTaken = 'hold_existing_order';
+              reasonCode = replacement?.reason || 'stale_quote_fallback_skipped';
+            }
+            logExitDecision({
+              symbol,
+              heldSeconds,
+              entryPrice: state.entryPrice,
+              targetPrice,
+              bid,
+              ask,
+              minNetProfitBps,
+              actionTaken,
+            });
+            console.log('exit_scan', {
+              symbol,
+              heldQty: state.qty,
+              entryPrice: state.entryPrice,
+              bid,
+              ask,
+              spreadBps,
+              openBuyCount,
+              openSellCount,
+              existingOrderAgeMs: null,
+              feeBpsRoundTrip,
+              profitBufferBps,
+              minNetProfitBps,
+              targetPrice,
+              breakevenPrice,
+              desiredLimit,
+              decisionPath: 'stale_quote_fallback',
+              lastRepriceAgeMs: lastRepriceAgeMs,
+              lastCancelReplaceAt: lastCancelReplaceAtMs,
+              actionTaken,
+              reasonCode,
+              iocRequestedQty: null,
+              iocFilledQty: null,
+              iocFallbackReason: null,
+            });
+            state.staleQuoteSkipAt = null;
+            continue;
+          }
+
+          if (!state.staleQuoteSkipAt) {
+            state.staleQuoteSkipAt = now;
+            console.warn('exit_stale_quote_skip', {
+              symbol,
+              reason: 'no_last_price',
+              retry: 'next_cycle_latest_quotes',
+            });
+          }
+          actionTaken = 'hold_existing_order';
+          reasonCode = 'stale_quote_no_price';
+          logExitDecision({
+            symbol,
+            heldSeconds,
+            entryPrice: state.entryPrice,
+            targetPrice,
+            bid,
+            ask,
+            minNetProfitBps,
+            actionTaken,
+          });
+          console.log('exit_scan', {
+            symbol,
+            heldQty: state.qty,
+            entryPrice: state.entryPrice,
+            bid,
+            ask,
+            spreadBps,
+            openBuyCount,
+            openSellCount,
+            existingOrderAgeMs: null,
+            feeBpsRoundTrip,
+            profitBufferBps,
+            minNetProfitBps,
+            targetPrice,
+            breakevenPrice,
+            desiredLimit,
+            decisionPath: 'stale_quote_no_price',
+            lastRepriceAgeMs: lastRepriceAgeMs,
+            lastCancelReplaceAt: lastCancelReplaceAtMs,
+            actionTaken,
+            reasonCode,
+            iocRequestedQty: null,
+            iocFilledQty: null,
+            iocFallbackReason: null,
+          });
+          continue;
+        }
         if (!state.sellOrderId && openSellOrders.length === 1) {
           const onlyOrder = openSellOrders[0];
           state.sellOrderId = onlyOrder?.id || onlyOrder?.order_id || null;
@@ -4147,7 +4475,13 @@ async function manageExitStates() {
               ? ((currentLimit - makerDesiredLimit) / makerDesiredLimit) * 10000
               : null;
 
-          if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS) {
+          if (
+            existingOrderAgeMs != null &&
+            existingOrderAgeMs > SELL_ORDER_TTL_MS &&
+            Number.isFinite(awayBps) &&
+            awayBps > REPRICE_IF_AWAY_BPS &&
+            !repriceCooldownActive
+          ) {
             await cancelOrderSafe(state.sellOrderId);
             const replacement = await submitLimitSell({
               symbol,
@@ -4171,6 +4505,14 @@ async function manageExitStates() {
               reasonCode = replacement?.reason || 'reprice_ttl_skipped';
               decisionPath = 'reprice_ttl';
             }
+          } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS && repriceCooldownActive) {
+            actionTaken = 'hold_existing_order';
+            reasonCode = 'reprice_ttl_cooldown';
+            decisionPath = 'reprice_ttl';
+          } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS) {
+            actionTaken = 'hold_existing_order';
+            reasonCode = 'reprice_ttl_within_band';
+            decisionPath = 'reprice_ttl';
           } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
             await cancelOrderSafe(state.sellOrderId);
             const replacement = await submitLimitSell({
@@ -4235,7 +4577,13 @@ async function manageExitStates() {
               Number.isFinite(currentLimit) && desiredLimit > 0
                 ? ((currentLimit - desiredLimit) / desiredLimit) * 10000
                 : null;
-            if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS) {
+            if (
+              existingOrderAgeMs != null &&
+              existingOrderAgeMs > SELL_ORDER_TTL_MS &&
+              Number.isFinite(awayBps) &&
+              awayBps > REPRICE_IF_AWAY_BPS &&
+              !repriceCooldownActive
+            ) {
               await cancelOrderSafe(state.sellOrderId);
               const replacement = await submitLimitSell({
                 symbol,
@@ -4258,6 +4606,12 @@ async function manageExitStates() {
                 actionTaken = 'hold_existing_order';
                 reasonCode = replacement?.reason || 'reprice_ttl_skipped';
               }
+            } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS && repriceCooldownActive) {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'reprice_ttl_cooldown';
+            } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS) {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'reprice_ttl_within_band';
             } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
               await cancelOrderSafe(state.sellOrderId);
               const replacement = await submitLimitSell({

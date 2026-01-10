@@ -22,6 +22,10 @@ Optional:
 - `CORS_ALLOWED_ORIGINS` (comma-separated list; leave empty to allow all origins during development)
 - `RATE_LIMIT_WINDOW_MS` (default `60000`)
 - `RATE_LIMIT_MAX` (default `120`)
+- `DESIRED_NET_PROFIT_BASIS_POINTS` (default `100`, target net profit per trade after fees)
+- `MAX_GROSS_TAKE_PROFIT_BASIS_POINTS` (default `220`, cap on gross take-profit distance above entry)
+- `MAX_HOLD_SECONDS` (default `180`, soft max hold time before exiting when profitable)
+- `FORCE_EXIT_SECONDS` (default `300`, hard max hold time before forced exit)
 
 ## Notes
 
