@@ -13,6 +13,7 @@ const {
   fetchOrderById,
   replaceOrder,
   cancelOrder,
+  startEntryManager,
   startExitManager,
   getConcurrencyGuardStatus,
   getLastQuoteSnapshot,
@@ -629,5 +630,6 @@ initializeInventoryFromPositions()
     });
 
     startExitManager();
+    startEntryManager();
 
   });

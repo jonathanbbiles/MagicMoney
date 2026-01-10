@@ -142,6 +142,15 @@ const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
 const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 10000);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
 const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
+const STOP_LOSS_BPS = readNumber('STOP_LOSS_BPS', 60);
+const VOL_HALF_LIFE_MIN = readNumber('VOL_HALF_LIFE_MIN', 6);
+const STOP_VOL_MULT = readNumber('STOP_VOL_MULT', 2.5);
+const TP_VOL_SCALE = readNumber('TP_VOL_SCALE', 1.0);
+const EV_GUARD_ENABLED = readFlag('EV_GUARD_ENABLED', true);
+const EV_MIN_BPS = readNumber('EV_MIN_BPS', -1);
+const RISK_LEVEL = readNumber('RISK_LEVEL', 2);
+const ENTRY_SCAN_INTERVAL_MS = readNumber('ENTRY_SCAN_INTERVAL_MS', 4000);
+const DEBUG_ENTRY = readFlag('DEBUG_ENTRY', false);
 
 const MAX_HOLD_SECONDS = Number(process.env.MAX_HOLD_SECONDS || 300);
 const MAX_HOLD_MS = Number(process.env.MAX_HOLD_MS || MAX_HOLD_SECONDS * 1000);
@@ -166,6 +175,235 @@ const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
+
+// ───────────────────────── ENTRY SIGNAL (RESTORED FROM v3) ─────────────────────────
+const symStats = Object.create(null);
+const sigmaEwmaBySymbol = new Map();
+const spreadEwmaBySymbol = new Map();
+const slipEwmaBySymbol = new Map();
+
+/* 10) STATIC UNIVERSES */
+const ORIGINAL_TOKENS = [
+  'BTC/USD',
+  'ETH/USD',
+  'SOL/USD',
+  'AVAX/USD',
+  'DOGE/USD',
+  'ADA/USD',
+  'XRP/USD',
+  'DOT/USD',
+  'LINK/USD',
+  'MATIC/USD',
+  'LTC/USD',
+  'BCH/USD',
+  'UNI/USD',
+  'AAVE/USD',
+];
+
+const CRYPTO_CORE_TRACKED = ORIGINAL_TOKENS.filter((sym) => !String(sym).includes('USD/USD'));
+
+const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+
+const emaArr = (arr, span) => {
+  if (!arr?.length) return [];
+  const k = 2 / (span + 1);
+  let prev = arr[0];
+  const out = [prev];
+  for (let i = 1; i < arr.length; i++) {
+    prev = arr[i] * k + prev * (1 - k);
+    out.push(prev);
+  }
+  return out;
+};
+
+/* 14) FEE / PNL MODEL */
+const BPS = 10000;
+
+function feeBpsRoundTrip() {
+  return FEE_BPS_MAKER + (TAKER_EXIT_ON_TOUCH ? FEE_BPS_TAKER : FEE_BPS_MAKER);
+}
+
+function expectedValueBps({ pUp, winBps, loseBps, feeBps, spreadBps, slippageBps }) {
+  const win = Number.isFinite(winBps) ? winBps : 0;
+  const lose = Number.isFinite(loseBps) ? loseBps : 0;
+  const fees = Number.isFinite(feeBps) ? feeBps : 0;
+  const spread = Number.isFinite(spreadBps) ? spreadBps : 0;
+  const slip = Number.isFinite(slippageBps) ? slippageBps : 0;
+  const p = clamp(Number.isFinite(pUp) ? pUp : 0.5, 0, 1);
+  return p * win - (1 - p) * lose - fees - spread - slip;
+}
+
+function requiredProfitBpsForSymbol({ spreadBps, slippageBps, feeBps, userMinBps }) {
+  const base = Number.isFinite(userMinBps) ? userMinBps : USER_MIN_PROFIT_BPS;
+  const spread = Number.isFinite(spreadBps) ? spreadBps : 0;
+  const slip = Number.isFinite(slippageBps) ? slippageBps : 0;
+  const fees = Number.isFinite(feeBps) ? feeBps : feeBpsRoundTrip();
+  return Math.max(0, base + PROFIT_BUFFER_BPS + spread + slip + fees);
+}
+
+/* 18) SIGNAL / ENTRY MATH */
+function ewmaSigmaFromCloses(closes, halfLifeMin = 6) {
+  if (!Array.isArray(closes) || closes.length < 2) return 0;
+  const hl = Math.max(1, halfLifeMin);
+  const alpha = 1 - Math.exp(Math.log(0.5) / hl);
+  let variance = 0;
+  for (let i = 1; i < closes.length; i++) {
+    const prev = Number(closes[i - 1]);
+    const next = Number(closes[i]);
+    if (!Number.isFinite(prev) || !Number.isFinite(next) || prev <= 0 || next <= 0) continue;
+    const r = Math.log(next / prev);
+    const r2 = r * r;
+    variance = alpha * r2 + (1 - alpha) * variance;
+  }
+  return Math.sqrt(Math.max(variance, 0)) * BPS;
+}
+
+function barrierPTouchUpDriftless(distUpBps, distDownBps) {
+  const up = Math.max(1, Number(distUpBps) || 0);
+  const down = Math.max(1, Number(distDownBps) || 0);
+  return clamp(down / (up + down), 0.05, 0.95);
+}
+
+function microMetrics({ mid, prevMid, spreadBps }) {
+  const deltaBps = Number.isFinite(prevMid) && prevMid > 0 ? ((mid - prevMid) / prevMid) * BPS : 0;
+  const spreadNorm = Number.isFinite(spreadBps) ? spreadBps : 0;
+  const microBias = clamp(deltaBps / Math.max(spreadNorm, 1) * 0.08, -0.08, 0.08);
+  return {
+    deltaBps,
+    microBias,
+  };
+}
+
+async function computeEntrySignal(symbol) {
+  const asset = { symbol: normalizeSymbol(symbol) };
+  const riskLvl = clamp(Math.round(RISK_LEVEL), 0, 4);
+  let quote;
+  try {
+    quote = await getLatestQuote(asset.symbol, { maxAgeMs: MAX_QUOTE_AGE_MS });
+  } catch (err) {
+    return { entryReady: false, why: 'stale_quote', meta: { symbol: asset.symbol, error: err?.message || err } };
+  }
+
+  const bid = Number(quote.bid);
+  const ask = Number(quote.ask);
+  const mid = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : Number(quote.mid || bid || ask);
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || !Number.isFinite(mid)) {
+    return { entryReady: false, why: 'invalid_quote', meta: { symbol: asset.symbol, bid, ask } };
+  }
+
+  const spreadBps = ((ask - bid) / mid) * BPS;
+  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
+    return { entryReady: false, why: 'spread_gate', meta: { symbol: asset.symbol, spreadBps } };
+  }
+
+  let bars;
+  try {
+    bars = await fetchCryptoBars({ symbols: [asset.symbol], limit: 16, timeframe: '1Min' });
+  } catch (err) {
+    return { entryReady: false, why: 'bars_unavailable', meta: { symbol: asset.symbol, error: err?.message || err } };
+  }
+
+  const barKey = normalizeSymbol(asset.symbol);
+  const barSeries = bars?.bars?.[barKey] || bars?.bars?.[normalizePair(barKey)] || [];
+  const closes = (Array.isArray(barSeries) ? barSeries : []).map((bar) =>
+    Number(bar.c ?? bar.close ?? bar.close_price ?? bar.price ?? bar.vwap)
+  ).filter((value) => Number.isFinite(value) && value > 0);
+
+  if (closes.length < 3) {
+    return { entryReady: false, why: 'insufficient_bars', meta: { symbol: asset.symbol, barCount: closes.length } };
+  }
+
+  const sigmaRawBps = ewmaSigmaFromCloses(closes, VOL_HALF_LIFE_MIN);
+  const sigmaAlpha = 2 / (Math.max(2, VOL_HALF_LIFE_MIN) + 1);
+  const prevSigma = sigmaEwmaBySymbol.get(asset.symbol) ?? sigmaRawBps;
+  const sigmaEwma = sigmaAlpha * sigmaRawBps + (1 - sigmaAlpha) * prevSigma;
+  sigmaEwmaBySymbol.set(asset.symbol, sigmaEwma);
+
+  const spreadAlpha = 0.2;
+  const prevSpread = spreadEwmaBySymbol.get(asset.symbol) ?? spreadBps;
+  const spreadEwma = spreadAlpha * spreadBps + (1 - spreadAlpha) * prevSpread;
+  spreadEwmaBySymbol.set(asset.symbol, spreadEwma);
+
+  const rawSlip = Number.isFinite(spreadBps) ? Math.min(SLIPPAGE_BPS, spreadBps) : SLIPPAGE_BPS;
+  const prevSlip = slipEwmaBySymbol.get(asset.symbol) ?? rawSlip;
+  const slipEwma = spreadAlpha * rawSlip + (1 - spreadAlpha) * prevSlip;
+  slipEwmaBySymbol.set(asset.symbol, slipEwma);
+
+  const prevMid = symStats[asset.symbol]?.lastMid;
+  const micro = microMetrics({ mid, prevMid, spreadBps: spreadEwma });
+  const closesEma = emaArr(closes.slice(-8), 5);
+  const emaTail = closesEma[closesEma.length - 1];
+  const momentumBps = Number.isFinite(emaTail) ? ((closes[closes.length - 1] - emaTail) / emaTail) * BPS : 0;
+  const momentumPenaltyBps = momentumBps < 0 ? Math.abs(momentumBps) * 0.35 : 0;
+  const momBias = clamp(momentumBps / Math.max(sigmaEwma, 1) * 0.15, -0.15, 0.15);
+
+  const stopBps = Math.max(STOP_LOSS_BPS, sigmaEwma * STOP_VOL_MULT);
+  const needBpsVol = Math.max(1, sigmaEwma * TP_VOL_SCALE);
+  const baseNeed = requiredProfitBpsForSymbol({
+    spreadBps: spreadEwma,
+    slippageBps: slipEwma,
+    feeBps: feeBpsRoundTrip(),
+    userMinBps: USER_MIN_PROFIT_BPS,
+  });
+  const riskScale = [1.25, 1.1, 1.0, 0.9, 0.8][riskLvl] ?? 1.0;
+  const needDyn = Math.max(baseNeed, needBpsVol * riskScale) + momentumPenaltyBps;
+  const needBpsCapped = Math.min(needDyn, stopBps);
+
+  const pUpBarrier = barrierPTouchUpDriftless(needBpsCapped, stopBps);
+  let pUp = 0.5 + micro.microBias + momBias + (pUpBarrier - 0.5) * 0.65;
+  pUp = clamp(pUp, 0.05, 0.95);
+
+  const expectedBps = expectedValueBps({
+    pUp,
+    winBps: needBpsCapped,
+    loseBps: stopBps,
+    feeBps: feeBpsRoundTrip(),
+    spreadBps: spreadEwma,
+    slippageBps: slipEwma,
+  });
+
+  if (EV_GUARD_ENABLED && expectedBps < EV_MIN_BPS) {
+    return {
+      entryReady: false,
+      why: 'ev_guard',
+      meta: { symbol: asset.symbol, expectedBps, pUp, needBpsCapped, stopBps },
+    };
+  }
+
+  const grossTpBps = needBpsCapped;
+  const grossFees = FEE_BPS_MAKER + (TAKER_EXIT_ON_TOUCH ? FEE_BPS_TAKER : FEE_BPS_MAKER) + PROFIT_BUFFER_BPS;
+  const desiredNetExitBpsForV22 = Math.max(0, grossTpBps - grossFees);
+
+  symStats[asset.symbol] = {
+    lastMid: mid,
+    lastTs: quote.tsMs,
+    sigmaBps: sigmaEwma,
+    spreadBps: spreadEwma,
+    slipBps: slipEwma,
+  };
+
+  return {
+    entryReady: true,
+    symbol: asset.symbol,
+    grossTpBps,
+    desiredNetExitBpsForV22,
+    stopBps,
+    spreadBps: spreadEwma,
+    slippageBps: slipEwma,
+    sigmaBps: sigmaEwma,
+    pUp,
+    expectedBps,
+    meta: {
+      riskLvl,
+      microDeltaBps: micro.deltaBps,
+      momentumBps,
+      needBpsVol,
+      needDyn,
+      needBpsCapped,
+      feeBps: feeBpsRoundTrip(),
+    },
+  };
+}
 
 const inventoryState = new Map();
 
@@ -197,6 +435,8 @@ const positionsListCache = {
   data: null,
   pending: null,
 };
+let entryManagerRunning = false;
+let entryScanRunning = false;
 const openPositionsCache = {
   tsMs: 0,
   data: null,
@@ -4125,6 +4365,105 @@ async function manageExitStates() {
   }
 }
 
+async function runEntryScanOnce() {
+  if (entryScanRunning) return;
+  entryScanRunning = true;
+  try {
+    const startMs = Date.now();
+    const autoTradeEnabled = readEnvFlag('AUTO_TRADE', true);
+    const liveMode = readEnvFlag('LIVE', readEnvFlag('LIVE_MODE', readEnvFlag('LIVE_TRADING', true)));
+    if (!autoTradeEnabled || !liveMode) {
+      return;
+    }
+
+    const envSymbols = normalizeSymbolsParam(process.env.AUTO_SCAN_SYMBOLS);
+    const stableSymbols = new Set(['USDC/USD', 'USDT/USD', 'BUSD/USD', 'DAI/USD']);
+    const scanSymbols = (envSymbols.length ? envSymbols : CRYPTO_CORE_TRACKED)
+      .map((sym) => normalizeSymbol(sym))
+      .filter((sym) => sym && !stableSymbols.has(sym));
+
+    let positions = [];
+    let openOrders = [];
+    try {
+      [positions, openOrders] = await Promise.all([fetchPositions(), fetchOrders({ status: 'open' })]);
+    } catch (err) {
+      console.warn('entry_scan_fetch_failed', err?.message || err);
+      return;
+    }
+
+    const heldSymbols = new Set();
+    (Array.isArray(positions) ? positions : []).forEach((pos) => {
+      const qty = Number(pos.qty ?? pos.quantity ?? pos.position_qty ?? pos.available);
+      if (Number.isFinite(qty) && qty > 0) {
+        heldSymbols.add(normalizeSymbol(pos.symbol || pos.asset_id || pos.id || ''));
+      }
+    });
+
+    const openBuySymbols = new Set();
+    (Array.isArray(openOrders) ? openOrders : []).forEach((order) => {
+      const side = String(order.side || '').toLowerCase();
+      if (side !== 'buy') return;
+      const orderSymbol = normalizeSymbol(order.symbol || order.rawSymbol || '');
+      if (orderSymbol) openBuySymbols.add(orderSymbol);
+    });
+
+    let placed = 0;
+    let scanned = 0;
+    let skipped = 0;
+    const skipCounts = new Map();
+
+    for (const symbol of scanSymbols) {
+      scanned += 1;
+      if (heldSymbols.has(symbol)) {
+        skipped += 1;
+        skipCounts.set('held_position', (skipCounts.get('held_position') || 0) + 1);
+        continue;
+      }
+      if (openBuySymbols.has(symbol)) {
+        skipped += 1;
+        skipCounts.set('open_buy', (skipCounts.get('open_buy') || 0) + 1);
+        continue;
+      }
+
+      const signal = await computeEntrySignal(symbol);
+      if (DEBUG_ENTRY) {
+        console.log('entry_signal', { symbol, entryReady: signal.entryReady, why: signal.why, meta: signal.meta });
+      }
+      if (!signal.entryReady) {
+        skipped += 1;
+        skipCounts.set(signal.why || 'signal_skip', (skipCounts.get(signal.why || 'signal_skip') || 0) + 1);
+        continue;
+      }
+
+      desiredExitBpsBySymbol.set(symbol, signal.desiredNetExitBpsForV22);
+      await placeMakerLimitBuyThenSell(symbol);
+      placed += 1;
+      break;
+    }
+
+    const topSkipReasons = Array.from(skipCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .reduce((acc, [reason, count]) => {
+        acc[reason] = count;
+        return acc;
+      }, {});
+
+    const endMs = Date.now();
+    console.log('entry_scan', {
+      startMs,
+      endMs,
+      durationMs: endMs - startMs,
+      scanned,
+      placed,
+      skipped,
+      topSkipReasons,
+    });
+  } finally {
+    entryScanRunning = false;
+  }
+}
+
 function startExitManager() {
 
   setInterval(() => {
@@ -4139,6 +4478,17 @@ function startExitManager() {
 
   console.log('exit_manager_started', { intervalSeconds: REPRICE_EVERY_SECONDS });
 
+}
+
+function startEntryManager() {
+  if (entryManagerRunning) return;
+  entryManagerRunning = true;
+  setInterval(() => {
+    runEntryScanOnce().catch((err) => {
+      console.error('entry_manager_failed', err?.message || err);
+    });
+  }, ENTRY_SCAN_INTERVAL_MS);
+  console.log('entry_manager_started', { intervalMs: ENTRY_SCAN_INTERVAL_MS });
 }
 
  
@@ -5063,6 +5413,7 @@ module.exports = {
   getSupportedCryptoPairsSnapshot,
   filterSupportedCryptoSymbols,
 
+  startEntryManager,
   startExitManager,
   getConcurrencyGuardStatus,
   getLastQuoteSnapshot,
