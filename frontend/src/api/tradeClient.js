@@ -1,4 +1,4 @@
-import { getApiToken, getBackendBaseUrl } from '../config/alpaca';
+import { getApiToken, getBackendBaseUrl } from '../config/alpaca.js';
 
 const buildAuthHeaders = () => {
   const token = getApiToken();

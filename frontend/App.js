@@ -9,11 +9,11 @@ import {
   StyleSheet,
   ActivityIndicator,
 } from 'react-native';
-import { getBackendBaseUrl, getBackendHeaders } from './src/config/alpaca';
-import { LiveLogsCopyViewer, TxnHistoryCSVViewer } from './src/components/HistoryViewers';
-import { getAccountSummaryRaw, getAllPositions, getOpenOrders, registerAlpacaLogger } from './src/services/alpacaClient';
-import { fmtPct, fmtUSD } from './src/utils/format';
-import { normalizePair } from './src/utils/symbols';
+import { getBackendBaseUrl, getBackendHeaders } from './src/config/alpaca.js';
+import { LiveLogsCopyViewer, TxnHistoryCSVViewer } from './src/components/HistoryViewers.js';
+import { getAccountSummaryRaw, getAllPositions, getOpenOrders, registerAlpacaLogger } from './src/services/alpacaClient.js';
+import { fmtPct, fmtUSD } from './src/utils/format.js';
+import { normalizePair } from './src/utils/symbols.js';
 async function buyViaTrade(symbolRaw) {
   const symbol = String(symbolRaw || '').trim();
   if (!symbol) throw new Error('buyViaTrade: symbol required');

@@ -1,4 +1,4 @@
-import { DEFAULT_SETTINGS, SIMPLE_SETTINGS_ONLY } from '../config/alpaca';
+import { DEFAULT_SETTINGS, SIMPLE_SETTINGS_ONLY } from '../config/alpaca.js';
 
 let settings = { ...DEFAULT_SETTINGS };
 let overrides = {};

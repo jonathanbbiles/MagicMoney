@@ -2,7 +2,7 @@ import {
   BACKEND_BASE_URL,
   DATA_LOCATIONS,
   getBackendHeaders,
-} from '../config/alpaca';
+} from '../config/alpaca.js';
 import { getSettings } from '../state/settingsStore';
 import { isoDaysAgo, isFresh, parseTsMs } from '../utils/format';
 import { rateLimitedFetch as fetchWithBudget, sleep } from '../utils/network';
