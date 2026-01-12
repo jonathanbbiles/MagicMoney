@@ -9,7 +9,7 @@ import {
   StyleSheet,
   ActivityIndicator,
 } from 'react-native';
-import { getBackendBaseUrl, getBackendHeaders } from './src/config/alpaca';
+import { getBackendBaseUrl, getBackendHeaders } from './src/config/./alpaca';
 import { LiveLogsCopyViewer, TxnHistoryCSVViewer } from './src/components/HistoryViewers';
 import { getAccountSummaryRaw, getAllPositions, getOpenOrders, registerAlpacaLogger } from './src/services/alpacaClient';
 import { fmtPct, fmtUSD } from './src/utils/format';
