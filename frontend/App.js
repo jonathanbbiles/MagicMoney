@@ -764,7 +764,7 @@ async function getStockClockCached(ttlMs = 30000) {
 }
 
 /* ──────────────────────── 9) TRANSACTION HISTORY → CSV VIEWER ──────────────────────── */
-const TxnHistoryCSVViewer = () => {
+const TxnHistoryCSVViewer = ({ embedded = false }) => {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
   const [csv, setCsv] = useState('');
@@ -845,8 +845,8 @@ const TxnHistoryCSVViewer = () => {
     }
   };
 
-  return (
-    <View style={styles.txnBox}>
+  const content = (
+    <>
       <Text style={styles.txnTitle}>Transaction History → CSV</Text>
       <View style={styles.txnBtnRow}>
         <TouchableOpacity style={styles.txnBtn} onPress={() => buildRange(1)} disabled={busy}>
@@ -889,12 +889,14 @@ const TxnHistoryCSVViewer = () => {
           )}
         </>
       ) : null}
-    </View>
+    </>
   );
+
+  return embedded ? <View>{content}</View> : <View style={styles.txnBox}>{content}</View>;
 };
 
 /* ─────────────────────────── 9b) LIVE LOGS → COPY VIEWER ─────────────────────────── */
-const LiveLogsCopyViewer = ({ logs = [] }) => {
+const LiveLogsCopyViewer = ({ logs = [], embedded = false }) => {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
   const [txt, setTxt] = useState('');
@@ -927,8 +929,8 @@ const LiveLogsCopyViewer = ({ logs = [] }) => {
     }
   };
 
-  return (
-    <View style={styles.txnBox}>
+  const content = (
+    <>
       <Text style={styles.txnTitle}>Live Logs → Copy</Text>
       <View style={styles.txnBtnRow}>
         <TouchableOpacity style={styles.txnBtn} onPress={build} disabled={busy}>
@@ -952,8 +954,10 @@ const LiveLogsCopyViewer = ({ logs = [] }) => {
           textBreakStrategy="highQuality"
         />
       ) : null}
-    </View>
+    </>
   );
+
+  return embedded ? <View>{content}</View> : <View style={styles.txnBox}>{content}</View>;
 };
 
 /* ─────────────────────────── 9c) PnL & Benchmark Scoreboard ─────────────────────────── */
@@ -5783,6 +5787,7 @@ export default function App() {
     skipped: 0,
     reasons: {},
   });
+  const [historyTab, setHistoryTab] = useState('transactions');
 
   const [settings, setSettings] = useState({ ...getEffectiveSettings() });
   const lastRiskChangeRef = useRef({ ts: 0, source: null, level: null });
@@ -7454,6 +7459,10 @@ export default function App() {
     );
   }
 
+  const combinedBuyingPower =
+    (Number.isFinite(acctSummary.cryptoBuyingPower) ? acctSummary.cryptoBuyingPower : 0) +
+    (Number.isFinite(acctSummary.stockBuyingPower) ? acctSummary.stockBuyingPower : 0);
+
   return (
     <SafeAreaView style={styles.safe}>
       <ScrollView
@@ -7465,380 +7474,145 @@ export default function App() {
           <View style={styles.headerTopRow}>
             <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
             <Text style={[styles.appTitle, darkMode && styles.titleDark]}>Magic $$</Text>
-            <Text style={styles.versionTag}>{VERSION}</Text>
-            <View style={[styles.pillToggle, { marginLeft: 6, backgroundColor: '#7fd180' }]}>
-              <Text style={styles.pillText}>LIVE</Text>
-            </View>
-            <TouchableOpacity onPress={() => setShowSettings((v) => !v)} style={[styles.pillToggle, { marginLeft: 8 }]}>
-              <Text style={styles.pillText}>⚙️ Settings</Text>
-            </TouchableOpacity>
           </View>
-
-          <Text style={styles.subTitle}>
-            Open {openMeta.positions}/{openMeta.universe}
-            <Text style={styles.dot}> • </Text>
-            Orders {openMeta.orders}
-            <Text style={styles.dot}> • </Text>
-            Universe {openMeta.universe}
-            {univUpdatedAt ? ` • U↑ ${new Date(univUpdatedAt).toLocaleTimeString()}` : ''}
-          </Text>
 
           {notification && (
             <View style={styles.topBanner}>
               <Text style={styles.topBannerText}>{notification}</Text>
             </View>
           )}
-
-          <View style={styles.riskHealthRow}>
-            <View style={styles.riskIconGroup}>
-              {RISK_LEVELS.map((icon, idx) => (
-                <TouchableOpacity
-                  key={idx}
-                  onPress={() => setRiskLevel(idx, { source: 'UI', reason: 'tap' })}
-                  style={[
-                    styles.riskIconWrapper,
-                    settings.riskLevel === idx && styles.riskIconWrapperActive,
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.riskIcon,
-                      settings.riskLevel === idx && styles.riskIconActive,
-                    ]}
-                  >
-                    {icon}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-            <View style={styles.healthIconGroup}>
-              <View style={styles.healthIconItem}>
-                <Text style={styles.healthIcon}>✅</Text>
-                <Text style={styles.healthIconLabel}>Crypto</Text>
-              </View>
-              <TouchableOpacity onPress={checkAlpacaHealth} style={styles.chip}>
-                <Text style={styles.chipText}>Re-check</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
         </View>
 
-        {/* Settings Panel */}
-        {showSettings && (
-          <View style={styles.card}>
-            <Text style={styles.cardTitle}>🛠️ Settings — Gates (matches logs)</Text>
-
-            <View style={styles.rowSpace}>
-              {['Safer', 'Neutral', 'Faster', 'Aggro', 'Max'].map((p) => (
-                <TouchableOpacity key={p} style={styles.chip} onPress={() => applyPreset(p)}>
-                  <Text style={styles.chipText}>{p}</Text>
-                </TouchableOpacity>
-              ))}
+        <View style={styles.accountSnapshot}>
+          <Text style={styles.snapshotTitle}>Account Snapshot</Text>
+          <Text style={styles.snapshotLabel}>Buying Power</Text>
+          <Text style={styles.snapshotValue}>{fmtUSD(combinedBuyingPower)}</Text>
+          <View style={styles.snapshotMetaRow}>
+            <View style={styles.snapshotBadge}>
+              <Text style={styles.snapshotBadgeText}>Day {fmtPct(acctSummary.dailyChangePct)}</Text>
             </View>
-
-            <View style={styles.line} />
-
-            {/* Spread max */}
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>🧱 spread — Max spread (bps)</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('spreadMaxBps', -5, { min: 3 })}>
-                  <Text style={styles.bumpBtnText}>-5</Text>
-                </TouchableOpacity>
-                <Text style={styles.value}>{settings.spreadMaxBps}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('spreadMaxBps', +5, { max: 200 })}>
-                  <Text style={styles.bumpBtnText}>+5</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-
-            {/* Touch flip timeout */}
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>Touch flip timeout (s)</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('touchFlipTimeoutSec', -1, { min: 2 })}>
-                  <Text style={styles.bumpBtnText}>-</Text>
-                </TouchableOpacity>
-                <Text style={styles.value}>{settings.touchFlipTimeoutSec}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('touchFlipTimeoutSec', +1, { max: 30 })}>
-                  <Text style={styles.bumpBtnText}>+</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-
-            {!SIMPLE_SETTINGS_ONLY && (
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>⏱️ no_quote — require fresh quote</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity
-                  style={[styles.chip, { backgroundColor: settings.liveRequireQuote ? '#4caf50' : '#2b2b2b' }]}
-                  onPress={() => setSettings((s) => ({ ...s, liveRequireQuote: !s.liveRequireQuote }))}
-                >
-                  <Text style={styles.chipText}>{settings.liveRequireQuote ? 'ON' : 'OFF'}</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-            )}
-
-            <View style={styles.line} />
-
-            {/* Toggle: require spread ≥ fees + guard */}
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>💸 Require spread ≥ fees + guard</Text>
-              <TouchableOpacity
-                style={[styles.chip, { backgroundColor: settings.requireSpreadOverFees ? '#4caf50' : '#2b2b2b' }]}
-                onPress={() => setSettings((s) => ({ ...s, requireSpreadOverFees: !s.requireSpreadOverFees }))}
-              >
-                <Text style={styles.chipText}>{settings.requireSpreadOverFees ? 'ON' : 'OFF'}</Text>
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.line} />
-
-            {/* Stops */}
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>🛑 Stops enabled</Text>
-              <TouchableOpacity
-                style={[styles.chip, { backgroundColor: settings.enableStops ? '#4caf50' : '#2b2b2b' }]}
-                onPress={() => setSettings((s) => ({ ...s, enableStops: !s.enableStops }))}
-              >
-                <Text style={styles.chipText}>{settings.enableStops ? 'ON' : 'OFF'}</Text>
-              </TouchableOpacity>
-            </View>
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>Stop loss (%) below entry</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('stopLossPct', -0.25, { min: 0.2 })}>
-                  <Text style={styles.bumpBtnText}>-</Text>
-                </TouchableOpacity>
-                <Text style={styles.value}>{Number(settings.stopLossPct ?? 0).toFixed(2)}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('stopLossPct', +0.25, { max: 10 })}>
-                  <Text style={styles.bumpBtnText}>+</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-
-            {/* Trailing */}
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>📈 Trailing stop enabled</Text>
-              <TouchableOpacity
-                style={[styles.chip, { backgroundColor: settings.enableTrailing ? '#4caf50' : '#2b2b2b' }]}
-                onPress={() => setSettings((s) => ({ ...s, enableTrailing: !s.enableTrailing }))}
-              >
-                <Text style={styles.chipText}>{settings.enableTrailing ? 'ON' : 'OFF'}</Text>
-              </TouchableOpacity>
-            </View>
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>Trail starts at profit (%)</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('trailStartPct', -0.25, { min: 0.1 })}>
-                  <Text style={styles.bumpBtnText}>-</Text>
-                </TouchableOpacity>
-                <Text style={styles.value}>{Number(settings.trailStartPct ?? 0).toFixed(2)}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('trailStartPct', +0.25, { max: 20 })}>
-                  <Text style={styles.bumpBtnText}>+</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>Sell if drop from peak (%)</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('trailDropPct', -0.25, { min: 0.1 })}>
-                  <Text style={styles.bumpBtnText}>-</Text>
-                </TouchableOpacity>
-                <Text style={styles.value}>{Number(settings.trailDropPct ?? 0).toFixed(2)}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('trailDropPct', +0.25, { max: 20 })}>
-                  <Text style={styles.bumpBtnText}>+</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-
-            {/* Fees (bps): Maker/Taker */}
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>Fees (bps): Maker / Taker</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('feeBpsMaker', -1, { min: 0 })}><Text style={styles.bumpBtnText}>-</Text></TouchableOpacity>
-                <Text style={styles.value}>{settings.feeBpsMaker}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('feeBpsMaker', +1, { max: 200 })}><Text style={styles.bumpBtnText}>+</Text></TouchableOpacity>
-                <Text style={[styles.value, { marginHorizontal: 6 }]}>/</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('feeBpsTaker', -1, { min: 0 })}><Text style={styles.bumpBtnText}>-</Text></TouchableOpacity>
-                <Text style={styles.value}>{settings.feeBpsTaker}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('feeBpsTaker', +1, { max: 200 })}><Text style={styles.bumpBtnText}>+</Text></TouchableOpacity>
-              </View>
-            </View>
-
-            {/* Gates */}
-            <View style={{ marginTop: 4 }}><Text style={styles.subtle}>Gates</Text></View>
-
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>⚖️ spread_fee_gate — fees + guard (bps)</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('spreadOverFeesMinBps', -1, { min: 0 })}><Text style={styles.bumpBtnText}>-</Text></TouchableOpacity>
-                <Text style={styles.value}>{settings.spreadOverFeesMinBps}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('spreadOverFeesMinBps', +1, { max: 100 })}><Text style={styles.bumpBtnText}>+</Text></TouchableOpacity>
-              </View>
-            </View>
-
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>📉 edge_negative — Dynamic min profit (bps)</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('dynamicMinProfitBps', -5, { min: 0 })}><Text style={styles.bumpBtnText}>-5</Text></TouchableOpacity>
-                <Text style={styles.value}>{settings.dynamicMinProfitBps}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('dynamicMinProfitBps', +5, { max: 500 })}><Text style={styles.bumpBtnText}>+5</Text></TouchableOpacity>
-              </View>
-            </View>
-
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>📉 edge_negative — Extra over fees (bps)</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('extraOverFeesBps', -1, { min: 0 })}><Text style={styles.bumpBtnText}>-</Text></TouchableOpacity>
-                <Text style={styles.value}>{settings.extraOverFeesBps}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('extraOverFeesBps', +1, { max: 100 })}><Text style={styles.bumpBtnText}>+</Text></TouchableOpacity>
-              </View>
-            </View>
-
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>📉 edge_negative — Absolute net min profit (bps)</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('netMinProfitBps', -0.5, { min: 0 })}><Text style={styles.bumpBtnText}>-</Text></TouchableOpacity>
-                <Text style={styles.value}>{Number(settings.netMinProfitBps).toFixed(1)}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('netMinProfitBps', +0.5, { max: 100 })}><Text style={styles.bumpBtnText}>+</Text></TouchableOpacity>
-              </View>
-            </View>
-
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>🧪 tiny_price — Min price (USD)</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('minPriceUsd', -0.0005, { min: 0 })}><Text style={styles.bumpBtnText}>-</Text></TouchableOpacity>
-                <Text style={styles.value}>{settings.minPriceUsd}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('minPriceUsd', +0.0005, { max: 10 })}><Text style={styles.bumpBtnText}>+</Text></TouchableOpacity>
-              </View>
-            </View>
-
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>🧠 nomomo — momentum filter</Text>
-              <TouchableOpacity
-                style={[styles.chip, { backgroundColor: settings.enforceMomentum ? '#4caf50' : '#2b2b2b' }]}
-                onPress={() => setSettings((s) => ({ ...s, enforceMomentum: !s.enforceMomentum }))}
-              >
-                <Text style={styles.chipText}>{settings.enforceMomentum ? 'ON' : 'OFF'}</Text>
-              </TouchableOpacity>
-            </View>
-
-            <View style={styles.rowSpace}>
-              <Text style={styles.label}>🧮 concurrency_guard — Max positions</Text>
-              <View style={styles.bumpGroup}>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('maxConcurrentPositions', -1, { min: 1 })}>
-                  <Text style={styles.bumpBtnText}>-</Text>
-                </TouchableOpacity>
-                <Text style={styles.value}>{settings.maxConcurrentPositions}</Text>
-                <TouchableOpacity style={styles.bumpBtn} onPress={() => bump('maxConcurrentPositions', +1, { max: 50 })}>
-                  <Text style={styles.bumpBtnText}>+</Text></TouchableOpacity>
-              </View>
-            </View>
-          </View>
-        )}
-
-        {/* Controls + Buying Power */}
-        <View style={[styles.toolbar, darkMode && styles.toolbarDark]}>
-          <View style={styles.topControlRow}>
-            <TouchableOpacity onPress={onRefresh} style={[styles.pillToggle, styles.pillNeutral]}>
-              <Text style={styles.pillText}>Refresh</Text>
-            </TouchableOpacity>
-            <TouchableOpacity onPress={() => cancelAllOrders({ caller: 'manual_cancel_orders' })} style={[styles.pillToggle, styles.btnWarn]}>
-              <Text style={styles.pillText}>Cancel Orders</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={() => cancelAllOrders({ allowTpCancel: true, caller: 'manual_mass_cancel_tp' })}
-              style={[styles.pillToggle, styles.btnWarn]}
-            >
-              <Text style={styles.pillText}>Cancel TP</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              onPress={() => setAutoTrade((v) => !v)}
-              style={[styles.pillToggle, { backgroundColor: autoTrade ? '#7fd180' : '#e0d8f6' }]}
-            >
-              <Text style={styles.pillText}>{autoTrade ? 'Auto-Trade: ON' : 'Auto-Trade: OFF'}</Text>
-            </TouchableOpacity>
-            <View style={styles.inlineBP}>
-              <Text style={styles.bpLabel}>Buying Power</Text>
-              <Text style={styles.bpValue}>
-                {fmtUSD(acctSummary.buyingPower)} <Text style={styles.subtle}>crypto</Text>
-                <Text style={styles.dot}> • </Text>
-                {fmtUSD(acctSummary.stockBuyingPower)} <Text style={styles.subtle}>stk</Text>
-                {isUpdatingAcct && <Text style={styles.badgeUpdating}>↻</Text>}
-                <Text style={styles.dot}> • </Text>
-                <Text style={styles.dayBadge}>Day {fmtPct(acctSummary.dailyChangePct)}</Text>
-              </Text>
-            </View>
+            {isUpdatingAcct && <Text style={styles.snapshotUpdating}>↻</Text>}
           </View>
         </View>
 
         {/* Chart order per request: 1) Portfolio Percentage, 2) Holdings Percentage, 3) Portfolio Value */}
-        {/* NEW: P&L + Benchmarks scoreboard */}
-        <PnlScoreboard days={7} />
-        <PortfolioChangeChart acctSummary={acctSummary} />
-        <HoldingsChangeBarChart />
-        <DailyPortfolioValueChart acctSummary={acctSummary} />
-        <TxnHistoryCSVViewer />
+        <View style={styles.dashboardCard}>
+          <Text style={styles.dashboardTitle}>Dashboard</Text>
+          <Text style={styles.dashboardSectionTitle}>At-a-glance</Text>
+          <View style={styles.metricsGrid}>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Portfolio Value</Text>
+              <Text style={styles.metricValue}>{fmtUSD(acctSummary.portfolioValue)}</Text>
+            </View>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Daily Change</Text>
+              <Text style={styles.metricValue}>{fmtPct(acctSummary.dailyChangePct)}</Text>
+              <Text style={styles.metricSubValue}>{fmtUSD(acctSummary.dailyChangeUsd)}</Text>
+            </View>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Open Positions</Text>
+              <Text style={styles.metricValue}>{openMeta.positions}</Text>
+            </View>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Open Orders</Text>
+              <Text style={styles.metricValue}>{openMeta.orders}</Text>
+            </View>
+          </View>
 
-        <LiveLogsCopyViewer logs={logHistory} />
+          <Text style={styles.dashboardSectionTitle}>Performance</Text>
+          <View style={styles.dashboardSection}>
+            <PnlScoreboard days={7} />
+            <PortfolioChangeChart acctSummary={acctSummary} />
+            <HoldingsChangeBarChart />
+            <DailyPortfolioValueChart acctSummary={acctSummary} />
+          </View>
 
-        <View style={styles.card}>
-          <Text style={styles.cardTitle}>Scan summary</Text>
-          <View style={styles.scanRow}>
-            <View style={styles.scanItem}>
-              <Text style={styles.scanLabel}>Ready</Text>
-              <Text style={styles.scanValue}>{scanStats.ready}</Text>
+          <Text style={styles.dashboardSectionTitle}>Scan Summary</Text>
+          <View style={styles.scanGrid}>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Ready</Text>
+              <Text style={styles.metricValue}>{scanStats.ready}</Text>
             </View>
-            <View style={styles.scanItem}>
-              <Text style={styles.scanLabel}>Sent</Text>
-              <Text style={styles.scanValue}>{scanStats.attemptsSent}</Text>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Sent</Text>
+              <Text style={styles.metricValue}>{scanStats.attemptsSent}</Text>
             </View>
-            <View style={styles.scanItem}>
-              <Text style={styles.scanLabel}>Failed</Text>
-              <Text style={styles.scanValue}>{scanStats.attemptsFailed}</Text>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Failed</Text>
+              <Text style={styles.metricValue}>{scanStats.attemptsFailed}</Text>
             </View>
-            <View style={styles.scanItem}>
-              <Text style={styles.scanLabel}>Open</Text>
-              <Text style={styles.scanValue}>{scanStats.ordersOpen}</Text>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Open</Text>
+              <Text style={styles.metricValue}>{scanStats.ordersOpen}</Text>
             </View>
-            <View style={styles.scanItem}>
-              <Text style={styles.scanLabel}>Fills</Text>
-              <Text style={styles.scanValue}>{scanStats.fillsCount}</Text>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Fills</Text>
+              <Text style={styles.metricValue}>{scanStats.fillsCount}</Text>
             </View>
-            <View style={styles.scanItem}>
-              <Text style={styles.scanLabel}>Watch</Text>
-              <Text style={styles.scanValue}>{scanStats.watch}</Text>
+            <View style={styles.metricTile}>
+              <Text style={styles.metricLabel}>Watch</Text>
+              <Text style={styles.metricValue}>{scanStats.watch}</Text>
             </View>
           </View>
           {!!scanStats?.reasons && Object.keys(scanStats.reasons).length > 0 && (
-            <>
+            <View style={styles.scanReasons}>
               <View style={styles.line} />
               <Text style={styles.subtle}>Skipped by reason:</Text>
               {Object.entries(scanStats.reasons).map(([k, v]) => (
                 <Text key={k} style={styles.subtle}>• {k}: {v}</Text>
               ))}
-            </>
+            </View>
           )}
         </View>
 
         <View style={[styles.card, { flexShrink: 0 }]}>
-          <Text style={styles.cardTitle}>Live logs</Text>
-          <View style={{ minHeight: Math.min(logHistory.length, LOG_UI_LIMIT) * LOG_LINE_HEIGHT }}>
-            {logHistory.slice(0, LOG_UI_LIMIT).map((l, i) => (
-              <Text
-                key={`${l.ts}-${i}`}
-                style={[
-                  styles.logLine,
-                  l.sev === 'success' ? styles.sevSuccess :
-                  l.sev === 'warn'    ? styles.sevWarn :
-                  l.sev === 'error'   ? styles.sevError : styles.sevInfo
-                ]}
-              >
-                {new Date(l.ts).toLocaleTimeString()} • {l.text}
+          <Text style={styles.cardTitle}>History & Logs</Text>
+          <View style={styles.historyTabsRow}>
+            <TouchableOpacity
+              onPress={() => setHistoryTab('transactions')}
+              style={[styles.historyTabChip, historyTab === 'transactions' && styles.historyTabChipActive]}
+            >
+              <Text style={[styles.historyTabText, historyTab === 'transactions' && styles.historyTabTextActive]}>
+                Transactions (CSV)
               </Text>
-            ))}
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setHistoryTab('feed')}
+              style={[styles.historyTabChip, historyTab === 'feed' && styles.historyTabChipActive]}
+            >
+              <Text style={[styles.historyTabText, historyTab === 'feed' && styles.historyTabTextActive]}>
+                Live Logs (Feed)
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={() => setHistoryTab('copy')}
+              style={[styles.historyTabChip, historyTab === 'copy' && styles.historyTabChipActive]}
+            >
+              <Text style={[styles.historyTabText, historyTab === 'copy' && styles.historyTabTextActive]}>
+                Live Logs (Copy)
+              </Text>
+            </TouchableOpacity>
+          </View>
+          <View style={styles.historyContent}>
+            {historyTab === 'transactions' && <TxnHistoryCSVViewer embedded />}
+            {historyTab === 'feed' && (
+              <View style={{ minHeight: Math.min(logHistory.length, LOG_UI_LIMIT) * LOG_LINE_HEIGHT }}>
+                {logHistory.slice(0, LOG_UI_LIMIT).map((l, i) => (
+                  <Text
+                    key={`${l.ts}-${i}`}
+                    style={[
+                      styles.logLine,
+                      l.sev === 'success' ? styles.sevSuccess :
+                      l.sev === 'warn'    ? styles.sevWarn :
+                      l.sev === 'error'   ? styles.sevError : styles.sevInfo
+                    ]}
+                  >
+                    {new Date(l.ts).toLocaleTimeString()} • {l.text}
+                  </Text>
+                ))}
+              </View>
+            )}
+            {historyTab === 'copy' && <LiveLogsCopyViewer logs={logHistory} embedded />}
           </View>
         </View>
 
@@ -7864,6 +7638,22 @@ const styles = StyleSheet.create({
   dot: { color: '#657788', fontWeight: '800' },
   topBanner: { marginTop: 6, paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#ead5ff', borderRadius: 8, width: '100%' },
   topBannerText: { color: '#355070', textAlign: 'center', fontWeight: '700', fontSize: 12 },
+
+  accountSnapshot: {
+    backgroundColor: '#ffffff',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  snapshotTitle: { color: '#657788', fontSize: 12, fontWeight: '700', letterSpacing: 0.3 },
+  snapshotLabel: { color: '#9aa8b7', fontSize: 11, marginTop: 4 },
+  snapshotValue: { color: '#355070', fontSize: 22, fontWeight: '800', marginTop: 4 },
+  snapshotMetaRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 },
+  snapshotBadge: { backgroundColor: '#e0d8f6', paddingVertical: 4, paddingHorizontal: 8, borderRadius: 999 },
+  snapshotBadgeText: { color: '#355070', fontSize: 11, fontWeight: '800' },
+  snapshotUpdating: { color: '#657788', fontSize: 12, fontWeight: '700' },
 
   toolbar: { backgroundColor: '#e9faff', padding: 6, borderRadius: 8, marginBottom: 8 },
   toolbarDark: { backgroundColor: '#d7ecff' },
@@ -7892,6 +7682,24 @@ const styles = StyleSheet.create({
   bumpGroup: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   bumpBtn: { backgroundColor: '#dcd3f7', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 6 },
   bumpBtnText: { color: '#355070', fontWeight: '800' },
+
+  dashboardCard: { backgroundColor: '#f6fbff', borderRadius: 14, padding: 12, marginBottom: 10 },
+  dashboardTitle: { color: '#355070', fontWeight: '800', fontSize: 14, marginBottom: 6 },
+  dashboardSectionTitle: { color: '#657788', fontWeight: '700', fontSize: 12, marginTop: 8, marginBottom: 6 },
+  dashboardSection: { gap: 8 },
+  metricsGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  metricTile: {
+    width: '48%',
+    backgroundColor: '#ffffff',
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  metricLabel: { color: '#657788', fontSize: 11, fontWeight: '600' },
+  metricValue: { color: '#355070', fontSize: 16, fontWeight: '800', marginTop: 4 },
+  metricSubValue: { color: '#9aa8b7', fontSize: 11, marginTop: 2 },
+  scanGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  scanReasons: { marginTop: 6 },
 
   grid2: { flexDirection: 'row', gap: 8 },
   statBox: { flex: 1, backgroundColor: '#e9faff', borderRadius: 8, padding: 10 },
@@ -7934,6 +7742,12 @@ const styles = StyleSheet.create({
   scanItem: { flex: 1, alignItems: 'center' },
   scanLabel: { color: '#657788', fontSize: 11, fontWeight: '600' },
   scanValue: { color: '#355070', fontSize: 14, fontWeight: '800', marginTop: 2 },
+  historyTabsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 8 },
+  historyTabChip: { backgroundColor: '#e0d8f6', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 999 },
+  historyTabChipActive: { backgroundColor: '#b29cd4' },
+  historyTabText: { color: '#355070', fontSize: 11, fontWeight: '800' },
+  historyTabTextActive: { color: '#ffffff' },
+  historyContent: { paddingTop: 4 },
   riskHealthRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginTop: 6, marginBottom: 6 },
   riskIconGroup: { flexDirection: 'row', alignItems: 'center', marginRight: 16 },
   healthIconGroup: { flexDirection: 'row', alignItems: 'center' },
