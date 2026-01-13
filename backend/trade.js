@@ -3329,44 +3329,6 @@ async function repairOrphanExits() {
       continue;
     }
 
-    if (hasTrackedExit) {
-      if (hasOpenSell) {
-        decision = 'OK:tracked_and_has_open_sell';
-        skipped += 1;
-        logExitRepairDecision({
-          symbol,
-          qty,
-          avgEntryPrice,
-          costBasis,
-          bid,
-          ask,
-          targetPrice,
-          timeInForce,
-          orderType,
-          hasOpenSell,
-          gates: gateFlags,
-          decision,
-        });
-        continue;
-      }
-      exitState.delete(symbol);
-      decision = 'RESET:tracked_missing_open_sell';
-      logExitRepairDecision({
-        symbol,
-        qty,
-        avgEntryPrice,
-        costBasis,
-        bid,
-        ask,
-        targetPrice,
-        timeInForce,
-        orderType,
-        hasOpenSell,
-        gates: gateFlags,
-        decision,
-      });
-    }
-
     if (!Number.isFinite(avgEntryPrice) || avgEntryPrice <= 0) {
       decision = 'SKIP:missing_cost_basis';
       skipped += 1;
@@ -3407,6 +3369,53 @@ async function repairOrphanExits() {
     const requiredExitBps = plan.requiredExitBps;
     targetPrice = plan.targetPrice;
     const postOnly = true;
+
+    if (hasTrackedExit) {
+      if (hasOpenSell) {
+        const trackedState = exitState.get(symbol) || {};
+        exitState.set(symbol, {
+          ...trackedState,
+          effectiveEntryPrice: plan.effectiveEntryPrice,
+          requiredExitBps: plan.requiredExitBps,
+          minNetProfitBps: plan.requiredExitBps,
+          netAfterFeesBps: plan.netAfterFeesBps,
+          targetPrice: plan.targetPrice,
+        });
+        decision = 'OK:tracked_and_has_open_sell';
+        skipped += 1;
+        logExitRepairDecision({
+          symbol,
+          qty,
+          avgEntryPrice,
+          costBasis,
+          bid,
+          ask,
+          targetPrice,
+          timeInForce,
+          orderType,
+          hasOpenSell,
+          gates: gateFlags,
+          decision,
+        });
+        continue;
+      }
+      exitState.delete(symbol);
+      decision = 'RESET:tracked_missing_open_sell';
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+    }
 
     if (hasOpenSell && !hasTrackedExit) {
       const bestOrder = openSellOrders
@@ -3819,16 +3828,15 @@ async function manageExitStates() {
         let requiredExitBps = Number.isFinite(state.requiredExitBps) ? state.requiredExitBps : null;
         let minNetProfitBps = Number.isFinite(state.requiredExitBps) ? state.requiredExitBps : null;
         let targetPrice = null;
-        if (
-          useNetAfterFeesMode &&
-          (!Number.isFinite(state.requiredExitBps) || !Number.isFinite(state.effectiveEntryPrice))
-        ) {
+        if (useNetAfterFeesMode) {
           const plan = computeExitPlanNetAfterFees({
             symbol,
             entryPrice: state.entryPrice,
             entryFeeBps,
             exitFeeBps,
-            effectiveEntryPriceOverride: exitEntryPrice,
+            effectiveEntryPriceOverride: Number.isFinite(state.effectiveEntryPrice)
+              ? state.effectiveEntryPrice
+              : state.entryPrice,
           });
           state.netAfterFeesBps = plan.netAfterFeesBps;
           state.effectiveEntryPrice = plan.effectiveEntryPrice;
@@ -3839,7 +3847,7 @@ async function manageExitStates() {
           requiredExitBps = plan.requiredExitBps;
           minNetProfitBps = plan.requiredExitBps;
           targetPrice = plan.targetPrice;
-        } else if (!useNetAfterFeesMode) {
+        } else {
           requiredExitBps = Number.isFinite(requiredExitBps)
             ? requiredExitBps
             : resolveRequiredExitBps({
@@ -3860,9 +3868,6 @@ async function manageExitStates() {
               spreadBufferBps,
               maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             });
-        } else {
-          requiredExitBps = Number.isFinite(requiredExitBps) ? requiredExitBps : 0;
-          minNetProfitBps = Number.isFinite(minNetProfitBps) ? minNetProfitBps : requiredExitBps;
         }
         const tickSize = getTickSize({ symbol, price: exitEntryPrice });
         if (!Number.isFinite(targetPrice)) {
