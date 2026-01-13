@@ -1939,8 +1939,11 @@ function roundPrice(price) {
 function getTickSize({ symbol, price }) {
   if (isCryptoSymbol(symbol)) {
     const priceNum = Number(price);
-    if (Number.isFinite(priceNum) && priceNum < 1) {
-      return 0.0001;
+    // Avoid huge bps rounding on mid-priced coins.
+    if (Number.isFinite(priceNum)) {
+      if (priceNum < 0.01) return 0.00000001;
+      if (priceNum < 0.1) return 0.000001;
+      if (priceNum < 1000) return 0.0001;
     }
     return 0.01;
   }
