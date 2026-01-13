@@ -16,7 +16,8 @@ module.exports = {
     extra: {
       BACKEND_BASE_URL: process.env.BACKEND_BASE_URL || "https://magicmoney.onrender.com",
       // Shipping a static token in a distributed app is not ideal. Use for personal/dev usage only.
-      API_TOKEN: process.env.API_TOKEN || ""
+      API_TOKEN: process.env.API_TOKEN || "",
+      EXIT_BRAIN: process.env.EXIT_BRAIN || "backend"
     }
   }
 };
