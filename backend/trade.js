@@ -1701,6 +1701,36 @@ async function fetchActivities(params = {}) {
   };
 }
 
+async function fetchMaxFillPriceForOrder({ symbol, orderId, lookback = 100 }) {
+  if (!orderId) return null;
+  try {
+    const { items } = await fetchActivities({
+      activity_types: 'FILL',
+      direction: 'desc',
+      page_size: String(lookback),
+    });
+    const normalizedSymbol = normalizeSymbol(symbol);
+    const prices = items
+      .filter((item) => {
+        const itemOrderId = item?.order_id || item?.orderId || null;
+        if (!itemOrderId || String(itemOrderId) !== String(orderId)) {
+          return false;
+        }
+        const itemSymbol = normalizeSymbol(item?.symbol || '');
+        return itemSymbol === normalizedSymbol;
+      })
+      .map((item) => Number(item?.price ?? item?.fill_price ?? item?.transaction_price))
+      .filter((price) => Number.isFinite(price) && price > 0);
+    if (!prices.length) {
+      return null;
+    }
+    return Math.max(...prices);
+  } catch (err) {
+    console.warn('fill_activity_fetch_failed', { symbol, orderId, error: err?.message || err });
+    return null;
+  }
+}
+
 async function fetchClock() {
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'clock', label: 'market_clock' });
   return requestJson({
@@ -1940,6 +1970,22 @@ function getFeeBps({ orderType, isMaker }) {
     return FEE_BPS_TAKER;
   }
   return isMaker ? FEE_BPS_MAKER : FEE_BPS_TAKER;
+}
+
+function computeRequiredExitBpsForNetAfterFees({ entryFeeBps, exitFeeBps, netAfterFeesBps }) {
+  const fBuy = Number(entryFeeBps) / 10000;
+  const fSell = Number(exitFeeBps) / 10000;
+  const r = Number(netAfterFeesBps) / 10000;
+  const denom = (1 - fBuy) * (1 - fSell);
+  if (!Number.isFinite(denom) || denom <= 0) {
+    return 0;
+  }
+  const g = (1 + r) / denom - 1;
+  const requiredExitBps = g * 10000;
+  if (!Number.isFinite(requiredExitBps)) {
+    return 0;
+  }
+  return Math.max(0, requiredExitBps);
 }
 
 function resolveRequiredExitBps({
@@ -2939,6 +2985,9 @@ async function handleBuyFill({
     postOnly: entryPostOnly,
   });
   const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
+  const netAfterFeesBps = Number(process.env.EXIT_NET_PROFIT_AFTER_FEES_BPS || 5);
+  const maxFill = await fetchMaxFillPriceForOrder({ symbol, orderId: entryOrderId });
+  const effectiveEntryPrice = Number.isFinite(maxFill) ? maxFill : entryPriceNum;
   const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
   let desiredNetExitBpsValue = Number.isFinite(desiredNetExitBps)
     ? Number(desiredNetExitBps)
@@ -2960,35 +3009,28 @@ async function handleBuyFill({
     });
     desiredNetExitBpsValue = 0;
   }
-  const minNetProfitBps = computeMinNetProfitBps({
-    feeBpsRoundTrip,
-    profitBufferBps,
-    desiredNetExitBps: desiredNetExitBpsValue,
-    slippageBps: slippageBpsUsed,
-    spreadBufferBps,
-    maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
+  const requiredExitBps = computeRequiredExitBpsForNetAfterFees({
+    entryFeeBps,
+    exitFeeBps,
+    netAfterFeesBps,
   });
-  const tickSize = getTickSize({ symbol, price: entryPriceNum });
-  const requiredExitBps = resolveRequiredExitBps({
-    desiredNetExitBps: desiredNetExitBpsValue,
-    feeBpsRoundTrip,
-    slippageBps: slippageBpsUsed,
-    spreadBufferBps,
-    profitBufferBps,
-    maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
-  });
-  const targetPrice = computeTargetSellPrice(entryPriceNum, requiredExitBps, tickSize);
-  const breakevenPrice = computeBreakevenPrice(entryPriceNum, minNetProfitBps);
+  const minNetProfitBps = requiredExitBps;
+  const tickSize = getTickSize({ symbol, price: effectiveEntryPrice });
+  const targetPrice = computeTargetSellPrice(effectiveEntryPrice, requiredExitBps, tickSize);
+  const breakevenPrice = computeBreakevenPrice(effectiveEntryPrice, minNetProfitBps);
   const postOnly = true;
   const wantOco = (process.env.EXIT_ORDER_CLASS || '').toLowerCase() === 'oco';
 
   console.log('tp_attach_plan', {
     symbol,
     entryPrice: entryPriceNum,
+    effectiveEntryPrice,
+    maxFillPriceUsed: Number.isFinite(maxFill) ? maxFill : null,
     entryFeeBps,
     exitFeeBps,
     feeBpsRoundTrip,
     desiredNetExitBps: desiredNetExitBpsValue,
+    netAfterFeesBps,
     entrySpreadBpsUsed,
     slippageBpsUsed,
     spreadBufferBps,
@@ -3048,6 +3090,7 @@ async function handleBuyFill({
     qty: qtyNum,
 
     entryPrice: entryPriceNum,
+    effectiveEntryPrice,
 
     entryTime: now,
 
@@ -3753,15 +3796,8 @@ async function manageExitStates() {
         const slippageBps = Number.isFinite(state.slippageBpsUsed) ? state.slippageBpsUsed : SLIPPAGE_BPS;
         const spreadBufferBps = Number.isFinite(state.spreadBufferBps) ? state.spreadBufferBps : BUFFER_BPS;
         const desiredNetExitBps = Number.isFinite(state.desiredNetExitBps) ? state.desiredNetExitBps : null;
-        const minNetProfitBps = computeMinNetProfitBps({
-          feeBpsRoundTrip,
-          profitBufferBps,
-          desiredNetExitBps,
-          slippageBps,
-          spreadBufferBps,
-          maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
-        });
-        const tickSize = getTickSize({ symbol, price: state.entryPrice });
+        const exitEntryPrice = Number.isFinite(state.effectiveEntryPrice) ? state.effectiveEntryPrice : state.entryPrice;
+        const tickSize = getTickSize({ symbol, price: exitEntryPrice });
         const requiredExitBps = Number.isFinite(state.requiredExitBps)
           ? state.requiredExitBps
           : resolveRequiredExitBps({
@@ -3772,7 +3808,17 @@ async function manageExitStates() {
             profitBufferBps,
             maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
           });
-        const targetPrice = computeTargetSellPrice(state.entryPrice, requiredExitBps, tickSize);
+        const minNetProfitBps = Number.isFinite(state.requiredExitBps)
+          ? state.requiredExitBps
+          : computeMinNetProfitBps({
+            feeBpsRoundTrip,
+            profitBufferBps,
+            desiredNetExitBps,
+            slippageBps,
+            spreadBufferBps,
+            maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
+          });
+        const targetPrice = computeTargetSellPrice(exitEntryPrice, requiredExitBps, tickSize);
         state.targetPrice = targetPrice;
         state.minNetProfitBps = minNetProfitBps;
         state.feeBpsRoundTrip = feeBpsRoundTrip;
@@ -3783,7 +3829,7 @@ async function manageExitStates() {
         state.requiredExitBps = requiredExitBps;
         state.entryFeeBps = entryFeeBps;
         state.exitFeeBps = exitFeeBps;
-        const breakevenPrice = computeBreakevenPrice(state.entryPrice, minNetProfitBps);
+        const breakevenPrice = computeBreakevenPrice(exitEntryPrice, minNetProfitBps);
         const roundedBreakeven = roundToTick(breakevenPrice, tickSize, 'up');
         const bidMeetsBreakeven = Number.isFinite(bid) && bid >= breakevenPrice;
         const askMeetsBreakeven = Number.isFinite(ask) && ask >= breakevenPrice;
