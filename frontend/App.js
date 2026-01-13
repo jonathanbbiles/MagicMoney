@@ -68,6 +68,8 @@ const isStock = (sym) => !isCrypto(sym);
 const VERSION = 'v1';
 const EX = Constants?.expoConfig?.extra || Constants?.manifest?.extra || {};
 const API_TOKEN = String(EX.API_TOKEN || '').trim();
+const EXIT_BRAIN = String(EX.EXIT_BRAIN || 'backend').trim().toLowerCase();
+const FRONTEND_EXIT_AUTOMATION_ENABLED = EXIT_BRAIN !== 'backend';
 
 const RENDER_BACKEND_URL = 'https://magicmoney.onrender.com';
 // Dev-only override for physical devices: set to your LAN IP (e.g., 'http://192.168.x.x:10000').
@@ -201,7 +203,7 @@ const DEFAULT_SETTINGS = {
   maxHoldMin: 20,
   maxTimeLossUSD: -5.0,
   cryptoExitAlwaysOn: true,
-  cryptoExitStartBps: 500,
+  cryptoExitStartBps: 100,
   cryptoExitHoldSec: 20,
   cryptoExitDecayEverySec: 22,
   cryptoExitDecayStepBps: 1,
@@ -3028,6 +3030,7 @@ function computeRiskDecision({ entryPrice, currentPrice, peakPrice, trailingActi
 }
 
 async function ensureRiskExitsForPosition(pos, ctx = {}) {
+  if (!FRONTEND_EXIT_AUTOMATION_ENABLED) return false;
   if (!SETTINGS.enableStops) return false;
   const symbol = pos.symbol;
   const qtyAvailable = Number(pos.qty_available ?? pos.available ?? pos.qty ?? 0);
@@ -3550,6 +3553,7 @@ const HoldingsChangeBarChart = () => {
   };
 
   useEffect(() => {
+    if (!FRONTEND_EXIT_AUTOMATION_ENABLED) return;
     let stopped = false;
     const poll = async () => {
       try {
@@ -4352,6 +4356,7 @@ const ensureLimitTP = async (symbol, limitPrice, {
   allowCancelTp = false,
   forceReplace = false,
 } = {}) => {
+  if (!FRONTEND_EXIT_AUTOMATION_ENABLED) return { attempted: false, attemptsSent: 0, attemptsFailed: 0, submittedOk: false };
   let attemptsSent = 0;
   let attemptsFailed = 0;
   let attempted = false;
@@ -6796,6 +6801,7 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!FRONTEND_EXIT_AUTOMATION_ENABLED) return;
     let timer = null;
     const run = async () => {
       try {
@@ -6849,6 +6855,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!FRONTEND_EXIT_AUTOMATION_ENABLED) return;
     let stopped = false;
     const sweep = async () => {
       try {
@@ -7322,6 +7329,7 @@ export default function App() {
 
   // Always-on exit manager: run every 20s to maintain crypto TP orders.
   useEffect(() => {
+    if (!FRONTEND_EXIT_AUTOMATION_ENABLED) return;
     let cancelled = false;
     const tick = async () => {
       if (cancelled || exitManagerActiveRef.current) return;

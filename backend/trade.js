@@ -128,7 +128,8 @@ const MARKET_DATA_COOLDOWN_MS = Number(process.env.MARKET_DATA_COOLDOWN_MS || 60
 
 const USER_MIN_PROFIT_BPS = Number(process.env.USER_MIN_PROFIT_BPS || 5);
 const DESIRED_NET_PROFIT_BASIS_POINTS = readNumber('DESIRED_NET_PROFIT_BASIS_POINTS', 100);
-const MAX_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MAX_GROSS_TAKE_PROFIT_BASIS_POINTS', 220);
+const MAX_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MAX_GROSS_TAKE_PROFIT_BASIS_POINTS', 150);
+const MIN_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MIN_GROSS_TAKE_PROFIT_BASIS_POINTS', 60);
 
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 10);
 
@@ -1956,8 +1957,18 @@ function resolveRequiredExitBps({
   const bufferBps = Number.isFinite(profitBufferBps) ? profitBufferBps : PROFIT_BUFFER_BPS;
   const rawRequired = Math.max(0, desired) + feeBps + slipBps + spreadBuffer + bufferBps;
   const cap = Number.isFinite(maxGrossTakeProfitBps) ? maxGrossTakeProfitBps : MAX_GROSS_TAKE_PROFIT_BASIS_POINTS;
-  if (Number.isFinite(cap) && cap > 0) return Math.min(rawRequired, cap);
-  return rawRequired;
+  const safetyFloor = feeBps + slipBps + spreadBuffer + bufferBps;
+  let capped = rawRequired;
+  if (Number.isFinite(cap) && cap > 0 && cap < capped) {
+    if (cap >= safetyFloor) {
+      capped = cap;
+    }
+  }
+  const minGross = MIN_GROSS_TAKE_PROFIT_BASIS_POINTS;
+  if (Number.isFinite(minGross) && minGross > 0) {
+    capped = Math.max(capped, minGross);
+  }
+  return capped;
 }
 
 function computeMinNetProfitBps({
@@ -2033,7 +2044,12 @@ function hasExitIntentOrder(order, symbol) {
   if (!clientOrderId) return false;
   const tpPrefix = buildIntentPrefix({ symbol, side: 'SELL', intent: 'TP' });
   const exitPrefix = buildIntentPrefix({ symbol, side: 'SELL', intent: 'EXIT' });
-  return clientOrderId.startsWith(tpPrefix) || clientOrderId.startsWith(exitPrefix);
+  return (
+    clientOrderId.startsWith(tpPrefix) ||
+    clientOrderId.startsWith(exitPrefix) ||
+    clientOrderId.startsWith('TP_') ||
+    clientOrderId.startsWith('EXIT-')
+  );
 }
 
 function normalizeFilledQty(order) {
