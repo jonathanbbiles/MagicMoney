@@ -4358,20 +4358,62 @@ const ensureLimitTP = async (symbol, limitPrice, {
   let submittedOk = false;
   const normalizedSymbol = normalizePair(symbol);
   const isCrypto = !isStock(symbol);
-  const posInfo = pos ?? await getPositionInfo(symbol);
-  if (!posInfo || posInfo.available <= 0) return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  const logExitSkip = (reason, extra = {}) => {
+    console.log('EXIT_TP_SKIP', { symbol: normalizedSymbol, reason, ...extra });
+  };
+  const normalizePositionInfo = (info) => {
+    const firstPositive = (values) => {
+      for (const value of values) {
+        const num = Number(value);
+        if (Number.isFinite(num) && num > 0) return num;
+      }
+      return null;
+    };
+    return {
+      qtyAvailable: firstPositive([info?.qty_available, info?.qtyAvailable, info?.qty, info?.quantity]),
+      basis: firstPositive([info?.basis, info?.avg_entry_price, info?.avgEntryPrice, info?.entry_price, info?.entryPrice]),
+      mark: firstPositive([info?.mark, info?.current_price, info?.currentPrice]),
+    };
+  };
+
+  let posInfo = pos ?? await getPositionInfo(symbol);
+  let { qtyAvailable, basis, mark } = normalizePositionInfo(posInfo);
+  if (!(basis > 0)) {
+    const refreshed = await getPositionInfo(symbol);
+    if (refreshed) {
+      posInfo = refreshed;
+      ({ qtyAvailable, basis, mark } = normalizePositionInfo(posInfo));
+    }
+  }
+  if (!posInfo) {
+    logExitSkip('missing_position');
+    return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  }
+  if (!(qtyAvailable > 0)) {
+    logExitSkip('missing_qty', { posKeys: Object.keys(posInfo || {}) });
+    return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  }
 
   const state = (tradeStateRef?.current?.[normalizedSymbol]) || {};
-  const entryPx = state.entry ?? posInfo.basis ?? posInfo.mark ?? 0;
-  const qty = Number(posInfo.available ?? 0);
-  if (!(entryPx > 0) || !(qty > 0)) return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  const entryPx = state.entry ?? basis ?? mark ?? 0;
+  const qty = Number(qtyAvailable ?? 0);
+  if (!(entryPx > 0) || !(qty > 0)) {
+    logExitSkip('missing_entry_price', { posKeys: Object.keys(posInfo || {}) });
+    return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  }
 
   const now = Date.now();
   const cooldownActive = isSellReplaceCooldownActive(normalizedSymbol, now);
-  if (!isCrypto && cooldownActive) return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  if (!isCrypto && cooldownActive) {
+    logExitSkip('cooldown_active');
+    return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  }
 
   const riskExited = await ensureRiskExits(normalizedSymbol, { tradeStateRef, pos: posInfo });
-  if (riskExited) return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  if (riskExited) {
+    logExitSkip('risk_exit_already_sent');
+    return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  }
 
   if (isCrypto) {
     const symbolKey = canonicalizeSymbol(normalizedSymbol);
@@ -4395,7 +4437,6 @@ const ensureLimitTP = async (symbol, limitPrice, {
       }) || null;
     }
 
-    const entryPx = Number(posInfo?.basis ?? state.entry ?? 0);
     const quoteContext = await getExitQuoteContext({ symbol: normalizedSymbol, entryBase: entryPx, now });
     const bid = Number.isFinite(quoteContext?.bid) ? quoteContext.bid : null;
     const ask = Number.isFinite(quoteContext?.ask) ? quoteContext.ask : null;
@@ -4717,7 +4758,10 @@ const ensureLimitTP = async (symbol, limitPrice, {
     ? Math.abs(existingLimit - finalLimit) / Math.max(1, finalLimit)
     : Infinity;
   const needsPost = !existing || priceDrift > 0.001 || now - lastTs > 1000 * 10;
-  if (!needsPost) return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  if (!needsPost) {
+    logExitSkip('limit_already_ok');
+    return { attemptsSent, attemptsFailed, attempted, submittedOk };
+  }
 
   try {
     const decimals = isStock(symbol) ? 2 : 5;
