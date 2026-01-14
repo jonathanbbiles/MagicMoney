@@ -176,6 +176,7 @@ const OPEN_ORDERS_CACHE_TTL_MS = 1500;
 const ACCOUNT_CACHE_TTL_MS = 2000;
 const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
 const EXIT_STALE_QUOTE_MAX_AGE_MS = Math.min(EXIT_QUOTE_MAX_AGE_MS, 15000);
+const ENTRY_QUOTE_MAX_AGE_MS = Number(process.env.ENTRY_QUOTE_MAX_AGE_MS || 60000);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
@@ -289,7 +290,7 @@ async function computeEntrySignal(symbol) {
   const riskLvl = clamp(Math.round(RISK_LEVEL), 0, 4);
   let quote;
   try {
-    quote = await getLatestQuote(asset.symbol, { maxAgeMs: MAX_QUOTE_AGE_MS });
+    quote = await getLatestQuote(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
   } catch (err) {
     return { entryReady: false, why: 'stale_quote', meta: { symbol: asset.symbol, error: err?.message || err } };
   }
@@ -1389,7 +1390,7 @@ async function placeLimitBuyThenSell(symbol, qty, limitPrice) {
   let ask = null;
   let spreadBps = null;
   try {
-    const quote = await getLatestQuote(normalizedSymbol);
+    const quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     bid = quote.bid;
     ask = quote.ask;
     if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
@@ -2009,6 +2010,21 @@ function computeExitPlanNetAfterFees({
   const targetPrice = computeTargetSellPrice(effectiveEntryPrice, requiredExitBps, tickSize);
   const breakevenPrice = Number(effectiveEntryPrice) * (1 + requiredExitBps / 10000);
   return { netAfterFeesBps, effectiveEntryPrice, requiredExitBps, targetPrice, breakevenPrice };
+}
+
+function computeSpreadAwareExitBps({ baseRequiredExitBps, spreadBps }) {
+  const enabled = (process.env.EXIT_SPREAD_AWARE_ENABLED ?? 'true').toLowerCase() === 'true';
+  if (!enabled) return baseRequiredExitBps;
+
+  const mult = Number(process.env.EXIT_SPREAD_BPS_MULTIPLIER ?? 1.0);
+  const add = Number(process.env.EXIT_SPREAD_BPS_ADD ?? 0);
+  const cap = Number(process.env.EXIT_SPREAD_BPS_CAP ?? 250);
+  const floor = Number(process.env.EXIT_SPREAD_BPS_FLOOR ?? 0);
+
+  if (!Number.isFinite(spreadBps)) return baseRequiredExitBps;
+  const s = Math.max(floor, Math.min(cap, spreadBps));
+  const spreadAllowance = s * mult + add;
+  return Math.max(baseRequiredExitBps, spreadAllowance);
 }
 
 function resolveRequiredExitBps({
@@ -3831,6 +3847,8 @@ async function manageExitStates() {
         let requiredExitBps = Number.isFinite(state.requiredExitBps) ? state.requiredExitBps : null;
         let minNetProfitBps = Number.isFinite(state.requiredExitBps) ? state.requiredExitBps : null;
         let targetPrice = null;
+        let baseRequiredExitBps = requiredExitBps;
+        let requiredExitBpsFinal = requiredExitBps;
         if (useNetAfterFeesMode) {
           const plan = computeExitPlanNetAfterFees({
             symbol,
@@ -3843,13 +3861,14 @@ async function manageExitStates() {
           });
           state.netAfterFeesBps = plan.netAfterFeesBps;
           state.effectiveEntryPrice = plan.effectiveEntryPrice;
-          state.requiredExitBps = plan.requiredExitBps;
-          state.minNetProfitBps = plan.requiredExitBps;
-          state.targetPrice = plan.targetPrice;
           exitEntryPrice = plan.effectiveEntryPrice;
-          requiredExitBps = plan.requiredExitBps;
-          minNetProfitBps = plan.requiredExitBps;
-          targetPrice = plan.targetPrice;
+          baseRequiredExitBps = plan.requiredExitBps;
+          requiredExitBpsFinal = baseRequiredExitBps;
+          if (Number.isFinite(bid) && Number.isFinite(ask)) {
+            requiredExitBpsFinal = computeSpreadAwareExitBps({ baseRequiredExitBps, spreadBps });
+          }
+          requiredExitBps = requiredExitBpsFinal;
+          minNetProfitBps = requiredExitBpsFinal;
         } else {
           requiredExitBps = Number.isFinite(requiredExitBps)
             ? requiredExitBps
@@ -3872,10 +3891,10 @@ async function manageExitStates() {
               maxGrossTakeProfitBps: MAX_GROSS_TAKE_PROFIT_BASIS_POINTS,
             });
         }
+        baseRequiredExitBps = Number.isFinite(baseRequiredExitBps) ? baseRequiredExitBps : requiredExitBps;
+        requiredExitBpsFinal = Number.isFinite(requiredExitBpsFinal) ? requiredExitBpsFinal : requiredExitBps;
         const tickSize = getTickSize({ symbol, price: exitEntryPrice });
-        if (!Number.isFinite(targetPrice)) {
-          targetPrice = computeTargetSellPrice(exitEntryPrice, requiredExitBps, tickSize);
-        }
+        targetPrice = computeTargetSellPrice(exitEntryPrice, requiredExitBpsFinal, tickSize);
         state.targetPrice = targetPrice;
         state.minNetProfitBps = minNetProfitBps;
         state.feeBpsRoundTrip = feeBpsRoundTrip;
@@ -3883,11 +3902,12 @@ async function manageExitStates() {
         state.slippageBpsUsed = slippageBps;
         state.spreadBufferBps = spreadBufferBps;
         state.desiredNetExitBps = desiredNetExitBps;
-        state.requiredExitBps = requiredExitBps;
+        state.requiredExitBps = requiredExitBpsFinal;
         state.entryFeeBps = entryFeeBps;
         state.exitFeeBps = exitFeeBps;
         state.effectiveEntryPrice = exitEntryPrice;
         const breakevenPrice = computeBreakevenPrice(exitEntryPrice, minNetProfitBps);
+        state.breakevenPrice = breakevenPrice;
         const roundedBreakeven = roundToTick(breakevenPrice, tickSize, 'up');
         const bidMeetsBreakeven = Number.isFinite(bid) && bid >= breakevenPrice;
         const askMeetsBreakeven = Number.isFinite(ask) && ask >= breakevenPrice;
@@ -3934,6 +3954,8 @@ async function manageExitStates() {
               bid,
               ask,
               spreadBps,
+              baseRequiredExitBps,
+              requiredExitBpsFinal,
               openBuyCount,
               openSellCount,
               existingOrderAgeMs: null,
@@ -4012,6 +4034,8 @@ async function manageExitStates() {
               bid,
               ask,
               spreadBps,
+              baseRequiredExitBps,
+              requiredExitBpsFinal,
               openBuyCount,
               openSellCount,
               existingOrderAgeMs: null,
@@ -4061,6 +4085,8 @@ async function manageExitStates() {
             bid,
             ask,
             spreadBps,
+            baseRequiredExitBps,
+            requiredExitBpsFinal,
             openBuyCount,
             openSellCount,
             existingOrderAgeMs: null,
@@ -4208,6 +4234,8 @@ async function manageExitStates() {
               bid,
               ask,
               spreadBps,
+              baseRequiredExitBps,
+              requiredExitBpsFinal,
               openBuyCount,
               openSellCount,
               existingOrderAgeMs: null,
@@ -4295,6 +4323,8 @@ async function manageExitStates() {
               bid,
               ask,
               spreadBps,
+              baseRequiredExitBps,
+              requiredExitBpsFinal,
               openBuyCount,
               openSellCount,
               existingOrderAgeMs: null,
@@ -4373,6 +4403,8 @@ async function manageExitStates() {
           bid,
           ask,
           spreadBps,
+          baseRequiredExitBps,
+          requiredExitBpsFinal,
           openBuyCount,
           openSellCount,
           existingOrderAgeMs: null,
@@ -4456,6 +4488,8 @@ async function manageExitStates() {
             bid,
             ask,
             spreadBps,
+            baseRequiredExitBps,
+            requiredExitBpsFinal,
             openBuyCount,
             openSellCount,
             existingOrderAgeMs: null,
@@ -4811,6 +4845,8 @@ async function manageExitStates() {
         bid,
         ask,
         spreadBps,
+        baseRequiredExitBps,
+        requiredExitBpsFinal,
         openBuyCount,
         openSellCount,
         existingOrderAgeMs,
@@ -4982,7 +5018,7 @@ async function placeMakerLimitBuyThenSell(symbol) {
   let ask = null;
   let spreadBps = null;
   try {
-    const quote = await getLatestQuote(normalizedSymbol);
+    const quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     bid = quote.bid;
     ask = quote.ask;
     if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
@@ -5143,7 +5179,7 @@ async function placeMarketBuyThenSell(symbol) {
   let ask = null;
   let spreadBps = null;
   try {
-    const quote = await getLatestQuote(normalizedSymbol);
+    const quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
     bid = quote.bid;
     ask = quote.ask;
     if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
