@@ -181,6 +181,7 @@ const ENTRY_QUOTE_MAX_AGE_MS = Number(process.env.ENTRY_QUOTE_MAX_AGE_MS || 6000
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
+const quoteKeyMissingLogged = new Set();
 
 // ───────────────────────── ENTRY SIGNAL (RESTORED FROM v3) ─────────────────────────
 const symStats = Object.create(null);
@@ -2239,6 +2240,14 @@ function isProfitableExit(entryPrice, exitPrice, feeBpsRoundTrip, profitBufferBp
   return netBps >= computeMinNetProfitBps({ feeBpsRoundTrip, profitBufferBps });
 }
 
+function pickSymbolKey(map, primaryKey) {
+  if (!map || !primaryKey) return null;
+  if (map[primaryKey]) return primaryKey;
+  const alt = String(primaryKey).replace('/', '');
+  if (map[alt]) return alt;
+  return null;
+}
+
 async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
   const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
   const isCrypto = isCryptoSymbol(symbol);
@@ -2266,7 +2275,8 @@ async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
   }
 
   const tradeKey = isCrypto ? dataSymbol : symbol;
-  const trade = res.trades && res.trades[tradeKey];
+  const tKey = pickSymbolKey(res.trades, tradeKey);
+  const trade = tKey ? res.trades[tKey] : null;
   if (!trade) {
     return null;
   }
@@ -2383,11 +2393,16 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   }
 
   const quoteKey = isCrypto ? dataSymbol : symbol;
-  const quote = res.quotes && res.quotes[quoteKey];
+  const qKey = pickSymbolKey(res.quotes, quoteKey);
+  const quote = qKey ? res.quotes[qKey] : null;
   if (!quote) {
     const fallbackQuote = await tryFallbackTradeQuote();
     if (fallbackQuote) {
       return fallbackQuote;
+    }
+    if (!quoteKeyMissingLogged.has(symbol)) {
+      console.warn('quote_key_missing', { symbol, expectedKeys: [quoteKey, quoteKey.replace('/', '')] });
+      quoteKeyMissingLogged.add(symbol);
     }
     const reason = cached ? 'stale_cache' : 'no_data';
     if (cached && Number.isFinite(cachedTsMs)) {
@@ -4283,7 +4298,7 @@ async function manageExitStates() {
           }
         }
 
-        const slBps = readNumber('STOP_LOSS_BPS', 0);
+        const slBps = STOP_LOSS_BPS;
         if (slBps > 0 && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) {
           const stopTrigger = state.entryPrice * (1 - slBps / 10000);
           if (bid <= stopTrigger) {
