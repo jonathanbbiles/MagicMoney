@@ -175,6 +175,8 @@ const OPEN_ORDERS_CACHE_TTL_MS = 1500;
 const ACCOUNT_CACHE_TTL_MS = 2000;
 const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
 const EXIT_STALE_QUOTE_MAX_AGE_MS = readNumber('EXIT_STALE_QUOTE_MAX_AGE_MS', 15000);
+const EXIT_REPAIR_INTERVAL_MS = readNumber('EXIT_REPAIR_INTERVAL_MS', 60000);
+const SELL_QTY_MATCH_EPSILON = Number(process.env.SELL_QTY_MATCH_EPSILON || 1e-9);
 const ENTRY_QUOTE_MAX_AGE_MS = Number(process.env.ENTRY_QUOTE_MAX_AGE_MS || 60000);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
@@ -425,6 +427,7 @@ const quoteCache = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let exitManagerRunning = false;
+let lastExitRepairAtMs = 0;
 const positionsSnapshot = {
   tsMs: 0,
   mapBySymbol: new Map(),
@@ -2123,6 +2126,12 @@ function normalizeOrderQty(order) {
   return Number.isFinite(num) ? num : null;
 }
 
+function orderQtyMeetsRequired(orderQty, requiredQty) {
+  if (!Number.isFinite(orderQty) || !Number.isFinite(requiredQty)) return false;
+  const tol = Math.max(SELL_QTY_MATCH_EPSILON, requiredQty * 1e-6);
+  return orderQty + tol >= requiredQty;
+}
+
 function hasExitIntentOrder(order, symbol) {
   const clientOrderId = String(order?.client_order_id ?? order?.clientOrderId ?? '');
   if (!clientOrderId) return false;
@@ -2749,7 +2758,7 @@ async function submitLimitSell({
     const side = String(order.side || '').toLowerCase();
     if (orderSymbol !== normalizedSymbol || side !== 'sell') return false;
     const orderQty = normalizeOrderQty(order);
-    return Number.isFinite(orderQty) && orderQty >= requiredQty;
+    return Number.isFinite(orderQty) && orderQtyMeetsRequired(orderQty, requiredQty);
   });
   if (openSellCandidates.length) {
     const taggedCandidates = openSellCandidates.filter((order) => hasExitIntentOrder(order, normalizedSymbol));
@@ -3744,8 +3753,16 @@ async function manageExitStates() {
   exitManagerRunning = true;
 
   try {
-    await repairOrphanExits();
-    const now = Date.now();
+    const nowMs = Date.now();
+    if (nowMs - lastExitRepairAtMs >= EXIT_REPAIR_INTERVAL_MS) {
+      await repairOrphanExits();
+      lastExitRepairAtMs = nowMs;
+    } else {
+      console.log('exit_repair_skip_interval', {
+        nextInMs: EXIT_REPAIR_INTERVAL_MS - (nowMs - lastExitRepairAtMs),
+      });
+    }
+    const now = nowMs;
     let openOrders = [];
     try {
       openOrders = await fetchOrders({ status: 'open' });
