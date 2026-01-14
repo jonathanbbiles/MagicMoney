@@ -174,7 +174,7 @@ const OPEN_POSITIONS_CACHE_TTL_MS = 1500;
 const OPEN_ORDERS_CACHE_TTL_MS = 1500;
 const ACCOUNT_CACHE_TTL_MS = 2000;
 const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
-const EXIT_STALE_QUOTE_MAX_AGE_MS = Math.min(EXIT_QUOTE_MAX_AGE_MS, 15000);
+const EXIT_STALE_QUOTE_MAX_AGE_MS = readNumber('EXIT_STALE_QUOTE_MAX_AGE_MS', 15000);
 const ENTRY_QUOTE_MAX_AGE_MS = Number(process.env.ENTRY_QUOTE_MAX_AGE_MS || 60000);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
@@ -3784,7 +3784,7 @@ async function manageExitStates() {
 
         try {
 
-          const quote = await getLatestQuote(symbol, { maxAgeMs: EXIT_STALE_QUOTE_MAX_AGE_MS });
+          const quote = await getLatestQuote(symbol, { maxAgeMs: EXIT_QUOTE_MAX_AGE_MS });
 
           bid = quote.bid;
 
@@ -3813,7 +3813,7 @@ async function manageExitStates() {
 
         let actionTaken = 'none';
         let reasonCode = 'hold';
-        const spreadBps =
+        let spreadBps =
           Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
         const entryFeeBps = Number.isFinite(state.entryFeeBps)
           ? state.entryFeeBps
@@ -3921,6 +3921,26 @@ async function manageExitStates() {
             ? state.lastMid
             : (Number.isFinite(lastKnownBid) && Number.isFinite(lastKnownAsk) ? (lastKnownBid + lastKnownAsk) / 2 : null);
           let fallbackBase = Number.isFinite(lastKnownAsk) ? lastKnownAsk : lastKnownMid;
+
+          // Backfill bid/ask for logging + spread math when quote is stale
+          if (!Number.isFinite(bid) && Number.isFinite(state.lastBid)) bid = state.lastBid;
+          if (!Number.isFinite(ask) && Number.isFinite(state.lastAsk)) ask = state.lastAsk;
+
+          // If still missing, try a quotes-only fetch once using the relaxed exit TTL
+          if (!Number.isFinite(bid) || !Number.isFinite(ask)) {
+            try {
+              const q2 = await getLatestQuoteFromQuotesOnly(symbol, { maxAgeMs: EXIT_QUOTE_MAX_AGE_MS });
+              if (Number.isFinite(q2?.bid)) bid = q2.bid;
+              if (Number.isFinite(q2?.ask)) ask = q2.ask;
+              if (Number.isFinite(bid)) state.lastBid = bid;
+              if (Number.isFinite(ask)) state.lastAsk = ask;
+              if (Number.isFinite(bid) && Number.isFinite(ask)) state.lastMid = (bid + ask) / 2;
+            } catch (_) {}
+          }
+
+          // Recompute spreadBps if bid/ask are now available
+          spreadBps =
+            Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 ? ((ask - bid) / bid) * 10000 : null;
 
           if (hasOpenSell) {
             actionTaken = 'hold_existing_order';
