@@ -117,9 +117,8 @@ function alpacaJsonHeaders() {
   };
 }
 
- 
-
-const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 25);
+const TRADE_PORTFOLIO_PCT = Number(process.env.TRADE_PORTFOLIO_PCT || 0.10);
+const MIN_ORDER_NOTIONAL_USD = Number(process.env.MIN_ORDER_NOTIONAL_USD || 1);
 const MIN_TRADE_QTY = Number(process.env.MIN_TRADE_QTY || 1e-6);
 const MARKET_DATA_TIMEOUT_MS = Number(process.env.MARKET_DATA_TIMEOUT_MS || 9000);
 const MARKET_DATA_RETRIES = Number(process.env.MARKET_DATA_RETRIES || 2);
@@ -2837,18 +2836,8 @@ async function submitLimitSell({
 
   console.log('submit_limit_sell', { symbol, qty, limitPrice: roundedLimit, reason, orderId: response?.id });
 
-  try {
-    const openList = openOrders || open;
-    const hasOpenSell = (Array.isArray(openList) ? openList : []).some((order) => {
-      const orderSymbol = normalizePair(order.symbol);
-      const side = String(order.side || '').toLowerCase();
-      return orderSymbol === normalizePair(symbol) && side === 'sell';
-    });
-    if (!hasOpenSell) {
-      console.warn('TP missing after buy', { symbol });
-    }
-  } catch (err) {
-    console.warn('tp_open_check_failed', { symbol, error: err?.message || err });
+  if (!response?.id) {
+    console.warn('tp_sell_missing_id', { symbol });
   }
 
   return response;
@@ -3755,9 +3744,8 @@ async function manageExitStates() {
   exitManagerRunning = true;
 
   try {
-    const now = Date.now();
-
     await repairOrphanExits();
+    const now = Date.now();
     let openOrders = [];
     try {
       openOrders = await fetchOrders({ status: 'open' });
@@ -3782,7 +3770,7 @@ async function manageExitStates() {
       }
       symbolLocks.set(symbol, true);
       try {
-        const heldMs = now - state.entryTime;
+        const heldMs = Math.max(0, now - state.entryTime);
         const heldSeconds = heldMs / 1000;
         const symbolOrders = openOrdersBySymbol.get(normalizePair(symbol)) || [];
         const openBuyCount = symbolOrders.filter((order) => String(order.side || '').toLowerCase() === 'buy').length;
@@ -5035,7 +5023,16 @@ async function placeMakerLimitBuyThenSell(symbol) {
   const account = await getAccountInfo();
   const portfolioValue = account.portfolioValue;
   const buyingPower = account.buyingPower;
-  const targetTradeAmount = portfolioValue * 0.1;
+  if (
+    !Number.isFinite(portfolioValue) ||
+    !Number.isFinite(buyingPower) ||
+    portfolioValue <= 0 ||
+    buyingPower <= 0
+  ) {
+    logSkip('invalid_account_values', { symbol: normalizedSymbol, portfolioValue, buyingPower });
+    return { skipped: true, reason: 'invalid_account_values' };
+  }
+  const targetTradeAmount = portfolioValue * TRADE_PORTFOLIO_PCT;
   const amountToSpend = Math.min(targetTradeAmount, buyingPower);
   const decision = Number.isFinite(amountToSpend) && amountToSpend >= MIN_ORDER_NOTIONAL_USD ? 'BUY' : 'SKIP';
 
@@ -5207,9 +5204,17 @@ async function placeMarketBuyThenSell(symbol) {
 
   const buyingPower = account.buyingPower;
 
- 
+  if (
+    !Number.isFinite(portfolioValue) ||
+    !Number.isFinite(buyingPower) ||
+    portfolioValue <= 0 ||
+    buyingPower <= 0
+  ) {
+    logSkip('invalid_account_values', { symbol: normalizedSymbol, portfolioValue, buyingPower });
+    return { skipped: true, reason: 'invalid_account_values' };
+  }
 
-  const targetTradeAmount = portfolioValue * 0.1;
+  const targetTradeAmount = portfolioValue * TRADE_PORTFOLIO_PCT;
 
   const amountToSpend = Math.min(targetTradeAmount, buyingPower);
 

@@ -9,6 +9,8 @@ const NOW_MS = 1_700_000_000_000;
 
 assert.equal(normalizeQuoteTsMs(1_700_000_000), 1_700_000_000 * 1000);
 assert.equal(normalizeQuoteTsMs(1_700_000_000_000), 1_700_000_000_000);
+assert.equal(normalizeQuoteTsMs(1_700_000_000_000_000), 1_700_000_000_000);
+assert.equal(normalizeQuoteTsMs(1_700_000_000_000_000_000), 1_700_000_000_000);
 assert.equal(
   normalizeQuoteTsMs('2024-01-01T00:00:00Z'),
   Date.parse('2024-01-01T00:00:00Z')

@@ -7,7 +7,16 @@ const MAX_CLOCK_SKEW_MS = 5000;
 function normalizeEpochNumber(rawTs) {
   if (!Number.isFinite(rawTs)) return null;
   const abs = Math.abs(rawTs);
-  const tsMs = abs < 2e10 ? abs * 1000 : abs;
+  let tsMs = abs;
+  if (abs < 2e10) {
+    tsMs = abs * 1000;
+  } else if (abs < 2e13) {
+    tsMs = abs;
+  } else if (abs < 2e16) {
+    tsMs = Math.floor(abs / 1000);
+  } else {
+    tsMs = Math.floor(abs / 1e6);
+  }
   return Number.isFinite(tsMs) ? tsMs : null;
 }
 
