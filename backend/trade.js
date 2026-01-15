@@ -1298,10 +1298,14 @@ function logExitRepairDecision({
   });
 }
 
+// Backwards-compatible env boolean parser.
+// Accepts: true/false, 1/0, yes/no, on/off (case-insensitive).
 function readEnvFlag(name, defaultValue = true) {
-  const raw = process.env[name];
-  if (raw == null || raw === '') return defaultValue;
-  return String(raw).toLowerCase() === 'true';
+  const raw = String(process.env[name] ?? '').trim().toLowerCase();
+  if (!raw) return defaultValue;
+  if (raw === 'true' || raw === '1' || raw === 'yes' || raw === 'y' || raw === 'on') return true;
+  if (raw === 'false' || raw === '0' || raw === 'no' || raw === 'n' || raw === 'off') return false;
+  return defaultValue;
 }
 
 function readFlag(name, defaultValue = false) {
@@ -3817,27 +3821,6 @@ async function repairOrphanExits() {
       decision = 'SKIP:open_sell';
       skipped += 1;
       exitsSkippedReasons.set('open_sell', (exitsSkippedReasons.get('open_sell') || 0) + 1);
-      logExitRepairDecision({
-        symbol,
-        qty,
-        avgEntryPrice,
-        costBasis,
-        bid,
-        ask,
-        targetPrice,
-        timeInForce,
-        orderType,
-        hasOpenSell,
-        gates: gateFlags,
-        decision,
-      });
-      continue;
-    }
-
-    if (!autoTradeEnabled) {
-      decision = 'SKIP:auto_trade_disabled';
-      skipped += 1;
-      exitsSkippedReasons.set('auto_trade_disabled', (exitsSkippedReasons.get('auto_trade_disabled') || 0) + 1);
       logExitRepairDecision({
         symbol,
         qty,
