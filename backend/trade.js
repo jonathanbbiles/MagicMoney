@@ -172,6 +172,15 @@ const ENTRY_FALLBACK_MARKET = readFlag('ENTRY_FALLBACK_MARKET', false);
 const ALLOW_TAKER_BEFORE_TARGET = readFlag('ALLOW_TAKER_BEFORE_TARGET', false);
 const TAKER_TOUCH_MIN_INTERVAL_MS = readNumber('TAKER_TOUCH_MIN_INTERVAL_MS', 5000);
 
+const SIMPLE_SCALPER_ENABLED = readFlag('SIMPLE_SCALPER', true);
+const MAX_SPREAD_BPS_SIMPLE_DEFAULT = Number.isFinite(Number(process.env.MAX_SPREAD_BPS_TO_TRADE))
+  ? Number(process.env.MAX_SPREAD_BPS_TO_TRADE)
+  : 60;
+const MAX_SPREAD_BPS_SIMPLE = readNumber('MAX_SPREAD_BPS_SIMPLE', MAX_SPREAD_BPS_SIMPLE_DEFAULT);
+const PROFIT_NET_BPS = readNumber('PROFIT_NET_BPS', 100);
+const FEE_BPS_EST = readNumber('FEE_BPS_EST', 25);
+const BUYING_POWER_RESERVE_USD = readNumber('BUYING_POWER_RESERVE_USD', 0);
+
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 100);
 const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
@@ -241,6 +250,12 @@ function isLiveOrderStatus(status) {
   if (LIVE_ORDER_STATUSES.has(lowered)) return true;
   if (NON_LIVE_ORDER_STATUSES.has(lowered)) return false;
   return false;
+}
+
+function isTerminalOrderStatus(status) {
+  const lowered = String(status || '').toLowerCase();
+  if (!lowered) return false;
+  return NON_LIVE_ORDER_STATUSES.has(lowered);
 }
 
 function filterLiveOrders(orders) {
@@ -330,6 +345,18 @@ async function computeEntrySignal(symbol) {
   }
 
   const spreadBps = ((ask - bid) / mid) * BPS;
+  if (SIMPLE_SCALPER_ENABLED) {
+    if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_SIMPLE) {
+      return { entryReady: false, why: 'spread_gate', meta: { symbol: asset.symbol, spreadBps } };
+    }
+    return {
+      entryReady: true,
+      symbol: asset.symbol,
+      spreadBps,
+      meta: { spreadBps },
+    };
+  }
+
   if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
     return { entryReady: false, why: 'spread_gate', meta: { symbol: asset.symbol, spreadBps } };
   }
@@ -451,6 +478,9 @@ const lastOrderFetchAt = new Map();
 const lastOrderSnapshotBySymbol = new Map();
 const ENTRY_SUBMISSION_COOLDOWN_MS = Number(process.env.ENTRY_SUBMISSION_COOLDOWN_MS || 60000);
 const recentEntrySubmissions = new Map(); // symbol -> { atMs, orderId }
+const SIMPLE_SCALPER_ENTRY_TIMEOUT_MS = 30000;
+const SIMPLE_SCALPER_RETRY_COOLDOWN_MS = 120000;
+const inFlightBySymbol = new Map();
 
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
@@ -516,6 +546,27 @@ function logSkip(reason, details = {}) {
 
   console.log(`Skip — ${reason}`, details);
 
+}
+
+function logSimpleScalperSkip(symbol, reason, details = {}) {
+  console.log('simple_scalper_skip', { symbol, reason, ...details });
+}
+
+function getInFlightStatus(symbol) {
+  const normalized = normalizeSymbol(symbol);
+  const entry = inFlightBySymbol.get(normalized);
+  if (!entry) return null;
+  const untilMs = entry.untilMs;
+  if (Number.isFinite(untilMs) && Date.now() > untilMs) {
+    inFlightBySymbol.delete(normalized);
+    return null;
+  }
+  return entry;
+}
+
+function setInFlightStatus(symbol, entry) {
+  const normalized = normalizeSymbol(symbol);
+  inFlightBySymbol.set(normalized, entry);
 }
 
 function markRecentEntry(symbol, orderId) {
@@ -5217,7 +5268,10 @@ async function runEntryScanOnce() {
     const envSymbols = normalizeSymbolsParam(process.env.AUTO_SCAN_SYMBOLS);
     const stableSymbols = new Set(['USDC/USD', 'USDT/USD', 'BUSD/USD', 'DAI/USD']);
     let universe = [];
-    if (envSymbols.length) {
+    if (SIMPLE_SCALPER_ENABLED) {
+      await loadSupportedCryptoPairs();
+      universe = Array.from(supportedCryptoPairsState.pairs);
+    } else if (envSymbols.length) {
       universe = envSymbols;
     } else {
       await loadSupportedCryptoPairs();
@@ -5233,7 +5287,8 @@ async function runEntryScanOnce() {
     let positions = [];
     let openOrders = [];
     try {
-      [positions, openOrders] = await Promise.all([fetchPositions(), fetchOrders({ status: 'open' })]);
+      const ordersStatus = SIMPLE_SCALPER_ENABLED ? 'all' : 'open';
+      [positions, openOrders] = await Promise.all([fetchPositions(), fetchOrders({ status: ordersStatus })]);
     } catch (err) {
       console.warn('entry_scan_fetch_failed', err?.message || err);
       return;
@@ -5249,10 +5304,16 @@ async function runEntryScanOnce() {
 
     const openBuySymbols = new Set();
     (Array.isArray(openOrders) ? openOrders : []).forEach((order) => {
+      if (SIMPLE_SCALPER_ENABLED && isTerminalOrderStatus(order?.status)) return;
+      const orderSymbol = normalizeSymbol(order.symbol || order.rawSymbol || '');
+      if (!orderSymbol) return;
+      if (SIMPLE_SCALPER_ENABLED) {
+        openBuySymbols.add(orderSymbol);
+        return;
+      }
       const side = String(order.side || '').toLowerCase();
       if (side !== 'buy') return;
-      const orderSymbol = normalizeSymbol(order.symbol || order.rawSymbol || '');
-      if (orderSymbol) openBuySymbols.add(orderSymbol);
+      openBuySymbols.add(orderSymbol);
     });
 
     let placed = 0;
@@ -5265,12 +5326,29 @@ async function runEntryScanOnce() {
       if (heldSymbols.has(symbol)) {
         skipped += 1;
         skipCounts.set('held_position', (skipCounts.get('held_position') || 0) + 1);
+        if (SIMPLE_SCALPER_ENABLED) {
+          logSimpleScalperSkip(symbol, 'held_position');
+        }
         continue;
       }
       if (openBuySymbols.has(symbol)) {
         skipped += 1;
-        skipCounts.set('open_buy', (skipCounts.get('open_buy') || 0) + 1);
+        const reason = SIMPLE_SCALPER_ENABLED ? 'open_order' : 'open_buy';
+        skipCounts.set(reason, (skipCounts.get(reason) || 0) + 1);
+        if (SIMPLE_SCALPER_ENABLED) {
+          logSimpleScalperSkip(symbol, 'open_order');
+        }
         continue;
+      }
+      if (SIMPLE_SCALPER_ENABLED) {
+        const inFlight = getInFlightStatus(symbol);
+        if (inFlight) {
+          skipped += 1;
+          const reason = inFlight.reason || 'in_flight';
+          skipCounts.set(reason, (skipCounts.get(reason) || 0) + 1);
+          logSimpleScalperSkip(symbol, reason, { untilMs: inFlight.untilMs ?? null });
+          continue;
+        }
       }
 
       const signal = await computeEntrySignal(symbol);
@@ -5280,12 +5358,22 @@ async function runEntryScanOnce() {
       if (!signal.entryReady) {
         skipped += 1;
         skipCounts.set(signal.why || 'signal_skip', (skipCounts.get(signal.why || 'signal_skip') || 0) + 1);
+        if (SIMPLE_SCALPER_ENABLED) {
+          logSimpleScalperSkip(symbol, signal.why || 'signal_skip', signal.meta || {});
+        }
         continue;
       }
 
-      desiredExitBpsBySymbol.set(symbol, signal.desiredNetExitBpsForV22);
-      await placeMakerLimitBuyThenSell(symbol);
-      placed += 1;
+      let result = null;
+      if (SIMPLE_SCALPER_ENABLED) {
+        result = await placeSimpleScalperEntry(symbol);
+      } else {
+        desiredExitBpsBySymbol.set(symbol, signal.desiredNetExitBpsForV22);
+        result = await placeMakerLimitBuyThenSell(symbol);
+      }
+      if (result?.submitted) {
+        placed += 1;
+      }
       break;
     }
 
@@ -5313,6 +5401,10 @@ async function runEntryScanOnce() {
 }
 
 function startExitManager() {
+  if (SIMPLE_SCALPER_ENABLED) {
+    console.log('exit_manager_disabled', { reason: 'simple_scalper' });
+    return;
+  }
 
   setInterval(() => {
 
@@ -5339,7 +5431,261 @@ function startEntryManager() {
   console.log('entry_manager_started', { intervalMs: ENTRY_SCAN_INTERVAL_MS });
 }
 
- 
+function monitorSimpleScalperTpFill({ symbol, orderId, maxMs = 600000, intervalMs = 5000 }) {
+  if (!orderId) return;
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const startMs = Date.now();
+  const poll = async () => {
+    try {
+      const order = await fetchOrderById(orderId);
+      const status = String(order?.status || '').toLowerCase();
+      if (status === 'filled') {
+        console.log('simple_scalper_tp_fill', {
+          symbol: normalizedSymbol,
+          filledQty: order?.filled_qty ?? null,
+          avgPrice: order?.filled_avg_price ?? null,
+        });
+        return;
+      }
+      if (isTerminalOrderStatus(status)) {
+        return;
+      }
+    } catch (err) {
+      console.warn('simple_scalper_tp_fill_check_failed', {
+        symbol: normalizedSymbol,
+        orderId,
+        error: err?.message || err,
+      });
+    }
+    if (Date.now() - startMs < maxMs) {
+      setTimeout(poll, intervalMs);
+    }
+  };
+  setTimeout(poll, intervalMs);
+}
+
+async function waitForOrderFill({ symbol, orderId, timeoutMs, intervalMs = 1000 }) {
+  const startMs = Date.now();
+  let order = null;
+  let status = null;
+  while (Date.now() - startMs < timeoutMs) {
+    order = await fetchOrderById(orderId);
+    status = String(order?.status || '').toLowerCase();
+    if (status === 'filled') {
+      return { filled: true, order };
+    }
+    if (isTerminalOrderStatus(status)) {
+      return { filled: false, terminalStatus: status, order };
+    }
+    await sleep(intervalMs);
+  }
+  return { filled: false, timeout: true, order };
+}
+
+async function placeSimpleScalperEntry(symbol) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  const inflight = getInFlightStatus(normalizedSymbol);
+  if (inflight) {
+    logSimpleScalperSkip(normalizedSymbol, inflight.reason || 'in_flight');
+    return { skipped: true, reason: inflight.reason || 'in_flight' };
+  }
+
+  const openOrders = await fetchOrders({ status: 'all' });
+  const hasOpenOrder = (Array.isArray(openOrders) ? openOrders : []).some((order) => {
+    if (isTerminalOrderStatus(order?.status)) return false;
+    const orderSymbol = normalizeSymbol(order.symbol || order.rawSymbol || '');
+    return orderSymbol === normalizedSymbol;
+  });
+  if (hasOpenOrder) {
+    logSimpleScalperSkip(normalizedSymbol, 'open_order');
+    return { skipped: true, reason: 'open_order' };
+  }
+
+  let quote;
+  try {
+    quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
+  } catch (err) {
+    logSimpleScalperSkip(normalizedSymbol, 'stale_quote', { error: err?.message || err });
+    return { skipped: true, reason: 'stale_quote' };
+  }
+  const bid = Number(quote.bid);
+  const ask = Number(quote.ask);
+  const mid = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : Number(quote.mid || bid || ask);
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || !Number.isFinite(mid)) {
+    logSimpleScalperSkip(normalizedSymbol, 'invalid_quote', { bid, ask });
+    return { skipped: true, reason: 'invalid_quote' };
+  }
+  const spreadBps = ((ask - bid) / mid) * BPS;
+  if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_SIMPLE) {
+    logSimpleScalperSkip(normalizedSymbol, 'spread_gate', { spreadBps });
+    return { skipped: true, reason: 'spread_gate', spreadBps };
+  }
+
+  const account = await getAccountInfo();
+  const portfolioValue = account.portfolioValue;
+  const buyingPower = account.buyingPower;
+  if (
+    !Number.isFinite(portfolioValue) ||
+    !Number.isFinite(buyingPower) ||
+    portfolioValue <= 0 ||
+    buyingPower <= 0
+  ) {
+    logSimpleScalperSkip(normalizedSymbol, 'invalid_account_values', { portfolioValue, buyingPower });
+    return { skipped: true, reason: 'invalid_account_values' };
+  }
+  const reserveUsd = Math.max(0, BUYING_POWER_RESERVE_USD);
+  const buyingPowerAvailable = buyingPower - reserveUsd;
+  const notionalUsd = Math.min(portfolioValue * 0.10, buyingPowerAvailable);
+  if (!Number.isFinite(notionalUsd) || notionalUsd < MIN_ORDER_NOTIONAL_USD) {
+    logSimpleScalperSkip(normalizedSymbol, 'notional_too_small', {
+      notionalUsd,
+      minNotionalUsd: MIN_ORDER_NOTIONAL_USD,
+    });
+    return { skipped: true, reason: 'notional_too_small', notionalUsd };
+  }
+  const qty = roundQty(notionalUsd / ask);
+  if (!Number.isFinite(qty) || qty <= 0) {
+    logSimpleScalperSkip(normalizedSymbol, 'invalid_qty', { qty });
+    return { skipped: true, reason: 'invalid_qty' };
+  }
+  const sizeGuard = guardTradeSize({
+    symbol: normalizedSymbol,
+    qty,
+    notional: notionalUsd,
+    price: ask,
+    side: 'buy',
+    context: 'simple_scalper_entry',
+  });
+  if (sizeGuard.skip) {
+    logSimpleScalperSkip(normalizedSymbol, 'below_min_trade', { notionalUsd: sizeGuard.notional });
+    return { skipped: true, reason: 'below_min_trade', notionalUsd: sizeGuard.notional };
+  }
+  const finalQty = sizeGuard.qty ?? qty;
+
+  const buyOrderUrl = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'orders',
+    label: 'orders_simple_scalper_buy',
+  });
+  let buyOrder = null;
+  let buyType = 'market';
+  let limitPrice = null;
+  setInFlightStatus(normalizedSymbol, {
+    reason: 'entry_in_flight',
+    untilMs: Date.now() + SIMPLE_SCALPER_ENTRY_TIMEOUT_MS,
+  });
+  try {
+    const payload = {
+      symbol: toTradeSymbol(normalizedSymbol),
+      qty: finalQty,
+      side: 'buy',
+      type: 'market',
+      time_in_force: isCryptoSymbol(normalizedSymbol) ? ENTRY_BUY_TIF_SAFE : 'gtc',
+      client_order_id: buildEntryClientOrderId(normalizedSymbol),
+    };
+    buyOrder = await placeOrderUnified({
+      symbol: normalizedSymbol,
+      url: buyOrderUrl,
+      payload,
+      label: 'orders_simple_scalper_buy',
+      reason: 'simple_scalper_market_buy',
+      context: 'simple_scalper_market_buy',
+    });
+  } catch (err) {
+    console.warn('simple_scalper_market_buy_failed', {
+      symbol: normalizedSymbol,
+      error: err?.errorMessage || err?.message || err,
+    });
+    buyType = 'limit';
+    const roundedAsk = roundToTick(ask, normalizedSymbol, 'up');
+    limitPrice = roundedAsk;
+    const payload = {
+      symbol: toTradeSymbol(normalizedSymbol),
+      qty: finalQty,
+      side: 'buy',
+      type: 'limit',
+      time_in_force: 'gtc',
+      limit_price: roundedAsk,
+      client_order_id: buildEntryClientOrderId(normalizedSymbol),
+    };
+    buyOrder = await placeOrderUnified({
+      symbol: normalizedSymbol,
+      url: buyOrderUrl,
+      payload,
+      label: 'orders_simple_scalper_buy',
+      reason: 'simple_scalper_limit_buy',
+      context: 'simple_scalper_limit_buy',
+    });
+  }
+
+  console.log('simple_scalper_buy_submit', {
+    symbol: normalizedSymbol,
+    qty: finalQty,
+    notionalUsd,
+    type: buyType,
+    limitPrice,
+  });
+
+  const buyOrderId = buyOrder?.id;
+  if (!buyOrderId) {
+    setInFlightStatus(normalizedSymbol, { reason: 'entry_not_submitted', untilMs: Date.now() + SIMPLE_SCALPER_RETRY_COOLDOWN_MS });
+    logSimpleScalperSkip(normalizedSymbol, 'entry_not_submitted');
+    return { submitted: false, skipped: true, reason: 'entry_not_submitted' };
+  }
+
+  const fillResult = await waitForOrderFill({
+    symbol: normalizedSymbol,
+    orderId: buyOrderId,
+    timeoutMs: SIMPLE_SCALPER_ENTRY_TIMEOUT_MS,
+  });
+  if (!fillResult.filled) {
+    await cancelOrderSafe(buyOrderId);
+    setInFlightStatus(normalizedSymbol, {
+      reason: 'entry_not_filled',
+      untilMs: Date.now() + SIMPLE_SCALPER_RETRY_COOLDOWN_MS,
+    });
+    logSimpleScalperSkip(normalizedSymbol, 'entry_not_filled', { status: fillResult.terminalStatus || null });
+    return { submitted: true, skipped: true, reason: 'entry_not_filled' };
+  }
+
+  inFlightBySymbol.delete(normalizedSymbol);
+  const filledOrder = fillResult.order;
+  const filledQty = Number(filledOrder?.filled_qty || 0);
+  const avgPrice = Number(filledOrder?.filled_avg_price || 0);
+  console.log('simple_scalper_buy_fill', { symbol: normalizedSymbol, filledQty, avgPrice });
+  if (Number.isFinite(filledQty) && Number.isFinite(avgPrice) && filledQty > 0 && avgPrice > 0) {
+    updateInventoryFromBuy(normalizedSymbol, filledQty, avgPrice);
+  }
+
+  const targetRaw = avgPrice * (1 + PROFIT_NET_BPS / 10000 + FEE_BPS_EST / 10000);
+  const targetPrice = roundToTick(targetRaw, normalizedSymbol, 'up');
+  const sellOrderUrl = buildAlpacaUrl({
+    baseUrl: ALPACA_BASE_URL,
+    path: 'orders',
+    label: 'orders_simple_scalper_tp',
+  });
+  const sellPayload = {
+    symbol: toTradeSymbol(normalizedSymbol),
+    qty: filledQty,
+    side: 'sell',
+    type: 'limit',
+    time_in_force: 'gtc',
+    limit_price: targetPrice,
+    client_order_id: buildTpClientOrderId(normalizedSymbol, buyOrderId),
+  };
+  const sellOrder = await placeOrderUnified({
+    symbol: normalizedSymbol,
+    url: sellOrderUrl,
+    payload: sellPayload,
+    label: 'orders_simple_scalper_tp',
+    reason: 'simple_scalper_tp',
+    context: 'simple_scalper_tp',
+  });
+  console.log('simple_scalper_tp_submit', { symbol: normalizedSymbol, qty: filledQty, targetPrice });
+  monitorSimpleScalperTpFill({ symbol: normalizedSymbol, orderId: sellOrder?.id });
+
+  return { submitted: true, buy: filledOrder, sell: sellOrder };
+}
 
 // Market buy using 10% of portfolio value then place a limit sell with markup
 
@@ -5448,6 +5794,7 @@ async function placeMakerLimitBuyThenSell(symbol) {
     reason: 'maker_limit_buy',
     context: 'maker_limit_buy',
   });
+  const submitted = Boolean(buyOrder?.id);
 
   const timeoutMs = ENTRY_FILL_TIMEOUT_SECONDS * 1000;
   const start = Date.now();
@@ -5490,7 +5837,7 @@ async function placeMakerLimitBuyThenSell(symbol) {
       console.log('entry_fallback_market', { symbol: normalizedSymbol, spreadBps });
       return placeMarketBuyThenSell(normalizedSymbol);
     }
-    return { skipped: true, reason: 'entry_not_filled' };
+    return { skipped: true, reason: 'entry_not_filled', submitted };
   }
 
   const avgPrice = parseFloat(filledOrder.filled_avg_price);
@@ -5498,7 +5845,7 @@ async function placeMakerLimitBuyThenSell(symbol) {
   const inventory = inventoryState.get(normalizedSymbol);
   if (!inventory || inventory.qty <= 0) {
     logSkip('no_inventory_for_sell', { symbol: normalizedSymbol, qty: filledOrder.filled_qty });
-    return { buy: filledOrder, sell: null, sellError: 'No inventory to sell' };
+    return { buy: filledOrder, sell: null, sellError: 'No inventory to sell', submitted };
   }
 
   const sellOrder = await handleBuyFill({
@@ -5511,7 +5858,7 @@ async function placeMakerLimitBuyThenSell(symbol) {
     entrySpreadBps: spreadBps,
   });
 
-  return { buy: filledOrder, sell: sellOrder };
+  return { buy: filledOrder, sell: sellOrder, submitted };
 }
 
 async function placeMarketBuyThenSell(symbol) {
@@ -5638,6 +5985,7 @@ async function placeMarketBuyThenSell(symbol) {
     reason: 'market_buy',
     context: 'market_buy',
   });
+  const submitted = Boolean(buyOrder?.id);
   if (buyOrder?.id) {
     markRecentEntry(normalizedSymbol, buyOrder?.id || null);
   }
@@ -5696,7 +6044,7 @@ async function placeMarketBuyThenSell(symbol) {
 
     logSkip('no_inventory_for_sell', { symbol: normalizedSymbol, qty: filled.filled_qty });
 
-    return { buy: filled, sell: null, sellError: 'No inventory to sell' };
+    return { buy: filled, sell: null, sellError: 'No inventory to sell', submitted };
 
   }
 
@@ -5720,13 +6068,13 @@ async function placeMarketBuyThenSell(symbol) {
 
     });
 
-    return { buy: filled, sell: sellOrder };
+    return { buy: filled, sell: sellOrder, submitted };
 
   } catch (err) {
 
     console.error('Sell order failed:', err?.responseSnippet200 || err?.errorMessage || err.message);
 
-    return { buy: filled, sell: null, sellError: err.message };
+    return { buy: filled, sell: null, sellError: err.message, submitted };
 
   }
 
