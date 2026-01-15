@@ -141,6 +141,7 @@ const TAKER_EXIT_ON_TOUCH = readFlag('TAKER_EXIT_ON_TOUCH', true);
 const REPLACE_THRESHOLD_BPS = Number(process.env.REPLACE_THRESHOLD_BPS || 8);
 const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
 const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
+const ORDER_FETCH_THROTTLE_MS = 1000;
 const MIN_REPRICE_INTERVAL_MS = Number(process.env.MIN_REPRICE_INTERVAL_MS || 20000);
 const REPRICE_IF_AWAY_BPS = Number(process.env.REPRICE_IF_AWAY_BPS || 8);
 const MAX_SPREAD_BPS_TO_TRADE = readNumber('MAX_SPREAD_BPS_TO_TRADE', 25);
@@ -175,6 +176,7 @@ const MIN_POSITION_QTY = Number(process.env.MIN_POSITION_QTY || 1e-6);
 const POSITIONS_SNAPSHOT_TTL_MS = Number(process.env.POSITIONS_SNAPSHOT_TTL_MS || 5000);
 const OPEN_POSITIONS_CACHE_TTL_MS = 1500;
 const OPEN_ORDERS_CACHE_TTL_MS = 1500;
+const LIVE_ORDERS_CACHE_TTL_MS = 1500;
 const ACCOUNT_CACHE_TTL_MS = 2000;
 const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
 const EXIT_STALE_QUOTE_MAX_AGE_MS = readNumber('EXIT_STALE_QUOTE_MAX_AGE_MS', 15000);
@@ -227,6 +229,22 @@ const emaArr = (arr, span) => {
   }
   return out;
 };
+
+const LIVE_ORDER_STATUSES = new Set(['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace']);
+const NON_LIVE_ORDER_STATUSES = new Set(['filled', 'canceled', 'expired', 'rejected']);
+
+function isLiveOrderStatus(status) {
+  const lowered = String(status || '').toLowerCase();
+  if (!lowered) return false;
+  if (LIVE_ORDER_STATUSES.has(lowered)) return true;
+  if (NON_LIVE_ORDER_STATUSES.has(lowered)) return false;
+  return false;
+}
+
+function filterLiveOrders(orders) {
+  const list = Array.isArray(orders) ? orders : [];
+  return list.filter((order) => isLiveOrderStatus(order?.status));
+}
 
 /* 14) FEE / PNL MODEL */
 const BPS = 10000;
@@ -427,6 +445,8 @@ const desiredExitBpsBySymbol = new Map();
 const symbolLocks = new Map();
 const lastActionAt = new Map();
 const lastCancelReplaceAt = new Map();
+const lastOrderFetchAt = new Map();
+const lastOrderSnapshotBySymbol = new Map();
 
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
@@ -446,6 +466,11 @@ const positionsSnapshot = {
   pending: null,
 };
 const openOrdersCache = {
+  tsMs: 0,
+  data: null,
+  pending: null,
+};
+const liveOrdersCache = {
   tsMs: 0,
   data: null,
   pending: null,
@@ -2737,6 +2762,21 @@ async function fetchOrderById(orderId) {
 
 }
 
+async function fetchOrderByIdThrottled({ symbol, orderId }) {
+  if (!orderId) return null;
+  const now = Date.now();
+  const lastFetchAt = lastOrderFetchAt.get(symbol);
+  if (Number.isFinite(lastFetchAt) && now - lastFetchAt < ORDER_FETCH_THROTTLE_MS) {
+    return lastOrderSnapshotBySymbol.get(symbol) || null;
+  }
+  const order = await fetchOrderById(orderId);
+  lastOrderFetchAt.set(symbol, now);
+  if (order) {
+    lastOrderSnapshotBySymbol.set(symbol, order);
+  }
+  return order;
+}
+
 async function cancelOrderSafe(orderId) {
 
   try {
@@ -2830,7 +2870,7 @@ async function submitLimitSell({
 
 }) {
 
-  const open = openOrders || (await fetchOrders({ status: 'open' }));
+  const open = openOrders || (await fetchLiveOrders());
   const availableQty = await getAvailablePositionQty(symbol);
   if (!(availableQty > 0)) {
     logSkip('no_position_qty', { symbol, qty, availableQty, context: 'limit_sell' });
@@ -2937,6 +2977,36 @@ async function submitLimitSell({
 
   if (!response?.id) {
     console.warn('tp_sell_missing_id', { symbol });
+  }
+
+  if (response?.id) {
+    const rawSymbol = response.symbol || symbol;
+    const normalizedSymbol = normalizeSymbol(rawSymbol);
+    const cachedOrder = {
+      id: response.id,
+      order_id: response.order_id,
+      client_order_id: response.client_order_id || clientOrderId,
+      rawSymbol,
+      pairSymbol: normalizedSymbol,
+      symbol: normalizedSymbol,
+      side: response.side || 'sell',
+      status: response.status || 'new',
+      limit_price: response.limit_price ?? roundedLimit,
+      submitted_at: response.submitted_at || new Date().toISOString(),
+      created_at: response.created_at,
+    };
+    const upsertCacheOrder = (cache) => {
+      if (!Array.isArray(cache?.data)) return;
+      const idx = cache.data.findIndex((order) => (order?.id || order?.order_id) === response.id);
+      if (idx >= 0) {
+        cache.data[idx] = { ...cache.data[idx], ...cachedOrder };
+      } else {
+        cache.data.push(cachedOrder);
+      }
+      cache.tsMs = Date.now();
+    };
+    upsertCacheOrder(liveOrdersCache);
+    upsertCacheOrder(openOrdersCache);
   }
 
   return response;
@@ -3304,7 +3374,7 @@ async function repairOrphanExits() {
   let openOrders = [];
 
   try {
-    [positions, openOrders] = await Promise.all([fetchPositions(), fetchOrders({ status: 'open' })]);
+    [positions, openOrders] = await Promise.all([fetchPositions(), fetchLiveOrders()]);
   } catch (err) {
     console.warn('exit_repair_fetch_failed', { error: err?.message || err });
     return { placed: 0, skipped: 0, failed: 0 };
@@ -3902,11 +3972,53 @@ async function manageExitStates() {
     const now = nowMs;
     let openOrders = [];
     try {
-      openOrders = await fetchOrders({ status: 'open' });
+      openOrders = await fetchLiveOrders();
     } catch (err) {
       console.warn('exit_manager_open_orders_failed', { error: err?.message || err });
     }
     const openOrdersList = Array.isArray(openOrders) ? openOrders : [];
+    if (openOrdersList.length) {
+      for (const [symbol, state] of exitState.entries()) {
+        if (state?.sellOrderId) continue;
+        const normalizedSymbol = normalizePair(symbol);
+        const requiredQty = Number(state?.qty ?? 0);
+        if (!Number.isFinite(requiredQty) || requiredQty <= 0) {
+          continue;
+        }
+        const candidates = openOrdersList.filter((order) => {
+          const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
+          const side = String(order.side || '').toLowerCase();
+          if (orderSymbol !== normalizedSymbol || side !== 'sell') return false;
+          const orderQty = normalizeOrderQty(order);
+          return orderQtyMeetsRequired(orderQty, requiredQty);
+        });
+        if (!candidates.length) continue;
+        const tpPrefix = buildIntentPrefix({ symbol: normalizedSymbol, side: 'SELL', intent: 'TP' });
+        const exitPrefix = buildIntentPrefix({ symbol: normalizedSymbol, side: 'SELL', intent: 'EXIT' });
+        const preferred = candidates.filter((order) => {
+          const clientOrderId = String(order?.client_order_id ?? order?.clientOrderId ?? '');
+          return clientOrderId.startsWith(tpPrefix) || clientOrderId.startsWith(exitPrefix);
+        });
+        const chosen = (preferred.length ? preferred : candidates)[0];
+        const adoptedOrderId = chosen?.id || chosen?.order_id || null;
+        if (!adoptedOrderId) continue;
+        const submittedAtRaw =
+          chosen?.submitted_at || chosen?.submittedAt || chosen?.created_at || chosen?.createdAt || null;
+        const submittedAt = submittedAtRaw ? Date.parse(submittedAtRaw) : null;
+        const submittedAtMs = Number.isFinite(submittedAt) ? submittedAt : Date.now();
+        const limitPrice = normalizeOrderLimitPrice(chosen);
+        state.sellOrderId = adoptedOrderId;
+        state.sellOrderSubmittedAt = submittedAtMs;
+        state.sellOrderLimit = limitPrice;
+        console.log('adopt_existing_sell_on_restart', {
+          symbol,
+          orderId: adoptedOrderId,
+          limitPrice,
+          matchedQty: requiredQty,
+          intentTagged: preferred.length > 0,
+        });
+      }
+    }
     const openOrdersBySymbol = openOrdersList.reduce((acc, order) => {
       const symbol = normalizePair(order.symbol || order.rawSymbol);
       if (!acc.has(symbol)) {
@@ -4765,7 +4877,7 @@ async function manageExitStates() {
         let order;
         if (state.sellOrderId) {
           try {
-            order = await fetchOrderById(state.sellOrderId);
+            order = await fetchOrderByIdThrottled({ symbol, orderId: state.sellOrderId });
           } catch (err) {
             console.warn('order_fetch_failed', { symbol, orderId: state.sellOrderId, error: err?.message || err });
           }
@@ -4904,7 +5016,7 @@ async function manageExitStates() {
         if (state.sellOrderId) {
           let order;
           try {
-            order = await fetchOrderById(state.sellOrderId);
+            order = await fetchOrderByIdThrottled({ symbol, orderId: state.sellOrderId });
           } catch (err) {
             console.warn('order_fetch_failed', { symbol, orderId: state.sellOrderId, error: err?.message || err });
           }
@@ -5746,7 +5858,7 @@ async function submitOrder(order = {}) {
       });
       return { skipped: true, reason: 'no_position_qty' };
     }
-    const openOrders = await fetchOrders({ status: 'open' });
+    const openOrders = await fetchLiveOrders();
     const hasOpenSell = (Array.isArray(openOrders) ? openOrders : []).some((order) => {
       const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
       const side = String(order.side || '').toLowerCase();
@@ -5975,6 +6087,52 @@ async function fetchOrders(params = {}) {
     openOrdersCache.pending = null;
   }
 
+}
+
+async function fetchLiveOrders() {
+  const nowMs = Date.now();
+  if (liveOrdersCache.data && nowMs - liveOrdersCache.tsMs < LIVE_ORDERS_CACHE_TTL_MS) {
+    return liveOrdersCache.data;
+  }
+  if (liveOrdersCache.pending) {
+    return liveOrdersCache.pending;
+  }
+  const afterIso = new Date(nowMs - 15 * 60 * 1000).toISOString();
+  const fetcher = async () => {
+    try {
+      const response = await fetchOrders({
+        status: 'all',
+        after: afterIso,
+        direction: 'desc',
+        limit: 500,
+      });
+      const normalized = filterLiveOrders(Array.isArray(response) ? response : []).map((order) => {
+        const rawSymbol = order.rawSymbol ?? order.symbol;
+        const normalizedSymbol = normalizeSymbol(rawSymbol);
+        return {
+          ...order,
+          rawSymbol,
+          pairSymbol: normalizedSymbol,
+          symbol: normalizedSymbol,
+        };
+      });
+      liveOrdersCache.data = normalized;
+      liveOrdersCache.tsMs = Date.now();
+      return normalized;
+    } catch (err) {
+      const fallback = await fetchOrders({ status: 'open' });
+      const list = Array.isArray(fallback) ? fallback : [];
+      liveOrdersCache.data = list;
+      liveOrdersCache.tsMs = Date.now();
+      return list;
+    }
+  };
+  liveOrdersCache.pending = fetcher();
+  try {
+    return await liveOrdersCache.pending;
+  } finally {
+    liveOrdersCache.pending = null;
+  }
 }
 
 async function fetchOpenPositions() {
