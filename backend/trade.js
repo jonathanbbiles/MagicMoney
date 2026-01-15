@@ -130,13 +130,13 @@ const DESIRED_NET_PROFIT_BASIS_POINTS = readNumber('DESIRED_NET_PROFIT_BASIS_POI
 const MAX_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MAX_GROSS_TAKE_PROFIT_BASIS_POINTS', 150);
 const MIN_GROSS_TAKE_PROFIT_BASIS_POINTS = readNumber('MIN_GROSS_TAKE_PROFIT_BASIS_POINTS', 60);
 
-const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 10);
+const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || 0);
 
-const BUFFER_BPS = Number(process.env.BUFFER_BPS || 15);
+const BUFFER_BPS = Number(process.env.BUFFER_BPS || 0);
 
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
-const PROFIT_BUFFER_BPS = Number(process.env.PROFIT_BUFFER_BPS || 2);
+const PROFIT_BUFFER_BPS = Number(process.env.PROFIT_BUFFER_BPS || 0);
 const TAKER_EXIT_ON_TOUCH = readFlag('TAKER_EXIT_ON_TOUCH', true);
 const REPLACE_THRESHOLD_BPS = Number(process.env.REPLACE_THRESHOLD_BPS || 8);
 const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
@@ -5198,7 +5198,17 @@ async function runEntryScanOnce() {
 
     const envSymbols = normalizeSymbolsParam(process.env.AUTO_SCAN_SYMBOLS);
     const stableSymbols = new Set(['USDC/USD', 'USDT/USD', 'BUSD/USD', 'DAI/USD']);
-    const scanSymbols = (envSymbols.length ? envSymbols : CRYPTO_CORE_TRACKED)
+    let universe = [];
+    if (envSymbols.length) {
+      universe = envSymbols;
+    } else {
+      await loadSupportedCryptoPairs();
+      universe = Array.from(supportedCryptoPairsState.pairs);
+      if (!universe.length) {
+        universe = CRYPTO_CORE_TRACKED;
+      }
+    }
+    const scanSymbols = universe
       .map((sym) => normalizeSymbol(sym))
       .filter((sym) => sym && !stableSymbols.has(sym));
 
