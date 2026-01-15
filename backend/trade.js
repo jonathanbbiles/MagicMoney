@@ -181,10 +181,12 @@ const EXIT_STALE_QUOTE_MAX_AGE_MS = readNumber('EXIT_STALE_QUOTE_MAX_AGE_MS', 15
 const EXIT_REPAIR_INTERVAL_MS = readNumber('EXIT_REPAIR_INTERVAL_MS', 60000);
 const SELL_QTY_MATCH_EPSILON = Number(process.env.SELL_QTY_MATCH_EPSILON || 1e-9);
 const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 120000);
+const CRYPTO_QUOTE_MAX_AGE_MS = readNumber('CRYPTO_QUOTE_MAX_AGE_MS', 600000);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
 const quoteKeyMissingLogged = new Set();
+const cryptoQuoteTtlOverrideLogged = new Set();
 
 // ───────────────────────── ENTRY SIGNAL (RESTORED FROM v3) ─────────────────────────
 const symStats = Object.create(null);
@@ -2294,9 +2296,19 @@ function pickSymbolKey(map, primaryKey) {
   return null;
 }
 
+function applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs }) {
+  const effectiveMaxAgeMsFinal = isCrypto ? Math.max(effectiveMaxAgeMs, CRYPTO_QUOTE_MAX_AGE_MS) : effectiveMaxAgeMs;
+  if (isCrypto && effectiveMaxAgeMsFinal !== effectiveMaxAgeMs && !cryptoQuoteTtlOverrideLogged.has(symbol)) {
+    console.log('crypto_quote_ttl_override', { symbol, maxAgeMs: effectiveMaxAgeMsFinal });
+    cryptoQuoteTtlOverrideLogged.add(symbol);
+  }
+  return effectiveMaxAgeMsFinal;
+}
+
 async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
   const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
   const isCrypto = isCryptoSymbol(symbol);
+  const effectiveMaxAgeMsFinal = applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs });
   const dataSymbol = isCrypto ? toDataSymbol(symbol) : symbol;
   const url = isCrypto
     ? buildAlpacaUrl({
@@ -2344,7 +2356,7 @@ async function fetchFallbackTradeQuote(symbol, nowMs, opts = {}) {
     logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(rawAgeMs) });
     return null;
   }
-  if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMs) {
+  if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
     logSkip('stale_quote', { symbol, ageSeconds: formatLoggedAgeSeconds(ageMs) });
     return null;
   }
@@ -2363,6 +2375,8 @@ async function getLatestQuote(rawSymbol, opts = {}) {
 
   const symbol = normalizeSymbol(rawSymbol);
   const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
+  const isCrypto = isCryptoSymbol(symbol);
+  const effectiveMaxAgeMsFinal = applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs });
 
   const nowMs = Date.now();
   const cached = quoteCache.get(symbol);
@@ -2374,7 +2388,7 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   if (Number.isFinite(cachedAgeMsRaw)) {
     logQuoteAgeWarning({ symbol, ageMs: cachedAgeMsRaw, source: cached?.source || 'cache', tsMs: cachedTsMs });
   }
-  if (Number.isFinite(cachedAgeMs) && cachedAgeMs <= effectiveMaxAgeMs) {
+  if (Number.isFinite(cachedAgeMs) && cachedAgeMs <= effectiveMaxAgeMsFinal) {
     recordLastQuoteAt(symbol, { tsMs: cachedTsMs, source: 'cache' });
     return {
       bid: cached.bid,
@@ -2394,7 +2408,6 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     throw err;
   }
 
-  const isCrypto = isCryptoSymbol(symbol);
   const dataSymbol = isCrypto ? toDataSymbol(symbol) : symbol;
   const url = isCrypto
     ? buildAlpacaUrl({
@@ -2420,7 +2433,7 @@ async function getLatestQuote(rawSymbol, opts = {}) {
   }
 
   const tryFallbackTradeQuote = async () => {
-    const fallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMs });
+    const fallback = await fetchFallbackTradeQuote(symbol, nowMs, { maxAgeMs: effectiveMaxAgeMsFinal });
     if (!fallback) return null;
     quoteCache.set(symbol, fallback);
     recordLastQuoteAt(symbol, { tsMs: fallback.tsMs, source: fallback.source });
@@ -2529,7 +2542,7 @@ async function getLatestQuote(rawSymbol, opts = {}) {
     throw new Error(`Quote age absurd for ${symbol}`);
   }
 
-  if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMs) {
+  if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
     const fallbackQuote = await tryFallbackTradeQuote();
     if (fallbackQuote) {
       return fallbackQuote;
@@ -2560,6 +2573,7 @@ async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
   const effectiveMaxAgeMs = Number.isFinite(opts.maxAgeMs) ? opts.maxAgeMs : MAX_QUOTE_AGE_MS;
   const nowMs = Date.now();
   const isCrypto = isCryptoSymbol(symbol);
+  const effectiveMaxAgeMsFinal = applyCryptoQuoteMaxAgeOverride({ symbol, isCrypto, effectiveMaxAgeMs });
   const dataSymbol = isCrypto ? toDataSymbol(symbol) : symbol;
   const url = isCrypto
     ? buildAlpacaUrl({
@@ -2612,7 +2626,7 @@ async function getLatestQuoteFromQuotesOnly(rawSymbol, opts = {}) {
     throw new Error(`Quote age absurd for ${symbol}`);
   }
 
-  if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMs) {
+  if (Number.isFinite(ageMs) && ageMs > effectiveMaxAgeMsFinal) {
     throw new Error(`Quote stale for ${symbol}`);
   }
 

@@ -26,6 +26,7 @@ Optional:
 - `MAX_GROSS_TAKE_PROFIT_BASIS_POINTS` (default `220`, cap on gross take-profit distance above entry)
 - `MAX_HOLD_SECONDS` (default `180`, soft max hold time before exiting when profitable)
 - `FORCE_EXIT_SECONDS` (default `300`, hard max hold time before forced exit)
+- `CRYPTO_QUOTE_MAX_AGE_MS` (default `600000`, overrides quote/trade staleness checks for crypto only; stock quotes remain strict)
 
 ## Notes
 
