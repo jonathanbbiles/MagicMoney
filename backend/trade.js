@@ -491,7 +491,8 @@ const quoteFailureState = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let exitManagerRunning = false;
-let exitRepairSchedulerInterval = null;
+let exitRepairIntervalId = null;
+let exitRepairRunning = false;
 let lastExitRepairAtMs = 0;
 const positionsSnapshot = {
   tsMs: 0,
@@ -3444,7 +3445,10 @@ async function repairOrphanExits() {
   let openOrders = [];
 
   try {
-    [positions, openOrders] = await Promise.all([fetchPositions(), fetchLiveOrders()]);
+    [positions, openOrders] = await Promise.all([
+      fetchPositions(),
+      fetchOrders({ status: 'open', nested: true, limit: 100 }),
+    ]);
   } catch (err) {
     console.warn('exit_repair_fetch_failed', { error: err?.message || err });
     return { placed: 0, skipped: 0, failed: 0 };
@@ -3453,10 +3457,12 @@ async function repairOrphanExits() {
   const openSellsBySymbol = (Array.isArray(openOrders) ? openOrders : []).reduce((acc, order) => {
     const side = String(order.side || '').toLowerCase();
     const status = String(order.status || '').toLowerCase();
-    if (side !== 'sell') {
+    const isOpenStatus = ['new', 'accepted', 'partially_filled'].includes(status);
+    if (side !== 'sell' || !isOpenStatus) {
       return acc;
     }
-    if (['filled', 'canceled', 'expired', 'rejected'].includes(status)) {
+    const orderQty = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
+    if (!Number.isFinite(orderQty) || orderQty <= 0) {
       return acc;
     }
     const symbol = normalizeSymbol(order.symbol || order.rawSymbol);
@@ -3468,7 +3474,11 @@ async function repairOrphanExits() {
   }, new Map());
   const openSellSymbols = new Set(
     (Array.isArray(openOrders) ? openOrders : [])
-      .filter((order) => String(order.side || '').toLowerCase() === 'sell')
+      .filter((order) => {
+        const side = String(order.side || '').toLowerCase();
+        const status = String(order.status || '').toLowerCase();
+        return side === 'sell' && ['new', 'accepted', 'partially_filled'].includes(status);
+      })
       .map((order) => normalizeSymbol(order.symbol || order.rawSymbol))
   );
   const positionsBySymbol = new Map(
@@ -3481,9 +3491,12 @@ async function repairOrphanExits() {
   let skipped = 0;
   let failed = 0;
   let adopted = 0;
+  let positionsChecked = 0;
+  let orphansFound = 0;
+  const exitsSkippedReasons = new Map();
 
   console.log('exit_repair_pass_start', {
-    positions: Array.isArray(positions) ? positions.length : 0,
+    positionsChecked: Array.isArray(positions) ? positions.length : 0,
     openSell: openSellSymbols.size,
     openOrdersCount: Array.isArray(openOrders) ? openOrders.length : 0,
     openSellSample: Array.from(openSellSymbols).slice(0, 3),
@@ -3511,6 +3524,7 @@ async function repairOrphanExits() {
   }
 
   for (const pos of positions) {
+    positionsChecked += 1;
     const symbol = normalizeSymbol(pos.symbol);
     const qty = Number(pos.qty ?? pos.quantity ?? 0);
     const avgEntryPrice = Number(pos.avg_entry_price ?? pos.avgEntryPrice ?? 0);
@@ -3563,6 +3577,7 @@ async function repairOrphanExits() {
     if (!Number.isFinite(qty) || qty <= 0) {
       decision = 'SKIP:non_positive_qty';
       skipped += 1;
+      exitsSkippedReasons.set('non_positive_qty', (exitsSkippedReasons.get('non_positive_qty') || 0) + 1);
       logExitRepairDecision({
         symbol,
         qty,
@@ -3583,6 +3598,7 @@ async function repairOrphanExits() {
     if (isDustQty(qty)) {
       decision = 'SKIP:dust_qty';
       skipped += 1;
+      exitsSkippedReasons.set('dust_qty', (exitsSkippedReasons.get('dust_qty') || 0) + 1);
       logExitRepairDecision({
         symbol,
         qty,
@@ -3603,6 +3619,7 @@ async function repairOrphanExits() {
     if (!Number.isFinite(avgEntryPrice) || avgEntryPrice <= 0) {
       decision = 'SKIP:missing_cost_basis';
       skipped += 1;
+      exitsSkippedReasons.set('missing_cost_basis', (exitsSkippedReasons.get('missing_cost_basis') || 0) + 1);
       logExitRepairDecision({
         symbol,
         qty,
@@ -3677,6 +3694,7 @@ async function repairOrphanExits() {
         });
         decision = 'OK:tracked_and_has_open_sell';
         skipped += 1;
+        exitsSkippedReasons.set('tracked_and_has_open_sell', (exitsSkippedReasons.get('tracked_and_has_open_sell') || 0) + 1);
         logExitRepairDecision({
           symbol,
           qty,
@@ -3776,6 +3794,7 @@ async function repairOrphanExits() {
         });
         decision = 'ADOPT:open_sell_untracked';
         adopted += 1;
+        exitsSkippedReasons.set('adopt_open_sell_untracked', (exitsSkippedReasons.get('adopt_open_sell_untracked') || 0) + 1);
         logExitRepairDecision({
           symbol,
           qty,
@@ -3797,6 +3816,7 @@ async function repairOrphanExits() {
     if (hasOpenSell) {
       decision = 'SKIP:open_sell';
       skipped += 1;
+      exitsSkippedReasons.set('open_sell', (exitsSkippedReasons.get('open_sell') || 0) + 1);
       logExitRepairDecision({
         symbol,
         qty,
@@ -3817,6 +3837,7 @@ async function repairOrphanExits() {
     if (!autoTradeEnabled) {
       decision = 'SKIP:auto_trade_disabled';
       skipped += 1;
+      exitsSkippedReasons.set('auto_trade_disabled', (exitsSkippedReasons.get('auto_trade_disabled') || 0) + 1);
       logExitRepairDecision({
         symbol,
         qty,
@@ -3837,6 +3858,7 @@ async function repairOrphanExits() {
     if (!autoSellEnabled) {
       decision = 'SKIP:auto_sell_disabled';
       skipped += 1;
+      exitsSkippedReasons.set('auto_sell_disabled', (exitsSkippedReasons.get('auto_sell_disabled') || 0) + 1);
       logExitRepairDecision({
         symbol,
         qty,
@@ -3857,6 +3879,7 @@ async function repairOrphanExits() {
     if (!exitsEnabled) {
       decision = 'SKIP:exits_disabled';
       skipped += 1;
+      exitsSkippedReasons.set('exits_disabled', (exitsSkippedReasons.get('exits_disabled') || 0) + 1);
       logExitRepairDecision({
         symbol,
         qty,
@@ -3877,6 +3900,7 @@ async function repairOrphanExits() {
     if (!liveMode) {
       decision = 'SKIP:live_mode_disabled';
       skipped += 1;
+      exitsSkippedReasons.set('live_mode_disabled', (exitsSkippedReasons.get('live_mode_disabled') || 0) + 1);
       logExitRepairDecision({
         symbol,
         qty,
@@ -3894,7 +3918,8 @@ async function repairOrphanExits() {
       continue;
     }
 
-    console.warn('exit_orphan_detected', { symbol, qty });
+    orphansFound += 1;
+    console.warn('exit_orphan_detected', { symbol, qty, avg_entry_price: avgEntryPrice });
 
     console.log('tp_attach_plan', {
       symbol,
@@ -3919,8 +3944,10 @@ async function repairOrphanExits() {
         postOnly,
       });
       if (repairOrder?.skipped) {
-        decision = `SKIP:${repairOrder.reason || 'submit_skipped'}`;
+        const skipReason = repairOrder.reason || 'submit_skipped';
+        decision = `SKIP:${skipReason}`;
         skipped += 1;
+        exitsSkippedReasons.set(skipReason, (exitsSkippedReasons.get(skipReason) || 0) + 1);
         logExitRepairDecision({
           symbol,
           qty,
@@ -3974,7 +4001,7 @@ async function repairOrphanExits() {
         slippageBpsUsed: slippageBps,
         spreadBufferBps,
         requiredExitBps,
-        netAfterFeesBps: plan.netAfterFeesBps,
+        netAfterFeesBps,
         sellOrderId: repairOrder.id,
         sellOrderSubmittedAt: now,
         sellOrderLimit: targetPrice,
@@ -3983,6 +4010,12 @@ async function repairOrphanExits() {
       desiredExitBpsBySymbol.delete(symbol);
       placed += 1;
       decision = 'PLACE_EXIT';
+      console.log('exit_order_submitted', {
+        symbol,
+        qty,
+        limitPrice: targetPrice,
+        orderId: repairOrder.id,
+      });
       logExitRepairDecision({
         symbol,
         qty,
@@ -4017,8 +4050,34 @@ async function repairOrphanExits() {
     }
   }
 
-  console.log('exit_repair_pass_done', { placed, skipped, failed, adopted });
+  const exitSkipSummary = Array.from(exitsSkippedReasons.entries())
+    .sort((a, b) => b[1] - a[1])
+    .reduce((acc, [reason, count]) => {
+      acc[reason] = count;
+      return acc;
+    }, {});
+  console.log('exit_repair_pass_done', {
+    positionsChecked,
+    orphansFound,
+    exitsPlaced: placed,
+    exitsSkippedReasons: exitSkipSummary,
+    skipped,
+    failed,
+    adopted,
+  });
   return { placed, skipped, failed, adopted };
+}
+
+async function repairOrphanExitsSafe() {
+  if (exitRepairRunning) {
+    return;
+  }
+  exitRepairRunning = true;
+  try {
+    await repairOrphanExits();
+  } finally {
+    exitRepairRunning = false;
+  }
 }
 
 async function manageExitStates() {
@@ -4032,7 +4091,7 @@ async function manageExitStates() {
   try {
     const nowMs = Date.now();
     if (nowMs - lastExitRepairAtMs >= EXIT_REPAIR_INTERVAL_MS) {
-      await repairOrphanExits();
+      await repairOrphanExitsSafe();
       lastExitRepairAtMs = nowMs;
     } else {
       console.log('exit_repair_skip_interval', {
@@ -5260,6 +5319,8 @@ async function runEntryScanOnce() {
   entryScanRunning = true;
   try {
     const startMs = Date.now();
+    const MAX_ATTEMPTS = Number(process.env.SIMPLE_SCALPER_MAX_ENTRY_ATTEMPTS_PER_SCAN ?? 5);
+    const maxAttemptsPerScan = Number.isFinite(MAX_ATTEMPTS) && MAX_ATTEMPTS > 0 ? MAX_ATTEMPTS : 5;
     const autoTradeEnabled = readEnvFlag('AUTO_TRADE', true);
     const liveMode = readEnvFlag('LIVE', readEnvFlag('LIVE_MODE', readEnvFlag('LIVE_TRADING', true)));
     if (!autoTradeEnabled || !liveMode) {
@@ -5320,9 +5381,13 @@ async function runEntryScanOnce() {
     let placed = 0;
     let scanned = 0;
     let skipped = 0;
+    let attempts = 0;
     const skipCounts = new Map();
 
     for (const symbol of scanSymbols) {
+      if (attempts >= maxAttemptsPerScan) {
+        break;
+      }
       scanned += 1;
       if (heldSymbols.has(symbol)) {
         skipped += 1;
@@ -5372,10 +5437,16 @@ async function runEntryScanOnce() {
         desiredExitBpsBySymbol.set(symbol, signal.desiredNetExitBpsForV22);
         result = await placeMakerLimitBuyThenSell(symbol);
       }
+      attempts += 1;
       if (result?.submitted) {
         placed += 1;
+        break;
       }
-      break;
+      if (result?.skipped || result?.failed) {
+        skipped += 1;
+        const reason = result.reason || (result.failed ? 'attempt_failed' : 'attempt_skipped');
+        skipCounts.set(reason, (skipCounts.get(reason) || 0) + 1);
+      }
     }
 
     const topSkipReasons = Array.from(skipCounts.entries())
@@ -5402,18 +5473,15 @@ async function runEntryScanOnce() {
 }
 
 function startExitManager() {
-  if (SIMPLE_SCALPER_ENABLED) {
-    if (exitRepairSchedulerInterval) {
-      return;
-    }
+  if (!exitRepairIntervalId) {
     try {
-      exitRepairSchedulerInterval = setInterval(() => {
-        repairOrphanExits().catch((err) => {
+      exitRepairIntervalId = setInterval(() => {
+        repairOrphanExitsSafe().catch((err) => {
           console.error('exit_repair_scheduler_failed', err?.message || err);
         });
       }, EXIT_REPAIR_INTERVAL_MS);
       setTimeout(() => {
-        repairOrphanExits().catch((err) => {
+        repairOrphanExitsSafe().catch((err) => {
           console.error('exit_repair_scheduler_failed', err?.message || err);
         });
       }, 0);
@@ -5421,6 +5489,8 @@ function startExitManager() {
     } catch (err) {
       console.error('exit_repair_scheduler_failed', err?.message || err);
     }
+  }
+  if (SIMPLE_SCALPER_ENABLED) {
     return;
   }
 
@@ -5436,7 +5506,7 @@ function startExitManager() {
 
   console.log('exit_manager_started', { intervalSeconds: REPRICE_EVERY_SECONDS });
   setTimeout(() => {
-    repairOrphanExits().catch((err) => {
+    repairOrphanExitsSafe().catch((err) => {
       console.error('exit_repair_start_failed', err?.message || err);
     });
   }, 0);
@@ -5547,14 +5617,13 @@ async function placeSimpleScalperEntry(symbol) {
   const account = await getAccountInfo();
   const portfolioValue = account.portfolioValue;
   const buyingPower = account.buyingPower;
-  if (
-    !Number.isFinite(portfolioValue) ||
-    !Number.isFinite(buyingPower) ||
-    portfolioValue <= 0 ||
-    buyingPower <= 0
-  ) {
+  if (!Number.isFinite(portfolioValue) || portfolioValue <= 0 || !Number.isFinite(buyingPower)) {
     logSimpleScalperSkip(normalizedSymbol, 'invalid_account_values', { portfolioValue, buyingPower });
     return { skipped: true, reason: 'invalid_account_values' };
+  }
+  if (buyingPower <= 0) {
+    logSimpleScalperSkip(normalizedSymbol, 'no_buying_power', { portfolioValue, buyingPower });
+    return { skipped: true, reason: 'no_buying_power' };
   }
   const reserveUsd = Math.max(0, BUYING_POWER_RESERVE_USD);
   const buyingPowerAvailable = buyingPower - reserveUsd;
@@ -5619,26 +5688,38 @@ async function placeSimpleScalperEntry(symbol) {
       symbol: normalizedSymbol,
       error: err?.errorMessage || err?.message || err,
     });
-    buyType = 'limit';
-    const roundedAsk = roundToTick(ask, normalizedSymbol, 'up');
-    limitPrice = roundedAsk;
-    const payload = {
-      symbol: toTradeSymbol(normalizedSymbol),
-      qty: finalQty,
-      side: 'buy',
-      type: 'limit',
-      time_in_force: 'gtc',
-      limit_price: roundedAsk,
-      client_order_id: buildEntryClientOrderId(normalizedSymbol),
-    };
-    buyOrder = await placeOrderUnified({
-      symbol: normalizedSymbol,
-      url: buyOrderUrl,
-      payload,
-      label: 'orders_simple_scalper_buy',
-      reason: 'simple_scalper_limit_buy',
-      context: 'simple_scalper_limit_buy',
-    });
+    try {
+      buyType = 'limit';
+      const roundedAsk = roundToTick(ask, normalizedSymbol, 'up');
+      limitPrice = roundedAsk;
+      const payload = {
+        symbol: toTradeSymbol(normalizedSymbol),
+        qty: finalQty,
+        side: 'buy',
+        type: 'limit',
+        time_in_force: 'gtc',
+        limit_price: roundedAsk,
+        client_order_id: buildEntryClientOrderId(normalizedSymbol),
+      };
+      buyOrder = await placeOrderUnified({
+        symbol: normalizedSymbol,
+        url: buyOrderUrl,
+        payload,
+        label: 'orders_simple_scalper_buy',
+        reason: 'simple_scalper_limit_buy',
+        context: 'simple_scalper_limit_buy',
+      });
+    } catch (submitErr) {
+      setInFlightStatus(normalizedSymbol, {
+        reason: 'submit_failed',
+        untilMs: Date.now() + SIMPLE_SCALPER_RETRY_COOLDOWN_MS,
+      });
+      return {
+        failed: true,
+        reason: 'submit_failed',
+        error: submitErr?.message || submitErr,
+      };
+    }
   }
 
   console.log('simple_scalper_buy_submit', {
@@ -5653,7 +5734,7 @@ async function placeSimpleScalperEntry(symbol) {
   if (!buyOrderId) {
     setInFlightStatus(normalizedSymbol, { reason: 'entry_not_submitted', untilMs: Date.now() + SIMPLE_SCALPER_RETRY_COOLDOWN_MS });
     logSimpleScalperSkip(normalizedSymbol, 'entry_not_submitted');
-    return { submitted: false, skipped: true, reason: 'entry_not_submitted' };
+    return { skipped: true, reason: 'entry_not_submitted' };
   }
 
   const fillResult = await waitForOrderFill({
