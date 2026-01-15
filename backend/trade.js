@@ -201,6 +201,8 @@ const quoteTsDebugLogged = new Set();
 const quoteKeyMissingLogged = new Set();
 const cryptoQuoteTtlOverrideLogged = new Set();
 const HALT_ON_ORPHANS = readEnvFlag('HALT_ON_ORPHANS', true);
+const ORPHAN_AUTO_ATTACH_TP = readEnvFlag('ORPHAN_AUTO_ATTACH_TP', true);
+const ORPHAN_REPAIR_BEFORE_HALT = readEnvFlag('ORPHAN_REPAIR_BEFORE_HALT', true);
 const ORPHAN_SCAN_TTL_MS = readNumber('ORPHAN_SCAN_TTL_MS', 15000);
 let tradingHaltedReason = null;
 let lastOrphanScan = { tsMs: 0, orphans: [], positionsCount: 0, openOrdersCount: 0, openSellSymbols: [] };
@@ -247,6 +249,16 @@ const emaArr = (arr, span) => {
 
 const LIVE_ORDER_STATUSES = new Set(['new', 'accepted', 'pending_new', 'partially_filled', 'pending_replace']);
 const NON_LIVE_ORDER_STATUSES = new Set(['filled', 'canceled', 'expired', 'rejected']);
+const OPEN_LIKE_ORDER_STATUSES = new Set([
+  'new',
+  'accepted',
+  'partially_filled',
+  'pending_new',
+  'pending_replace',
+  'held',
+  'queued',
+  'replaced',
+]);
 
 function isLiveOrderStatus(status) {
   const lowered = String(status || '').toLowerCase();
@@ -260,6 +272,23 @@ function isTerminalOrderStatus(status) {
   const lowered = String(status || '').toLowerCase();
   if (!lowered) return false;
   return NON_LIVE_ORDER_STATUSES.has(lowered);
+}
+
+function isOpenLikeOrderStatus(status) {
+  const lowered = String(status || '').toLowerCase();
+  if (!lowered) return false;
+  return OPEN_LIKE_ORDER_STATUSES.has(lowered);
+}
+
+function expandNestedOrders(orders) {
+  const list = Array.isArray(orders) ? orders : [];
+  return list.reduce((acc, order) => {
+    acc.push(order);
+    if (Array.isArray(order?.legs)) {
+      acc.push(...order.legs);
+    }
+    return acc;
+  }, []);
 }
 
 function filterLiveOrders(orders) {
@@ -475,6 +504,7 @@ const inventoryState = new Map();
 
 const exitState = new Map();
 const desiredExitBpsBySymbol = new Map();
+const entrySpreadOverridesBySymbol = new Map();
 const symbolLocks = new Map();
 const lastActionAt = new Map();
 const lastCancelReplaceAt = new Map();
@@ -2279,6 +2309,34 @@ function normalizeOrderQty(order) {
   return Number.isFinite(num) ? num : null;
 }
 
+function resolveOrderQty(order) {
+  const normalizedQty = normalizeOrderQty(order);
+  if (Number.isFinite(normalizedQty)) return normalizedQty;
+  const fallback = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
+  return Number.isFinite(fallback) ? fallback : null;
+}
+
+function orderHasValidLimit(order) {
+  const limitPrice = normalizeOrderLimitPrice(order) ?? Number(order?.limit);
+  if (Number.isFinite(limitPrice) && limitPrice > 0) return true;
+  const orderType = String(order?.type ?? order?.order_type ?? '').toLowerCase();
+  if (orderType === 'stop_limit') {
+    const stopLimitPrice = Number(order?.stop_limit_price ?? order?.stop_limit ?? order?.stopLimitPrice);
+    if (Number.isFinite(stopLimitPrice) && stopLimitPrice > 0) return true;
+  }
+  const nestedLimit = Number(order?.order_type?.limit_price ?? order?.order_type?.limitPrice ?? order?.order_type?.limit);
+  if (Number.isFinite(nestedLimit) && nestedLimit > 0) return true;
+  const orderClass = String(order?.order_class ?? order?.orderClass ?? '').toLowerCase();
+  if (orderClass === 'oco' && Array.isArray(order?.legs)) {
+    return order.legs.some((leg) => {
+      const side = String(leg?.side || '').toLowerCase();
+      if (side !== 'sell') return false;
+      return orderHasValidLimit(leg);
+    });
+  }
+  return false;
+}
+
 function orderQtyMeetsRequired(orderQty, requiredQty) {
   if (!Number.isFinite(orderQty) || !Number.isFinite(requiredQty)) return false;
   const tol = Math.max(SELL_QTY_MATCH_EPSILON, requiredQty * 1e-6);
@@ -3196,27 +3254,10 @@ async function submitIocLimitSell({
   return { order: response, requestedQty: finalQty };
 }
 
-async function handleBuyFill({
-
-  symbol: rawSymbol,
-
-  qty,
-
-  entryPrice,
-  entryOrderId,
-  desiredNetExitBps,
-  entryBid,
-  entryAsk,
-  entrySpreadBps,
-
-}) {
-
+async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entryOrderId = null, maxFill = null }) {
   const symbol = normalizeSymbol(rawSymbol);
-
   const entryPriceNum = Number(entryPrice);
-
   const qtyNum = Number(qty);
-
   const notionalUsd = qtyNum * entryPriceNum;
 
   let entryOrderType = null;
@@ -3230,15 +3271,11 @@ async function handleBuyFill({
       console.warn('entry_order_fetch_failed', { symbol, entryOrderId, error: err?.message || err });
     }
   }
-  let entrySpreadBpsUsed = Number(entrySpreadBps);
-  if (!Number.isFinite(entrySpreadBpsUsed)) {
-    const bidNum = Number(entryBid);
-    const askNum = Number(entryAsk);
-    if (Number.isFinite(bidNum) && Number.isFinite(askNum) && bidNum > 0) {
-      entrySpreadBpsUsed = ((askNum - bidNum) / bidNum) * 10000;
-    }
-  }
-  if (!Number.isFinite(entrySpreadBpsUsed)) {
+
+  let entrySpreadBpsUsed = Number(entrySpreadOverridesBySymbol.get(symbol));
+  if (Number.isFinite(entrySpreadBpsUsed)) {
+    entrySpreadOverridesBySymbol.delete(symbol);
+  } else {
     try {
       const quote = await getLatestQuote(symbol, { maxAgeMs: EXIT_QUOTE_MAX_AGE_MS });
       const bidNum = Number(quote.bid);
@@ -3261,12 +3298,11 @@ async function handleBuyFill({
     postOnly: entryPostOnly,
   });
   const exitFeeBps = inferExitFeeBps({ takerExitOnTouch: TAKER_EXIT_ON_TOUCH });
-  const maxFill = await fetchMaxFillPriceForOrder({ symbol, orderId: entryOrderId });
   const effectiveEntryPrice = Number.isFinite(maxFill) ? maxFill : entryPriceNum;
   const feeBpsRoundTrip = entryFeeBps + exitFeeBps;
-  let desiredNetExitBpsValue = Number.isFinite(desiredNetExitBps)
-    ? Number(desiredNetExitBps)
-    : (Number.isFinite(desiredExitBpsBySymbol.get(symbol)) ? desiredExitBpsBySymbol.get(symbol) : null);
+  let desiredNetExitBpsValue = Number.isFinite(desiredExitBpsBySymbol.get(symbol))
+    ? desiredExitBpsBySymbol.get(symbol)
+    : null;
   if (desiredNetExitBpsValue != null) {
     desiredExitBpsBySymbol.delete(symbol);
   }
@@ -3363,17 +3399,12 @@ async function handleBuyFill({
   }
 
   const sellOrder = await submitLimitSell({
-
     symbol,
-
     qty: qtyNum,
-
     limitPrice: targetPrice,
-
     reason: 'initial_target',
     intentRef: entryOrderId || getOrderIntentBucket(),
     postOnly,
-
   });
 
   const now = Date.now();
@@ -3384,20 +3415,13 @@ async function handleBuyFill({
     typeof sellOrderSubmittedAtRaw === 'string' ? Date.parse(sellOrderSubmittedAtRaw) : sellOrderSubmittedAtRaw;
 
   exitState.set(symbol, {
-
     symbol,
-
     qty: qtyNum,
-
     entryPrice: entryPriceNum,
     effectiveEntryPrice,
-
     entryTime: now,
-
     notionalUsd,
-
     minNetProfitBps,
-
     targetPrice,
     feeBpsRoundTrip,
     profitBufferBps,
@@ -3409,34 +3433,86 @@ async function handleBuyFill({
     entryFeeBps,
     exitFeeBps,
     entryOrderId: entryOrderId || null,
-
     sellOrderId,
-
     sellOrderSubmittedAt: Number.isFinite(sellOrderSubmittedAt) ? sellOrderSubmittedAt : now,
-
     sellOrderLimit,
-
     takerAttempted: false,
   });
 
   logExitDecision({
-
     symbol,
-
     heldSeconds: 0,
-
     entryPrice: entryPriceNum,
-
     targetPrice,
-
     bid: null,
-
     ask: null,
-
     minNetProfitBps,
-
     actionTaken: 'placed_initial_limit_sell',
+  });
 
+  return sellOrder;
+}
+
+async function handleBuyFill({
+
+  symbol: rawSymbol,
+
+  qty,
+
+  entryPrice,
+  entryOrderId,
+  desiredNetExitBps,
+  entryBid,
+  entryAsk,
+  entrySpreadBps,
+
+}) {
+
+  const symbol = normalizeSymbol(rawSymbol);
+
+  const entryPriceNum = Number(entryPrice);
+
+  const qtyNum = Number(qty);
+
+  const notionalUsd = qtyNum * entryPriceNum;
+
+  if (Number.isFinite(Number(desiredNetExitBps))) {
+    desiredExitBpsBySymbol.set(symbol, Number(desiredNetExitBps));
+  }
+
+  let entrySpreadBpsUsed = Number(entrySpreadBps);
+  if (!Number.isFinite(entrySpreadBpsUsed)) {
+    const bidNum = Number(entryBid);
+    const askNum = Number(entryAsk);
+    if (Number.isFinite(bidNum) && Number.isFinite(askNum) && bidNum > 0) {
+      entrySpreadBpsUsed = ((askNum - bidNum) / bidNum) * 10000;
+    }
+  }
+  if (!Number.isFinite(entrySpreadBpsUsed)) {
+    try {
+      const quote = await getLatestQuote(symbol, { maxAgeMs: EXIT_QUOTE_MAX_AGE_MS });
+      const bidNum = Number(quote.bid);
+      const askNum = Number(quote.ask);
+      if (Number.isFinite(bidNum) && Number.isFinite(askNum) && bidNum > 0) {
+        entrySpreadBpsUsed = ((askNum - bidNum) / bidNum) * 10000;
+      }
+    } catch (err) {
+      console.warn('entry_spread_fetch_failed', { symbol, error: err?.message || err });
+    }
+  }
+  if (!Number.isFinite(entrySpreadBpsUsed)) {
+    entrySpreadBpsUsed = 0;
+    console.warn('entry_spread_unknown', { symbol });
+  }
+  entrySpreadOverridesBySymbol.set(symbol, entrySpreadBpsUsed);
+
+  const maxFill = await fetchMaxFillPriceForOrder({ symbol, orderId: entryOrderId });
+  const sellOrder = await attachInitialExitLimit({
+    symbol,
+    qty: qtyNum,
+    entryPrice: entryPriceNum,
+    entryOrderId,
+    maxFill,
   });
 
   return sellOrder;
@@ -3461,14 +3537,14 @@ async function scanOrphanPositions() {
     };
   }
 
-  const openSellsBySymbol = (Array.isArray(openOrders) ? openOrders : []).reduce((acc, order) => {
+  const expandedOrders = expandNestedOrders(openOrders);
+  const openSellsBySymbol = expandedOrders.reduce((acc, order) => {
     const side = String(order.side || '').toLowerCase();
     const status = String(order.status || '').toLowerCase();
-    const isOpenStatus = ['new', 'accepted', 'partially_filled'].includes(status);
-    if (side !== 'sell' || !isOpenStatus) {
+    if (side !== 'sell' || !isOpenLikeOrderStatus(status)) {
       return acc;
     }
-    const orderQty = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
+    const orderQty = resolveOrderQty(order);
     if (!Number.isFinite(orderQty) || orderQty <= 0) {
       return acc;
     }
@@ -3481,11 +3557,11 @@ async function scanOrphanPositions() {
   }, new Map());
 
   const openSellSymbols = new Set(
-    (Array.isArray(openOrders) ? openOrders : [])
+    expandedOrders
       .filter((order) => {
         const side = String(order.side || '').toLowerCase();
         const status = String(order.status || '').toLowerCase();
-        return side === 'sell' && ['new', 'accepted', 'partially_filled'].includes(status);
+        return side === 'sell' && isOpenLikeOrderStatus(status);
       })
       .map((order) => normalizeSymbol(order.symbol || order.rawSymbol))
   );
@@ -3509,13 +3585,10 @@ async function scanOrphanPositions() {
       continue;
     }
     const openSellQty = openSellOrders.reduce((sum, order) => {
-      const orderQty = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
+      const orderQty = resolveOrderQty(order);
       return Number.isFinite(orderQty) ? sum + orderQty : sum;
     }, 0);
-    const hasValidLimit = openSellOrders.some((order) => {
-      const limitPrice = Number(order?.limit_price ?? order?.limitPrice ?? order?.limit);
-      return Number.isFinite(limitPrice) && limitPrice > 0;
-    });
+    const hasValidLimit = openSellOrders.some((order) => orderHasValidLimit(order));
     const unusableOpenSell =
       !Number.isFinite(openSellQty) ||
       openSellQty <= 0 ||
@@ -3568,14 +3641,14 @@ async function repairOrphanExits() {
     return { placed: 0, skipped: 0, failed: 0 };
   }
 
-  const openSellsBySymbol = (Array.isArray(openOrders) ? openOrders : []).reduce((acc, order) => {
+  const expandedOrders = expandNestedOrders(openOrders);
+  const openSellsBySymbol = expandedOrders.reduce((acc, order) => {
     const side = String(order.side || '').toLowerCase();
     const status = String(order.status || '').toLowerCase();
-    const isOpenStatus = ['new', 'accepted', 'partially_filled'].includes(status);
-    if (side !== 'sell' || !isOpenStatus) {
+    if (side !== 'sell' || !isOpenLikeOrderStatus(status)) {
       return acc;
     }
-    const orderQty = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
+    const orderQty = resolveOrderQty(order);
     if (!Number.isFinite(orderQty) || orderQty <= 0) {
       return acc;
     }
@@ -3587,11 +3660,11 @@ async function repairOrphanExits() {
     return acc;
   }, new Map());
   const openSellSymbols = new Set(
-    (Array.isArray(openOrders) ? openOrders : [])
+    expandedOrders
       .filter((order) => {
         const side = String(order.side || '').toLowerCase();
         const status = String(order.status || '').toLowerCase();
-        return side === 'sell' && ['new', 'accepted', 'partially_filled'].includes(status);
+        return side === 'sell' && isOpenLikeOrderStatus(status);
       })
       .map((order) => normalizeSymbol(order.symbol || order.rawSymbol))
   );
@@ -3664,13 +3737,10 @@ async function repairOrphanExits() {
 
     if (hasOpenSell) {
       const openSellQty = openSellOrders.reduce((sum, order) => {
-        const orderQty = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
+        const orderQty = resolveOrderQty(order);
         return Number.isFinite(orderQty) ? sum + orderQty : sum;
       }, 0);
-      const hasValidLimit = openSellOrders.some((order) => {
-        const limitPrice = Number(order?.limit_price ?? order?.limitPrice ?? order?.limit);
-        return Number.isFinite(limitPrice) && limitPrice > 0;
-      });
+      const hasValidLimit = openSellOrders.some((order) => orderHasValidLimit(order));
       const unusableOpenSell =
         !Number.isFinite(openSellQty) ||
         openSellQty <= 0 ||
@@ -3846,8 +3916,8 @@ async function repairOrphanExits() {
     if (hasOpenSell && !hasTrackedExit) {
       const bestOrder = openSellOrders
         .map((order) => {
-          const orderQty = Number(order?.qty ?? order?.quantity ?? order?.qty_requested ?? order?.order_qty ?? 0);
-          const limitPrice = Number(order?.limit_price ?? order?.limitPrice ?? order?.limit);
+          const orderQty = resolveOrderQty(order);
+          const limitPrice = normalizeOrderLimitPrice(order);
           return { order, orderQty, limitPrice };
         })
         .filter((item) => Number.isFinite(item.orderQty) && item.orderQty > 0 && Number.isFinite(item.limitPrice))
@@ -4014,6 +4084,43 @@ async function repairOrphanExits() {
     orphansFound += 1;
     console.warn('exit_orphan_detected', { symbol, qty, avg_entry_price: avgEntryPrice });
     console.warn('exit_orphan_gates', { symbol, gates: gateFlags });
+
+    if (ORPHAN_AUTO_ATTACH_TP && autoSellEnabled && exitsEnabled && liveMode) {
+      try {
+        const sellOrder = await attachInitialExitLimit({
+          symbol,
+          qty,
+          entryPrice: avgEntryPrice,
+          entryOrderId: null,
+          maxFill: null,
+        });
+        const orderId = sellOrder?.id || sellOrder?.order_id || null;
+        const exitSnapshot = exitState.get(symbol) || {};
+        const loggedTargetPrice = normalizeOrderLimitPrice(sellOrder) ?? exitSnapshot.targetPrice ?? null;
+        placed += 1;
+        decision = 'PLACED:repair_attached_tp';
+        console.log('exit_orphan_repaired', { symbol, qty, targetPrice: loggedTargetPrice, orderId });
+      } catch (err) {
+        failed += 1;
+        decision = 'FAILED:repair_attach_tp';
+        console.warn('exit_orphan_repair_failed', { symbol, error: err?.message || err });
+      }
+      logExitRepairDecision({
+        symbol,
+        qty,
+        avgEntryPrice,
+        costBasis,
+        bid,
+        ask,
+        targetPrice,
+        timeInForce,
+        orderType,
+        hasOpenSell,
+        gates: gateFlags,
+        decision,
+      });
+      continue;
+    }
 
     console.log('tp_attach_plan', {
       symbol,
@@ -5325,11 +5432,17 @@ async function runEntryScanOnce() {
       return;
     }
     if (HALT_ON_ORPHANS) {
-      const orphanReport = await getCachedOrphanScan();
-      const orphans = Array.isArray(orphanReport?.orphans) ? orphanReport.orphans : [];
-      if (orphans.length > 0) {
+      const orphanReport1 = await getCachedOrphanScan();
+      const orphans1 = Array.isArray(orphanReport1?.orphans) ? orphanReport1.orphans : [];
+      if (orphans1.length > 0 && ORPHAN_REPAIR_BEFORE_HALT) {
+        await repairOrphanExitsSafe();
+        lastOrphanScan.tsMs = 0;
+      }
+      const orphanReport2 = await scanOrphanPositions();
+      const orphans2 = Array.isArray(orphanReport2?.orphans) ? orphanReport2.orphans : [];
+      if (orphans2.length > 0) {
         tradingHaltedReason = 'orphans_present';
-        console.warn('HALT_TRADING_ORPHANS', { count: orphans.length, symbols: orphans.map((orphan) => orphan.symbol) });
+        console.warn('HALT_TRADING_ORPHANS', { count: orphans2.length, symbols: orphans2.map((orphan) => orphan.symbol) });
         const endMs = Date.now();
         console.log('entry_scan', {
           startMs,
@@ -5596,11 +5709,17 @@ async function waitForOrderFill({ symbol, orderId, timeoutMs, intervalMs = 1000 
 async function placeSimpleScalperEntry(symbol) {
   const normalizedSymbol = normalizeSymbol(symbol);
   if (HALT_ON_ORPHANS) {
-    const orphanReport = await getCachedOrphanScan();
-    const orphans = Array.isArray(orphanReport?.orphans) ? orphanReport.orphans : [];
-    if (orphans.length > 0) {
+    const orphanReport1 = await getCachedOrphanScan();
+    const orphans1 = Array.isArray(orphanReport1?.orphans) ? orphanReport1.orphans : [];
+    if (orphans1.length > 0 && ORPHAN_REPAIR_BEFORE_HALT) {
+      await repairOrphanExitsSafe();
+      lastOrphanScan.tsMs = 0;
+    }
+    const orphanReport2 = await scanOrphanPositions();
+    const orphans2 = Array.isArray(orphanReport2?.orphans) ? orphanReport2.orphans : [];
+    if (orphans2.length > 0) {
       tradingHaltedReason = 'orphans_present';
-      console.warn('HALT_TRADING_ORPHANS', { count: orphans.length, symbols: orphans.map((orphan) => orphan.symbol) });
+      console.warn('HALT_TRADING_ORPHANS', { count: orphans2.length, symbols: orphans2.map((orphan) => orphan.symbol) });
       logSimpleScalperSkip(normalizedSymbol, 'halted_orphans');
       return { skipped: true, reason: 'halted_orphans' };
     }
