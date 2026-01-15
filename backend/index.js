@@ -40,6 +40,7 @@ const {
   loadSupportedCryptoPairs,
   getSupportedCryptoPairsSnapshot,
   filterSupportedCryptoSymbols,
+  scanOrphanPositions,
 } = require('./trade');
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
@@ -160,6 +161,21 @@ app.get('/positions', async (req, res) => {
     res.json(Array.isArray(positions) ? positions : []);
   } catch (error) {
     console.error('Positions fetch error:', error?.responseSnippet || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/diagnostics/orphans', async (req, res) => {
+  try {
+    const report = await scanOrphanPositions();
+    res.json({
+      ts: new Date().toISOString(),
+      orphans: report?.orphans || [],
+      positionsCount: report?.positionsCount ?? 0,
+      openOrdersCount: report?.openOrdersCount ?? 0,
+    });
+  } catch (error) {
+    console.error('Orphan diagnostics error:', error?.responseSnippet || error.message);
     res.status(500).json({ error: error.message });
   }
 });
