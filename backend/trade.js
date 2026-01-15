@@ -137,7 +137,13 @@ const BUFFER_BPS = Number(process.env.BUFFER_BPS || 0);
 const FEE_BPS_MAKER = Number(process.env.FEE_BPS_MAKER || 10);
 const FEE_BPS_TAKER = Number(process.env.FEE_BPS_TAKER || 20);
 const PROFIT_BUFFER_BPS = Number(process.env.PROFIT_BUFFER_BPS || 0);
-const TAKER_EXIT_ON_TOUCH = readFlag('TAKER_EXIT_ON_TOUCH', true);
+const EXIT_POLICY_LOCKED = readEnvFlag('EXIT_POLICY_LOCKED', true);
+const EXIT_NET_PROFIT_AFTER_FEES_BPS = readNumber('EXIT_NET_PROFIT_AFTER_FEES_BPS', 5);
+const EXIT_CANCELS_ENABLED = readEnvFlag('EXIT_CANCELS_ENABLED', false);
+const SELL_REPRICE_ENABLED = readEnvFlag('SELL_REPRICE_ENABLED', false);
+const EXIT_TAKER_ON_TOUCH_ENABLED = readEnvFlag('EXIT_TAKER_ON_TOUCH_ENABLED', false);
+const EXIT_MARKET_EXITS_ENABLED = readEnvFlag('EXIT_MARKET_EXITS_ENABLED', false);
+const TAKER_EXIT_ON_TOUCH = EXIT_POLICY_LOCKED ? false : EXIT_TAKER_ON_TOUCH_ENABLED;
 const REPLACE_THRESHOLD_BPS = Number(process.env.REPLACE_THRESHOLD_BPS || 8);
 const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
 const SELL_ORDER_TTL_MS = readNumber('SELL_ORDER_TTL_MS', 12000);
@@ -160,7 +166,8 @@ const MAX_HOLD_MS = Number(process.env.MAX_HOLD_MS || MAX_HOLD_SECONDS * 1000);
 
 const REPRICE_EVERY_SECONDS = readNumber('REPRICE_EVERY_SECONDS', 5);
 
-const EXIT_MODE = String(process.env.EXIT_MODE || 'robust').trim().toLowerCase();
+const EXIT_MODE_RAW = String(process.env.EXIT_MODE || 'robust').trim().toLowerCase();
+const EXIT_MODE = EXIT_POLICY_LOCKED ? 'net_after_fees' : EXIT_MODE_RAW;
 const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 0);
 const FORCE_EXIT_ALLOW_LOSS = readFlag('FORCE_EXIT_ALLOW_LOSS', false);
 const ENTRY_FILL_TIMEOUT_SECONDS = readNumber('ENTRY_FILL_TIMEOUT_SECONDS', 30);
@@ -200,7 +207,7 @@ const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QU
 const quoteTsDebugLogged = new Set();
 const quoteKeyMissingLogged = new Set();
 const cryptoQuoteTtlOverrideLogged = new Set();
-const HALT_ON_ORPHANS = readEnvFlag('HALT_ON_ORPHANS', true);
+const HALT_ON_ORPHANS = readEnvFlag('HALT_ON_ORPHANS', false);
 const ORPHAN_AUTO_ATTACH_TP = readEnvFlag('ORPHAN_AUTO_ATTACH_TP', true);
 const ORPHAN_REPAIR_BEFORE_HALT = readEnvFlag('ORPHAN_REPAIR_BEFORE_HALT', true);
 const ORPHAN_SCAN_TTL_MS = readNumber('ORPHAN_SCAN_TTL_MS', 15000);
@@ -2184,7 +2191,7 @@ function computeExitPlanNetAfterFees({
   exitFeeBps,
   effectiveEntryPriceOverride,
 }) {
-  const netAfterFeesBps = Number(process.env.EXIT_NET_PROFIT_AFTER_FEES_BPS || 5);
+  const netAfterFeesBps = EXIT_NET_PROFIT_AFTER_FEES_BPS;
   const effectiveEntryPrice = effectiveEntryPriceOverride ?? entryPrice;
   const requiredExitBps = computeRequiredExitBpsForNetAfterFees({
     entryFeeBps,
@@ -2935,6 +2942,19 @@ async function cancelOrderSafe(orderId) {
 
 }
 
+function shouldCancelExitSell() {
+  return EXIT_CANCELS_ENABLED === true;
+}
+
+async function maybeCancelExitSell({ symbol, orderId, reason }) {
+  if (!orderId) return false;
+  if (shouldCancelExitSell()) {
+    return cancelOrderSafe(orderId);
+  }
+  console.log('exit_cancel_suppressed', { symbol, orderId, reason });
+  return false;
+}
+
 async function submitOcoExit({
 
   symbol,
@@ -3024,8 +3044,7 @@ async function submitLimitSell({
     const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
     const side = String(order.side || '').toLowerCase();
     if (orderSymbol !== normalizedSymbol || side !== 'sell') return false;
-    const orderQty = normalizeOrderQty(order);
-    return Number.isFinite(orderQty) && orderQtyMeetsRequired(orderQty, requiredQty);
+    return true;
   });
   if (openSellCandidates.length) {
     const taggedCandidates = openSellCandidates.filter((order) => hasExitIntentOrder(order, normalizedSymbol));
@@ -3324,7 +3343,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   let requiredExitBpsFinal = null;
   let netAfterFeesBps = null;
   if (EXIT_MODE === 'net_after_fees') {
-    netAfterFeesBps = Number(process.env.EXIT_NET_PROFIT_AFTER_FEES_BPS || 5);
+    netAfterFeesBps = EXIT_NET_PROFIT_AFTER_FEES_BPS;
     const requiredExitBps = computeRequiredExitBpsForNetAfterFees({
       entryFeeBps,
       exitFeeBps,
@@ -3354,7 +3373,7 @@ async function attachInitialExitLimit({ symbol: rawSymbol, qty, entryPrice, entr
   const targetPrice = computeTargetSellPrice(effectiveEntryPrice, requiredExitBpsFinal, tickSize);
   const breakevenPrice = computeBreakevenPrice(effectiveEntryPrice, minNetProfitBps);
   const postOnly = true;
-  const wantOco = (process.env.EXIT_ORDER_CLASS || '').toLowerCase() === 'oco';
+  const wantOco = !EXIT_POLICY_LOCKED && (process.env.EXIT_ORDER_CLASS || '').toLowerCase() === 'oco';
 
   console.log('tp_attach_plan', {
     symbol,
@@ -3582,25 +3601,6 @@ async function scanOrphanPositions() {
         avgEntryPrice,
         reason: 'no_open_sell',
       });
-      continue;
-    }
-    const openSellQty = openSellOrders.reduce((sum, order) => {
-      const orderQty = resolveOrderQty(order);
-      return Number.isFinite(orderQty) ? sum + orderQty : sum;
-    }, 0);
-    const hasValidLimit = openSellOrders.some((order) => orderHasValidLimit(order));
-    const unusableOpenSell =
-      !Number.isFinite(openSellQty) ||
-      openSellQty <= 0 ||
-      isDustQty(openSellQty) ||
-      !hasValidLimit;
-    if (unusableOpenSell) {
-      orphans.push({
-        symbol,
-        qty,
-        avgEntryPrice,
-        reason: 'open_sell_unusable',
-      });
     }
   }
 
@@ -3692,19 +3692,11 @@ async function repairOrphanExits() {
   for (const [symbol, sellOrders] of openSellsBySymbol.entries()) {
     const qty = positionsBySymbol.get(symbol);
     if (!Number.isFinite(qty) || qty <= 0 || isDustQty(qty)) {
-      let canceled = 0;
-      for (const order of sellOrders) {
-        const orderId = order?.id || order?.order_id;
-        if (orderId) {
-          await cancelOrderSafe(orderId);
-          canceled += 1;
-        }
-      }
       const hadTracked = exitState.has(symbol);
       exitState.delete(symbol);
-      console.log('exit_orphan_cleanup', {
+      console.log('exit_orphan_cleanup_suppressed', {
         symbol,
-        canceled,
+        openSellCount: sellOrders.length,
         clearedTracked: hadTracked,
       });
     }
@@ -3741,20 +3733,16 @@ async function repairOrphanExits() {
         return Number.isFinite(orderQty) ? sum + orderQty : sum;
       }, 0);
       const hasValidLimit = openSellOrders.some((order) => orderHasValidLimit(order));
-      const unusableOpenSell =
+      if (
         !Number.isFinite(openSellQty) ||
         openSellQty <= 0 ||
         isDustQty(openSellQty) ||
-        !hasValidLimit;
-      if (unusableOpenSell) {
-        for (const order of openSellOrders) {
-          const orderId = order?.id || order?.order_id;
-          if (orderId) {
-            await cancelOrderSafe(orderId);
-          }
-        }
-        openSellOrders = [];
-        hasOpenSell = false;
+        !hasValidLimit
+      ) {
+        console.log('open_sell_unusable_but_retained', {
+          symbol,
+          openSellCount: openSellOrders.length,
+        });
       }
     }
 
@@ -4647,12 +4635,11 @@ async function manageExitStates() {
             }, keepOrder);
           }
           const keepId = keepOrder?.id || keepOrder?.order_id;
-          for (const order of openSellOrders) {
-            const orderId = order?.id || order?.order_id;
-            if (orderId && orderId !== keepId) {
-              await cancelOrderSafe(orderId);
-            }
-          }
+          console.log('multiple_open_sells_detected', {
+            symbol,
+            keptId: keepId,
+            count: openSellOrders.length,
+          });
           if (keepId) {
             state.sellOrderId = keepId;
             const limitPrice = normalizeOrderLimitPrice(keepOrder);
@@ -4663,7 +4650,6 @@ async function manageExitStates() {
               state.sellOrderSubmittedAt ||
               (Number.isFinite(normalizedKeepOrderAgeMs) ? now - normalizedKeepOrderAgeMs : null);
           }
-          lastCancelReplaceAt.set(symbol, now);
         }
 
         if (!state.sellOrderId && state.qty > 0) {
@@ -4686,7 +4672,7 @@ async function manageExitStates() {
           }
         }
 
-        const takerOnTouch = readFlag('TAKER_EXIT_ON_TOUCH', true);
+        const takerOnTouch = EXIT_POLICY_LOCKED ? false : EXIT_TAKER_ON_TOUCH_ENABLED;
         const lastActionAtMs = lastActionAt.get(symbol);
         const takerTouchCooldownActive =
           Number.isFinite(TAKER_TOUCH_MIN_INTERVAL_MS) &&
@@ -4696,7 +4682,11 @@ async function manageExitStates() {
 
         if (takerOnTouch && Number.isFinite(bid) && bid >= targetPrice && !takerTouchCooldownActive) {
           if (state.sellOrderId) {
-            await cancelOrderSafe(state.sellOrderId);
+            await maybeCancelExitSell({
+              symbol,
+              orderId: state.sellOrderId,
+              reason: 'target_touch_taker',
+            });
           }
           const iocLimitPrice = roundDownToTick(bid, symbol);
           const iocResult = await submitIocLimitSell({
@@ -4773,12 +4763,16 @@ async function manageExitStates() {
         }
 
         const slBps = STOP_LOSS_BPS;
-        if (slBps > 0 && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) {
+        if (EXIT_MARKET_EXITS_ENABLED && slBps > 0 && Number.isFinite(state.entryPrice) && Number.isFinite(bid)) {
           const stopTrigger = state.entryPrice * (1 - slBps / 10000);
           if (bid <= stopTrigger) {
             console.log('hard_stop_trigger', { symbol, entryPrice: state.entryPrice, bid, slBps });
             if (state.sellOrderId) {
-              await cancelOrderSafe(state.sellOrderId);
+              await maybeCancelExitSell({
+                symbol,
+                orderId: state.sellOrderId,
+                reason: 'hard_stop_trigger',
+              });
             }
             const ioc = await submitIocLimitSell({
               symbol,
@@ -4861,14 +4855,18 @@ async function manageExitStates() {
           }
         }
 
-      if (FORCE_EXIT_SECONDS > 0 && heldSeconds >= FORCE_EXIT_SECONDS) {
+      if (EXIT_MARKET_EXITS_ENABLED && FORCE_EXIT_SECONDS > 0 && heldSeconds >= FORCE_EXIT_SECONDS) {
         const allowLossExit = FORCE_EXIT_ALLOW_LOSS;
         const canExitProfitably = Number.isFinite(bid) && bid >= breakevenPrice;
-        const wantOco = (process.env.EXIT_ORDER_CLASS || '').toLowerCase() === 'oco';
+        const wantOco = !EXIT_POLICY_LOCKED && (process.env.EXIT_ORDER_CLASS || '').toLowerCase() === 'oco';
 
         if (allowLossExit || canExitProfitably) {
           if (state.sellOrderId) {
-            await cancelOrderSafe(state.sellOrderId);
+            await maybeCancelExitSell({
+              symbol,
+              orderId: state.sellOrderId,
+              reason: 'force_exit_timeout',
+            });
           }
 
           const marketOrder = await submitMarketSell({
@@ -4973,16 +4971,18 @@ async function manageExitStates() {
       }
 
 
-      if (heldMs >= maxHoldMs && Number.isFinite(bid)) {
+      if (EXIT_MARKET_EXITS_ENABLED && heldMs >= maxHoldMs && Number.isFinite(bid)) {
 
         const netProfitBps = ((bid - state.entryPrice) / state.entryPrice) * 10000;
 
         if (netProfitBps >= minNetProfitBps) {
 
           if (state.sellOrderId) {
-
-            await cancelOrderSafe(state.sellOrderId);
-
+            await maybeCancelExitSell({
+              symbol,
+              orderId: state.sellOrderId,
+              reason: 'max_hold_exit',
+            });
           }
 
           const marketOrder = await submitMarketSell({ symbol, qty: state.qty, reason: 'max_hold' });
@@ -5065,10 +5065,16 @@ async function manageExitStates() {
       const repriceCooldownActive =
         Number.isFinite(lastRepriceAgeMs) && lastRepriceAgeMs < MIN_REPRICE_INTERVAL_MS;
 
-      if (ALLOW_TAKER_BEFORE_TARGET && bidMeetsBreakeven && Number.isFinite(bid)) {
+      if (EXIT_MARKET_EXITS_ENABLED && ALLOW_TAKER_BEFORE_TARGET && bidMeetsBreakeven && Number.isFinite(bid)) {
         if (state.sellOrderId) {
-          await cancelOrderSafe(state.sellOrderId);
-          lastCancelReplaceAt.set(symbol, now);
+          await maybeCancelExitSell({
+            symbol,
+            orderId: state.sellOrderId,
+            reason: 'taker_before_target',
+          });
+          if (shouldCancelExitSell()) {
+            lastCancelReplaceAt.set(symbol, now);
+          }
         }
         const iocPrice = roundToTick(bid, tickSize, 'down');
         const iocResult = await submitIocLimitSell({
@@ -5173,72 +5179,90 @@ async function manageExitStates() {
               ? ((currentLimit - makerDesiredLimit) / makerDesiredLimit) * 10000
               : null;
 
-          if (
-            existingOrderAgeMs != null &&
-            existingOrderAgeMs > SELL_ORDER_TTL_MS &&
-            Number.isFinite(awayBps) &&
-            awayBps > REPRICE_IF_AWAY_BPS &&
-            !repriceCooldownActive
-          ) {
-            await cancelOrderSafe(state.sellOrderId);
-            const replacement = await submitLimitSell({
-              symbol,
-              qty: state.qty,
-              limitPrice: makerDesiredLimit,
-              reason: 'reprice_ttl',
-              intentRef: state.entryOrderId || getOrderIntentBucket(),
-              postOnly: true,
-            });
-            if (replacement?.id) {
-              state.sellOrderId = replacement.id;
-              state.sellOrderSubmittedAt = Date.now();
-              state.sellOrderLimit = makerDesiredLimit;
-              actionTaken = 'reprice_cancel_replace';
-              reasonCode = 'reprice_ttl';
+          if (SELL_REPRICE_ENABLED) {
+            if (
+              existingOrderAgeMs != null &&
+              existingOrderAgeMs > SELL_ORDER_TTL_MS &&
+              Number.isFinite(awayBps) &&
+              awayBps > REPRICE_IF_AWAY_BPS &&
+              !repriceCooldownActive
+            ) {
+              await maybeCancelExitSell({
+                symbol,
+                orderId: state.sellOrderId,
+                reason: 'reprice_ttl',
+              });
+              const replacement = await submitLimitSell({
+                symbol,
+                qty: state.qty,
+                limitPrice: makerDesiredLimit,
+                reason: 'reprice_ttl',
+                intentRef: state.entryOrderId || getOrderIntentBucket(),
+                postOnly: true,
+              });
+              if (replacement?.id) {
+                state.sellOrderId = replacement.id;
+                state.sellOrderSubmittedAt = Date.now();
+                state.sellOrderLimit = makerDesiredLimit;
+                actionTaken = 'reprice_cancel_replace';
+                reasonCode = 'reprice_ttl';
+                decisionPath = 'reprice_ttl';
+                lastActionAt.set(symbol, now);
+                if (shouldCancelExitSell()) {
+                  lastCancelReplaceAt.set(symbol, now);
+                }
+              } else {
+                actionTaken = 'hold_existing_order';
+                reasonCode = replacement?.reason || 'reprice_ttl_skipped';
+                decisionPath = 'reprice_ttl';
+              }
+            } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS && repriceCooldownActive) {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'reprice_ttl_cooldown';
               decisionPath = 'reprice_ttl';
-              lastActionAt.set(symbol, now);
-              lastCancelReplaceAt.set(symbol, now);
+            } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS) {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'reprice_ttl_within_band';
+              decisionPath = 'reprice_ttl';
+            } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
+              await maybeCancelExitSell({
+                symbol,
+                orderId: state.sellOrderId,
+                reason: 'reprice_away',
+              });
+              const replacement = await submitLimitSell({
+                symbol,
+                qty: state.qty,
+                limitPrice: makerDesiredLimit,
+                reason: 'reprice_away',
+                intentRef: state.entryOrderId || getOrderIntentBucket(),
+                postOnly: true,
+              });
+              if (replacement?.id) {
+                state.sellOrderId = replacement.id;
+                state.sellOrderSubmittedAt = Date.now();
+                state.sellOrderLimit = makerDesiredLimit;
+                actionTaken = 'reprice_cancel_replace';
+                reasonCode = 'reprice_away';
+                decisionPath = 'reprice_away';
+                lastActionAt.set(symbol, now);
+                if (shouldCancelExitSell()) {
+                  lastCancelReplaceAt.set(symbol, now);
+                }
+              } else {
+                actionTaken = 'hold_existing_order';
+                reasonCode = replacement?.reason || 'reprice_away_skipped';
+                decisionPath = 'hold_within_band';
+              }
+            } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && repriceCooldownActive) {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'reprice_cooldown';
+              decisionPath = 'hold_within_band';
             } else {
               actionTaken = 'hold_existing_order';
-              reasonCode = replacement?.reason || 'reprice_ttl_skipped';
-              decisionPath = 'reprice_ttl';
-            }
-          } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS && repriceCooldownActive) {
-            actionTaken = 'hold_existing_order';
-            reasonCode = 'reprice_ttl_cooldown';
-            decisionPath = 'reprice_ttl';
-          } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS) {
-            actionTaken = 'hold_existing_order';
-            reasonCode = 'reprice_ttl_within_band';
-            decisionPath = 'reprice_ttl';
-          } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
-            await cancelOrderSafe(state.sellOrderId);
-            const replacement = await submitLimitSell({
-              symbol,
-              qty: state.qty,
-              limitPrice: makerDesiredLimit,
-              reason: 'reprice_away',
-              intentRef: state.entryOrderId || getOrderIntentBucket(),
-              postOnly: true,
-            });
-            if (replacement?.id) {
-              state.sellOrderId = replacement.id;
-              state.sellOrderSubmittedAt = Date.now();
-              state.sellOrderLimit = makerDesiredLimit;
-              actionTaken = 'reprice_cancel_replace';
-              reasonCode = 'reprice_away';
-              decisionPath = 'reprice_away';
-              lastActionAt.set(symbol, now);
-              lastCancelReplaceAt.set(symbol, now);
-            } else {
-              actionTaken = 'hold_existing_order';
-              reasonCode = replacement?.reason || 'reprice_away_skipped';
+              reasonCode = 'no_reprice_needed';
               decisionPath = 'hold_within_band';
             }
-          } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && repriceCooldownActive) {
-            actionTaken = 'hold_existing_order';
-            reasonCode = 'reprice_cooldown';
-            decisionPath = 'hold_within_band';
           } else {
             actionTaken = 'hold_existing_order';
             reasonCode = 'no_reprice_needed';
@@ -5275,69 +5299,87 @@ async function manageExitStates() {
               Number.isFinite(currentLimit) && desiredLimit > 0
                 ? ((currentLimit - desiredLimit) / desiredLimit) * 10000
                 : null;
-            if (
-              existingOrderAgeMs != null &&
-              existingOrderAgeMs > SELL_ORDER_TTL_MS &&
-              Number.isFinite(awayBps) &&
-              awayBps > REPRICE_IF_AWAY_BPS &&
-              !repriceCooldownActive
-            ) {
-              await cancelOrderSafe(state.sellOrderId);
-              const replacement = await submitLimitSell({
-                symbol,
-                qty: state.qty,
-                limitPrice: desiredLimit,
-                reason: 'reprice_ttl',
-                intentRef: state.entryOrderId || getOrderIntentBucket(),
-                postOnly: true,
-              });
-              if (replacement?.id) {
-                state.sellOrderId = replacement.id;
-                state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = desiredLimit;
-                actionTaken = 'reprice_cancel_replace';
-                reasonCode = 'reprice_ttl';
-                decisionPath = 'reprice_ttl';
-                lastActionAt.set(symbol, now);
-                lastCancelReplaceAt.set(symbol, now);
+            if (SELL_REPRICE_ENABLED) {
+              if (
+                existingOrderAgeMs != null &&
+                existingOrderAgeMs > SELL_ORDER_TTL_MS &&
+                Number.isFinite(awayBps) &&
+                awayBps > REPRICE_IF_AWAY_BPS &&
+                !repriceCooldownActive
+              ) {
+                await maybeCancelExitSell({
+                  symbol,
+                  orderId: state.sellOrderId,
+                  reason: 'reprice_ttl',
+                });
+                const replacement = await submitLimitSell({
+                  symbol,
+                  qty: state.qty,
+                  limitPrice: desiredLimit,
+                  reason: 'reprice_ttl',
+                  intentRef: state.entryOrderId || getOrderIntentBucket(),
+                  postOnly: true,
+                });
+                if (replacement?.id) {
+                  state.sellOrderId = replacement.id;
+                  state.sellOrderSubmittedAt = Date.now();
+                  state.sellOrderLimit = desiredLimit;
+                  actionTaken = 'reprice_cancel_replace';
+                  reasonCode = 'reprice_ttl';
+                  decisionPath = 'reprice_ttl';
+                  lastActionAt.set(symbol, now);
+                  if (shouldCancelExitSell()) {
+                    lastCancelReplaceAt.set(symbol, now);
+                  }
+                } else {
+                  actionTaken = 'hold_existing_order';
+                  reasonCode = replacement?.reason || 'reprice_ttl_skipped';
+                }
+              } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS && repriceCooldownActive) {
+                actionTaken = 'hold_existing_order';
+                reasonCode = 'reprice_ttl_cooldown';
+              } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS) {
+                actionTaken = 'hold_existing_order';
+                reasonCode = 'reprice_ttl_within_band';
+              } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
+                await maybeCancelExitSell({
+                  symbol,
+                  orderId: state.sellOrderId,
+                  reason: 'reprice_away',
+                });
+                const replacement = await submitLimitSell({
+                  symbol,
+                  qty: state.qty,
+                  limitPrice: desiredLimit,
+                  reason: 'reprice_away',
+                  intentRef: state.entryOrderId || getOrderIntentBucket(),
+                  postOnly: true,
+                });
+                if (replacement?.id) {
+                  state.sellOrderId = replacement.id;
+                  state.sellOrderSubmittedAt = Date.now();
+                  state.sellOrderLimit = desiredLimit;
+                  actionTaken = 'reprice_cancel_replace';
+                  reasonCode = 'reprice_away';
+                  decisionPath = 'reprice_away';
+                  lastActionAt.set(symbol, now);
+                  if (shouldCancelExitSell()) {
+                    lastCancelReplaceAt.set(symbol, now);
+                  }
+                } else {
+                  actionTaken = 'hold_existing_order';
+                  reasonCode = replacement?.reason || 'reprice_away_skipped';
+                  decisionPath = 'hold_not_profitable';
+                }
+              } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && repriceCooldownActive) {
+                actionTaken = 'hold_existing_order';
+                reasonCode = 'reprice_cooldown';
+                decisionPath = 'hold_not_profitable';
               } else {
                 actionTaken = 'hold_existing_order';
-                reasonCode = replacement?.reason || 'reprice_ttl_skipped';
-              }
-            } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS && repriceCooldownActive) {
-              actionTaken = 'hold_existing_order';
-              reasonCode = 'reprice_ttl_cooldown';
-            } else if (existingOrderAgeMs != null && existingOrderAgeMs > SELL_ORDER_TTL_MS) {
-              actionTaken = 'hold_existing_order';
-              reasonCode = 'reprice_ttl_within_band';
-            } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && !repriceCooldownActive) {
-              await cancelOrderSafe(state.sellOrderId);
-              const replacement = await submitLimitSell({
-                symbol,
-                qty: state.qty,
-                limitPrice: desiredLimit,
-                reason: 'reprice_away',
-                intentRef: state.entryOrderId || getOrderIntentBucket(),
-                postOnly: true,
-              });
-              if (replacement?.id) {
-                state.sellOrderId = replacement.id;
-                state.sellOrderSubmittedAt = Date.now();
-                state.sellOrderLimit = desiredLimit;
-                actionTaken = 'reprice_cancel_replace';
-                reasonCode = 'reprice_away';
-                decisionPath = 'reprice_away';
-                lastActionAt.set(symbol, now);
-                lastCancelReplaceAt.set(symbol, now);
-              } else {
-                actionTaken = 'hold_existing_order';
-                reasonCode = replacement?.reason || 'reprice_away_skipped';
+                reasonCode = 'no_reprice_needed';
                 decisionPath = 'hold_not_profitable';
               }
-            } else if (Number.isFinite(awayBps) && awayBps > REPRICE_IF_AWAY_BPS && repriceCooldownActive) {
-              actionTaken = 'hold_existing_order';
-              reasonCode = 'reprice_cooldown';
-              decisionPath = 'hold_not_profitable';
             } else {
               actionTaken = 'hold_existing_order';
               reasonCode = 'no_reprice_needed';
