@@ -690,7 +690,6 @@ initializeInventoryFromPositions()
 
     });
 
-    startExitManager();
     startEntryManager();
 
   });
