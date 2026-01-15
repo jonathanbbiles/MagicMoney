@@ -180,7 +180,7 @@ const EXIT_QUOTE_MAX_AGE_MS = readNumber('EXIT_QUOTE_MAX_AGE_MS', 120000);
 const EXIT_STALE_QUOTE_MAX_AGE_MS = readNumber('EXIT_STALE_QUOTE_MAX_AGE_MS', 15000);
 const EXIT_REPAIR_INTERVAL_MS = readNumber('EXIT_REPAIR_INTERVAL_MS', 60000);
 const SELL_QTY_MATCH_EPSILON = Number(process.env.SELL_QTY_MATCH_EPSILON || 1e-9);
-const ENTRY_QUOTE_MAX_AGE_MS = Number(process.env.ENTRY_QUOTE_MAX_AGE_MS || 60000);
+const ENTRY_QUOTE_MAX_AGE_MS = readNumber('ENTRY_QUOTE_MAX_AGE_MS', 120000);
 const MAX_LOGGED_QUOTE_AGE_SECONDS = 9999;
 const DEBUG_QUOTE_TS = ['1', 'true', 'yes'].includes(String(process.env.DEBUG_QUOTE_TS || '').toLowerCase());
 const quoteTsDebugLogged = new Set();
@@ -522,11 +522,12 @@ function isQuoteCooling(symbol) {
 
 function recordQuoteFailure(symbol, reason) {
   if (!symbol) return;
-  const now = Date.now();
   const state = getQuoteFailureState(symbol);
+  state.lastReason = reason || state.lastReason;
+  if (reason === 'stale_quote') return;
+  const now = Date.now();
   state.failures = state.failures.filter((ts) => now - ts <= QUOTE_FAILURE_WINDOW_MS);
   state.failures.push(now);
-  state.lastReason = reason || state.lastReason;
   if (state.failures.length >= QUOTE_FAILURE_THRESHOLD) {
     state.failures = [];
     state.cooldownUntil = now + QUOTE_COOLDOWN_MS;
