@@ -159,7 +159,7 @@ const MAX_HOLD_MS = Number(process.env.MAX_HOLD_MS || MAX_HOLD_SECONDS * 1000);
 
 const REPRICE_EVERY_SECONDS = readNumber('REPRICE_EVERY_SECONDS', 5);
 
-const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 300);
+const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 0);
 const ENTRY_FILL_TIMEOUT_SECONDS = readNumber('ENTRY_FILL_TIMEOUT_SECONDS', 30);
 const POST_ONLY_BUY = readFlag('POST_ONLY_BUY', true);
 const ENTRY_FALLBACK_MARKET = readFlag('ENTRY_FALLBACK_MARKET', false);
@@ -4387,7 +4387,7 @@ async function manageExitStates() {
           }
         }
 
-      if (heldSeconds >= FORCE_EXIT_SECONDS) {
+      if (FORCE_EXIT_SECONDS > 0 && heldSeconds >= FORCE_EXIT_SECONDS) {
 
         if (state.sellOrderId) {
 
@@ -5431,6 +5431,95 @@ async function placeMarketBuyThenSell(symbol) {
 
 }
 
+async function submitManagedEntryBuy({
+  symbol,
+  qty,
+  type,
+  time_in_force,
+  limit_price,
+  desiredNetExitBps,
+  notional,
+}) {
+  const normalizedSymbol = normalizeSymbol(symbol);
+  let bid = null;
+  let ask = null;
+  let spreadBps = null;
+  const quote = await getLatestQuote(normalizedSymbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS }).catch(() => null);
+  if (quote) {
+    bid = quote.bid;
+    ask = quote.ask;
+    if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0) {
+      spreadBps = ((ask - bid) / bid) * 10000;
+    }
+  }
+
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_entry_buy' });
+  const limitPriceNum = Number(limit_price);
+  const payload = {
+    symbol: toTradeSymbol(normalizedSymbol),
+    side: 'buy',
+    type,
+    time_in_force: time_in_force || undefined,
+    limit_price: Number.isFinite(limitPriceNum) ? limitPriceNum : undefined,
+    qty: qty ?? undefined,
+    notional: notional ?? undefined,
+    client_order_id: buildEntryClientOrderId(normalizedSymbol),
+  };
+  const buyOrder = await placeOrderUnified({
+    symbol: normalizedSymbol,
+    url,
+    payload,
+    label: 'orders_entry_buy',
+    reason: 'managed_entry_buy',
+    context: 'managed_entry_buy',
+  });
+
+  let filled = buyOrder;
+  let lastStatus = String(filled?.status || '').toLowerCase();
+  const terminalStatuses = new Set(['canceled', 'expired', 'rejected']);
+  const timeoutMs = ENTRY_FILL_TIMEOUT_SECONDS * 1000;
+  const startMs = Date.now();
+
+  while (Date.now() - startMs < timeoutMs && lastStatus !== 'filled' && !terminalStatuses.has(lastStatus)) {
+    await sleep(1000);
+    filled = await fetchOrderById(buyOrder.id);
+    lastStatus = String(filled?.status || '').toLowerCase();
+  }
+
+  if (lastStatus !== 'filled') {
+    if (terminalStatuses.has(lastStatus)) {
+      return { ok: false, skipped: true, reason: 'entry_terminal', orderId: buyOrder.id, status: lastStatus };
+    }
+    if (Date.now() - startMs >= timeoutMs) {
+      console.log('entry_buy_timeout_cancel', {
+        symbol: normalizedSymbol,
+        orderId: buyOrder.id,
+        timeoutSeconds: ENTRY_FILL_TIMEOUT_SECONDS,
+      });
+      await cancelOrderSafe(buyOrder.id);
+      return { ok: false, skipped: true, reason: 'entry_not_filled', orderId: buyOrder.id, status: lastStatus };
+    }
+  }
+
+  const avgPriceRaw = Number(filled?.filled_avg_price);
+  const avgPrice = Number.isFinite(avgPriceRaw)
+    ? avgPriceRaw
+    : (Number.isFinite(limitPriceNum) ? limitPriceNum : 0);
+  updateInventoryFromBuy(normalizedSymbol, filled.filled_qty, avgPrice);
+  const sellOrder = await handleBuyFill({
+    symbol: normalizedSymbol,
+    qty: filled.filled_qty,
+    entryPrice: avgPrice,
+    entryOrderId: filled.id,
+    desiredNetExitBps,
+    entryBid: bid,
+    entryAsk: ask,
+    entrySpreadBps: spreadBps,
+  });
+
+  return { ok: true, buy: filled, sell: sellOrder || null };
+}
+
 async function submitOrder(order = {}) {
 
   const {
@@ -5453,6 +5542,7 @@ async function submitOrder(order = {}) {
 
     reason,
     desiredNetExitBps,
+    raw = false,
 
   } = order;
 
@@ -5573,6 +5663,18 @@ async function submitOrder(order = {}) {
   const hasNotional = Number.isFinite(Number(finalNotional)) && Number(finalNotional) > 0;
   const useQty = hasQty;
   const useNotional = !useQty && hasNotional;
+
+  if (sideLower === 'buy' && !raw) {
+    return submitManagedEntryBuy({
+      symbol: normalizedSymbol,
+      qty: useQty ? finalQty : undefined,
+      type: finalType,
+      time_in_force: finalTif,
+      limit_price: Number.isFinite(limitPriceNum) ? limitPriceNum : undefined,
+      desiredNetExitBps,
+      notional: useNotional ? finalNotional : undefined,
+    });
+  }
 
   const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_submit' });
   const defaultClientOrderId =
