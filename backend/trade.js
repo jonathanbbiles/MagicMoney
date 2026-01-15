@@ -491,6 +491,7 @@ const quoteFailureState = new Map();
 const lastQuoteAt = new Map();
 const scanState = { lastScanAt: null };
 let exitManagerRunning = false;
+let exitRepairSchedulerInterval = null;
 let lastExitRepairAtMs = 0;
 const positionsSnapshot = {
   tsMs: 0,
@@ -5402,7 +5403,24 @@ async function runEntryScanOnce() {
 
 function startExitManager() {
   if (SIMPLE_SCALPER_ENABLED) {
-    console.log('exit_manager_disabled', { reason: 'simple_scalper' });
+    if (exitRepairSchedulerInterval) {
+      return;
+    }
+    try {
+      exitRepairSchedulerInterval = setInterval(() => {
+        repairOrphanExits().catch((err) => {
+          console.error('exit_repair_scheduler_failed', err?.message || err);
+        });
+      }, EXIT_REPAIR_INTERVAL_MS);
+      setTimeout(() => {
+        repairOrphanExits().catch((err) => {
+          console.error('exit_repair_scheduler_failed', err?.message || err);
+        });
+      }, 0);
+      console.log('exit_repair_scheduler_started', { intervalMs: EXIT_REPAIR_INTERVAL_MS });
+    } catch (err) {
+      console.error('exit_repair_scheduler_failed', err?.message || err);
+    }
     return;
   }
 
@@ -5417,6 +5435,11 @@ function startExitManager() {
   }, REPRICE_EVERY_SECONDS * 1000);
 
   console.log('exit_manager_started', { intervalSeconds: REPRICE_EVERY_SECONDS });
+  setTimeout(() => {
+    repairOrphanExits().catch((err) => {
+      console.error('exit_repair_start_failed', err?.message || err);
+    });
+  }, 0);
 
 }
 
