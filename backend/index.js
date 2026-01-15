@@ -691,5 +691,7 @@ initializeInventoryFromPositions()
     });
 
     startEntryManager();
+    startExitManager();
+    console.log('exit_manager_start_attempted');
 
   });
