@@ -165,6 +165,8 @@ const FORCE_EXIT_SECONDS = readNumber('FORCE_EXIT_SECONDS', 0);
 const FORCE_EXIT_ALLOW_LOSS = readFlag('FORCE_EXIT_ALLOW_LOSS', false);
 const ENTRY_FILL_TIMEOUT_SECONDS = readNumber('ENTRY_FILL_TIMEOUT_SECONDS', 30);
 const ENTRY_INTENT_TTL_MS = readNumber('ENTRY_INTENT_TTL_MS', 45000);
+const ENTRY_BUY_TIF = String(process.env.ENTRY_BUY_TIF || 'ioc').trim().toLowerCase();
+const ENTRY_BUY_TIF_SAFE = ['gtc', 'ioc', 'fok'].includes(ENTRY_BUY_TIF) ? ENTRY_BUY_TIF : 'ioc';
 const POST_ONLY_BUY = readFlag('POST_ONLY_BUY', true);
 const ENTRY_FALLBACK_MARKET = readFlag('ENTRY_FALLBACK_MARKET', false);
 const ALLOW_TAKER_BEFORE_TARGET = readFlag('ALLOW_TAKER_BEFORE_TARGET', false);
@@ -447,6 +449,8 @@ const lastActionAt = new Map();
 const lastCancelReplaceAt = new Map();
 const lastOrderFetchAt = new Map();
 const lastOrderSnapshotBySymbol = new Map();
+const ENTRY_SUBMISSION_COOLDOWN_MS = Number(process.env.ENTRY_SUBMISSION_COOLDOWN_MS || 60000);
+const recentEntrySubmissions = new Map(); // symbol -> { atMs, orderId }
 
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
@@ -512,6 +516,20 @@ function logSkip(reason, details = {}) {
 
   console.log(`Skip — ${reason}`, details);
 
+}
+
+function markRecentEntry(symbol, orderId) {
+  recentEntrySubmissions.set(symbol, { atMs: Date.now(), orderId });
+}
+
+function hasRecentEntry(symbol) {
+  const value = recentEntrySubmissions.get(symbol);
+  if (!value) return false;
+  if (Date.now() - value.atMs > ENTRY_SUBMISSION_COOLDOWN_MS) {
+    recentEntrySubmissions.delete(symbol);
+    return false;
+  }
+  return true;
 }
 
 function logNetworkError({ type, symbol, attempts, context }) {
@@ -5609,7 +5627,7 @@ async function placeMarketBuyThenSell(symbol) {
     qty: finalQty,
     side: 'buy',
     type: 'market',
-    time_in_force: 'gtc',
+    time_in_force: isCryptoSymbol(normalizedSymbol) ? ENTRY_BUY_TIF_SAFE : 'gtc',
     client_order_id: buildEntryClientOrderId(normalizedSymbol),
   };
   const buyOrder = await placeOrderUnified({
@@ -5620,6 +5638,9 @@ async function placeMarketBuyThenSell(symbol) {
     reason: 'market_buy',
     context: 'market_buy',
   });
+  if (buyOrder?.id) {
+    markRecentEntry(normalizedSymbol, buyOrder?.id || null);
+  }
 
  
 
@@ -5753,6 +5774,9 @@ async function submitManagedEntryBuy({
     reason: 'managed_entry_buy',
     context: 'managed_entry_buy',
   });
+  if (buyOrder?.id) {
+    markRecentEntry(normalizedSymbol, buyOrder?.id || null);
+  }
 
   let filled = buyOrder;
   let lastStatus = String(filled?.status || '').toLowerCase();
@@ -5829,13 +5853,17 @@ async function submitOrder(order = {}) {
   const normalizedSymbol = normalizeSymbol(rawSymbol);
   const isCrypto = isCryptoSymbol(normalizedSymbol);
   const sideLower = String(side || '').toLowerCase();
+  const intent = sideLower === 'buy' ? 'ENTRY' : null;
   const typeLower = String(type || '').toLowerCase();
   const allowedCryptoTypes = new Set(['market', 'limit', 'stop_limit']);
   const finalType = isCrypto && !allowedCryptoTypes.has(typeLower) ? 'market' : (typeLower || 'market');
   const rawTif = String(time_in_force || '').toLowerCase();
   const allowedCryptoTifs = new Set(['gtc', 'ioc', 'fok']);
   const defaultCryptoTif = sideLower === 'sell' ? 'ioc' : 'gtc';
-  const finalTif = isCrypto ? (allowedCryptoTifs.has(rawTif) ? rawTif : defaultCryptoTif) : (rawTif || time_in_force);
+  const entryBuyTif = ENTRY_BUY_TIF_SAFE;
+  const resolvedCryptoTif =
+    sideLower === 'buy' && intent === 'ENTRY' ? entryBuyTif : (allowedCryptoTifs.has(rawTif) ? rawTif : defaultCryptoTif);
+  const finalTif = isCrypto ? resolvedCryptoTif : (rawTif || time_in_force);
   let qtyNum = Number(qty);
   const limitPriceNum = Number(limit_price);
 
@@ -5919,7 +5947,24 @@ async function submitOrder(order = {}) {
   }
 
   if (sideLower === 'buy') {
-    const openOrders = await fetchOrders({ status: 'open' });
+    if (intent === 'ENTRY' && hasRecentEntry(normalizedSymbol)) {
+      const recent = recentEntrySubmissions.get(normalizedSymbol);
+      const ageMs = recent ? Date.now() - recent.atMs : null;
+      console.log('hold_existing_order', {
+        symbol: normalizedSymbol,
+        side: 'buy',
+        reason: 'recent_entry_submission',
+        ageMs,
+      });
+      return { ok: true, hold: true, reason: 'recent_entry_submission' };
+    }
+    const openOrders = await fetchOrders({
+      status: 'all',
+      after: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+      direction: 'desc',
+      limit: 500,
+      nested: true,
+    });
     const entryIntentPrefix = buildIntentPrefix({ symbol: normalizedSymbol, side: 'BUY', intent: 'ENTRY' });
     const entryIntentOrders = (Array.isArray(openOrders) ? openOrders : []).filter((order) => {
       const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
@@ -5931,9 +5976,13 @@ async function submitOrder(order = {}) {
         clientOrderId.startsWith(entryIntentPrefix)
       );
     });
-    if (entryIntentOrders.length) {
+    const activeEntryOrders = entryIntentOrders.filter((order) => {
+      const status = String(order.status || '').toLowerCase();
+      return !NON_LIVE_ORDER_STATUSES.has(status);
+    });
+    if (activeEntryOrders.length) {
       const ttlMs = Number.isFinite(ENTRY_INTENT_TTL_MS) ? ENTRY_INTENT_TTL_MS : 45000;
-      const expiredOrders = entryIntentOrders.filter((order) => {
+      const expiredOrders = activeEntryOrders.filter((order) => {
         const ageMs = getOrderAgeMs(order);
         return Number.isFinite(ageMs) && ageMs > ttlMs;
       });
@@ -6000,7 +6049,7 @@ async function submitOrder(order = {}) {
     notional: useNotional ? finalNotional : undefined,
     client_order_id: client_order_id || defaultClientOrderId,
   };
-  return placeOrderUnified({
+  const orderOk = await placeOrderUnified({
     symbol: normalizedSymbol,
     url,
     payload,
@@ -6008,6 +6057,10 @@ async function submitOrder(order = {}) {
     reason,
     context: 'submit_order',
   });
+  if (orderOk?.id && sideLower === 'buy' && intent === 'ENTRY') {
+    markRecentEntry(normalizedSymbol, orderOk?.id || null);
+  }
+  return orderOk;
 
 }
 
@@ -6033,6 +6086,12 @@ async function replaceOrder(orderId, payload = {}) {
 
 async function fetchOrders(params = {}) {
   const resolvedParams = { ...(params || {}) };
+  if (resolvedParams.limit != null && !Number.isFinite(Number(resolvedParams.limit))) {
+    delete resolvedParams.limit;
+  }
+  if (resolvedParams.nested != null) {
+    resolvedParams.nested = Boolean(resolvedParams.nested);
+  }
   const isOpenStatus = String(resolvedParams.status || '').toLowerCase() === 'open';
   if (isOpenStatus) {
     delete resolvedParams.symbol;
