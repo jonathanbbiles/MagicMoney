@@ -211,7 +211,7 @@ app.post('/trade', async (req, res) => {
 
 app.post('/buy', async (req, res) => {
 
-  const { symbol, qty, side, type, time_in_force, limit_price } = req.body;
+  const { symbol, qty, side, type, time_in_force, limit_price, desiredNetExitBps } = req.body;
 
  
 
@@ -220,11 +220,32 @@ app.post('/buy', async (req, res) => {
     const result = await submitOrder({
       symbol,
       qty,
-      side,
+      side: side || 'buy',
       type,
       time_in_force,
       limit_price,
+      desiredNetExitBps,
     });
+
+    if (result?.ok) {
+      res.json({
+        ok: true,
+        buy: result.buy,
+        sell: result.sell ?? null,
+      });
+      return;
+    }
+
+    if (result?.skipped) {
+      res.json({
+        ok: false,
+        skipped: true,
+        reason: result.reason,
+        status: result.status ?? null,
+        orderId: result.orderId ?? null,
+      });
+      return;
+    }
 
     if (result?.id) {
       res.json({
@@ -279,7 +300,29 @@ app.get('/orders/:id', async (req, res) => {
 
 app.post('/orders', async (req, res) => {
   try {
-    const result = await submitOrder(req.body || {});
+    const payload = req.body || {};
+    const sideLower = String(payload.side || '').toLowerCase();
+    const result = await submitOrder(payload);
+    if (sideLower === 'buy') {
+      if (result?.ok) {
+        res.json({
+          ok: true,
+          buy: result.buy,
+          sell: result.sell ?? null,
+        });
+        return;
+      }
+      if (result?.skipped) {
+        res.json({
+          ok: false,
+          skipped: true,
+          reason: result.reason,
+          status: result.status ?? null,
+          orderId: result.orderId ?? null,
+        });
+        return;
+      }
+    }
     if (result?.id) {
       res.json({
         ok: true,
