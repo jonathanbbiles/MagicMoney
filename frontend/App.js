@@ -2402,12 +2402,37 @@ const logOrderPayload = (context, order) => {
   );
 };
 
+const normalizeOrderResponse = (data) => {
+  const orderId =
+    data?.orderId ??
+    data?.order_id ??
+    data?.id ??
+    data?.buy?.id ??
+    data?.buy?.order_id ??
+    null;
+  const status =
+    data?.status ??
+    data?.order_status ??
+    data?.buy?.status ??
+    data?.buy?.order_status ??
+    null;
+  const submittedAt =
+    data?.submittedAt ??
+    data?.submitted_at ??
+    data?.buy?.submitted_at ??
+    data?.buy?.submittedAt ??
+    null;
+  return { orderId, status, submittedAt };
+};
+
 const logOrderResponse = (context, order, res, data) => {
-  const ok = Boolean(res?.ok && data?.ok && data?.orderId);
+  const normalized = normalizeOrderResponse(data);
+  const ok = Boolean(res?.ok && data?.ok && (normalized.orderId || data?.buy));
   const symbol = toInternalSymbol(order?.symbol);
   if (ok) {
-    console.log(`ORDER_OK id=${data.orderId} status=${data.status || 'accepted'} symbol=${symbol}`);
-    return { ok: true, orderId: data.orderId, status: data.status || 'accepted', err: 'NA' };
+    const status = normalized.status || 'accepted';
+    console.log(`ORDER_OK id=${normalized.orderId || 'unknown'} status=${status} symbol=${symbol}`);
+    return { ok: true, orderId: normalized.orderId, status, err: 'NA' };
   }
   const httpStatus = res?.status ?? 'NA';
   const code = data?.error?.code ?? data?.error?.status ?? data?.code ?? 'NA';
@@ -3934,11 +3959,19 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_limit', order, res, data);
-        const status = String(data?.status || '').toLowerCase();
-        const orderOk = Boolean(res.ok && data?.ok && data?.orderId && status !== 'rejected');
+        const normalized = normalizeOrderResponse(data);
+        const status = String(normalized.status || '').toLowerCase();
+        const orderOk = Boolean(res.ok && data?.ok && (normalized.orderId || data?.buy) && status !== 'rejected');
         if (orderOk) {
           attempted = true;
-          recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
+          if (normalized.orderId) {
+            recordRecentOrder({
+              id: normalized.orderId,
+              symbol: normalizedSymbol,
+              status,
+              submittedAt: normalized.submittedAt,
+            });
+          }
           if (status === 'filled') {
             fillsCount += 1;
           } else if (['new', 'accepted', 'open'].includes(status)) {
@@ -3954,7 +3987,11 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
           });
         }
         if (orderOk) {
-          lastOrderId = data.orderId; placedLimit = join; lastReplaceAt = nowTs;
+          if (normalized.orderId) {
+            lastOrderId = normalized.orderId;
+          }
+          placedLimit = join;
+          lastReplaceAt = nowTs;
           logTradeAction('buy_camped', normalizedSymbol, { limit: order.limit_price });
           __openOrdersCache = { ts: 0, items: [] };
         }
@@ -4046,11 +4083,19 @@ async function placeMakerThenMaybeTakerBuy(symbol, qty, preQuoteMap = null, usab
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('buy_market', order, res, data);
-        const status = String(data?.status || '').toLowerCase();
-        const orderOk = Boolean(res.ok && data?.ok && data?.orderId && status !== 'rejected');
+        const normalized = normalizeOrderResponse(data);
+        const status = String(normalized.status || '').toLowerCase();
+        const orderOk = Boolean(res.ok && data?.ok && (normalized.orderId || data?.buy) && status !== 'rejected');
         if (orderOk) {
           attempted = true;
-          recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
+          if (normalized.orderId) {
+            recordRecentOrder({
+              id: normalized.orderId,
+              symbol: normalizedSymbol,
+              status,
+              submittedAt: normalized.submittedAt,
+            });
+          }
           if (status === 'filled') {
             fillsCount += 1;
           } else if (['new', 'accepted', 'open'].includes(status)) {
@@ -6414,10 +6459,18 @@ export default function App() {
         const res = await f(`${BACKEND_BASE_URL}/orders`, { method: 'POST', headers: BACKEND_HEADERS, body: JSON.stringify(order) });
         const raw = await res.text(); let data; try { data = JSON.parse(raw); } catch { data = { raw }; }
         logOrderResponse('force_test_buy', order, res, data);
-        const status = String(data?.status || '').toLowerCase();
-        const orderOk = Boolean(res.ok && data?.ok && data?.orderId && status !== 'rejected');
+        const normalized = normalizeOrderResponse(data);
+        const status = String(normalized.status || '').toLowerCase();
+        const orderOk = Boolean(res.ok && data?.ok && (normalized.orderId || data?.buy) && status !== 'rejected');
         if (orderOk) {
-          recordRecentOrder({ id: data.orderId, symbol: normalizedSymbol, status, submittedAt: data.submittedAt });
+          if (normalized.orderId) {
+            recordRecentOrder({
+              id: normalized.orderId,
+              symbol: normalizedSymbol,
+              status,
+              submittedAt: normalized.submittedAt,
+            });
+          }
           if (status === 'filled') {
             fillsCount += 1;
           } else if (['new', 'accepted', 'open'].includes(status)) {

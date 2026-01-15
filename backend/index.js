@@ -80,6 +80,16 @@ const VERSION =
   process.env.COMMIT_SHA ||
   'dev';
 
+function extractOrderSummary(order) {
+  if (!order) {
+    return { orderId: null, status: null, submittedAt: null };
+  }
+  const orderId = order.id || order.order_id || null;
+  const status = order.status || order.order_status || null;
+  const submittedAt = order.submitted_at || order.submittedAt || null;
+  return { orderId, status, submittedAt };
+}
+
 app.use((req, res, next) => {
   if (req.method === 'GET' && req.path === '/health') {
     return next();
@@ -228,8 +238,12 @@ app.post('/buy', async (req, res) => {
     });
 
     if (result?.ok) {
+      const { orderId, status, submittedAt } = extractOrderSummary(result.buy);
       res.json({
         ok: true,
+        orderId,
+        status,
+        submittedAt,
         buy: result.buy,
         sell: result.sell ?? null,
       });
@@ -305,8 +319,12 @@ app.post('/orders', async (req, res) => {
     const result = await submitOrder(payload);
     if (sideLower === 'buy') {
       if (result?.ok) {
+        const { orderId, status, submittedAt } = extractOrderSummary(result.buy);
         res.json({
           ok: true,
+          orderId,
+          status,
+          submittedAt,
           buy: result.buy,
           sell: result.sell ?? null,
         });
