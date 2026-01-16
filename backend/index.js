@@ -1,5 +1,13 @@
 require('dotenv').config();
 
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED_REJECTION', reason?.stack || reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT_EXCEPTION', err?.stack || err);
+});
+
 const express = require('express');
 const cors = require('cors');
 const { requireApiToken } = require('./auth');

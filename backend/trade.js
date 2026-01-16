@@ -5726,22 +5726,29 @@ async function runEntryScanOnce() {
 
     const envSymbols = normalizeSymbolsParam(process.env.AUTO_SCAN_SYMBOLS);
     const stableSymbols = new Set(['USDC/USD', 'USDT/USD', 'BUSD/USD', 'DAI/USD']);
+
+    const scanAllSupported = readEnvFlag('SCAN_ALL_SUPPORTED_PAIRS', false);
+    const maxScanSymbolsEnv = Number(process.env.MAX_SCAN_SYMBOLS || 0);
+    const maxScanSymbols = Number.isFinite(maxScanSymbolsEnv) && maxScanSymbolsEnv > 0 ? maxScanSymbolsEnv : null;
+
     let universe = [];
-    if (SIMPLE_SCALPER_ENABLED) {
-      await loadSupportedCryptoPairs();
-      universe = Array.from(supportedCryptoPairsState.pairs);
-    } else if (envSymbols.length) {
+    if (envSymbols.length) {
       universe = envSymbols;
-    } else {
+    } else if (scanAllSupported) {
       await loadSupportedCryptoPairs();
       universe = Array.from(supportedCryptoPairsState.pairs);
-      if (!universe.length) {
-        universe = CRYPTO_CORE_TRACKED;
-      }
+      if (!universe.length) universe = CRYPTO_CORE_TRACKED;
+    } else {
+      universe = CRYPTO_CORE_TRACKED;
     }
-    const scanSymbols = universe
+
+    let scanSymbols = universe
       .map((sym) => normalizeSymbol(sym))
       .filter((sym) => sym && !stableSymbols.has(sym));
+
+    if (maxScanSymbols && scanSymbols.length > maxScanSymbols) {
+      scanSymbols = scanSymbols.slice(0, maxScanSymbols);
+    }
 
     let positions = [];
     let openOrders = [];
@@ -5814,7 +5821,16 @@ async function runEntryScanOnce() {
         }
       }
 
-      const signal = await computeEntrySignal(symbol);
+      let signal;
+      try {
+        signal = await computeEntrySignal(symbol);
+      } catch (err) {
+        skipped += 1;
+        const reason = 'signal_exception';
+        skipCounts.set(reason, (skipCounts.get(reason) || 0) + 1);
+        console.error('entry_signal_exception', { symbol, error: err?.message || String(err) });
+        continue;
+      }
       if (DEBUG_ENTRY) {
         console.log('entry_signal', { symbol, entryReady: signal.entryReady, why: signal.why, meta: signal.meta });
       }
