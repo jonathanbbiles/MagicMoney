@@ -1,36 +1,45 @@
-const quoteUtils = require('shared/quoteUtils');
-const normalizeQuoteTsMs = quoteUtils.normalizeQuoteTsMs;
-const isFreshQuote = quoteUtils.isFresh;
+export function formatUsd(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return '—';
+  const abs = Math.abs(x);
+  const digits = abs >= 1000 ? 0 : abs >= 100 ? 2 : 2;
+  return x.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: digits });
+}
 
-export const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+export function formatNum(n, { max = 8 } = {}) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return '—';
+  const abs = Math.abs(x);
+  const digits = abs >= 1000 ? 2 : abs >= 1 ? 6 : 8;
+  return x.toLocaleString(undefined, { maximumFractionDigits: Math.min(digits, max) });
+}
 
-export const fmtUSD = (n) =>
-  Number.isFinite(n)
-    ? `$ ${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-    : '—';
+export function formatPct(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return '—';
+  return `${(x * 100).toFixed(2)}%`;
+}
 
-export const fmtPct = (n) => (Number.isFinite(n) ? `${n.toFixed(2)}%` : '—');
+export function formatAgo(iso) {
+  if (!iso) return '—';
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return '—';
+  const sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  return `${hr}h ago`;
+}
 
-export { normalizeQuoteTsMs };
+export function pickTradePrice(tradeObj) {
+  if (!tradeObj) return null;
+  // Alpaca "latest trade" tends to use `p` for price, `t` for timestamp
+  const p = tradeObj.p ?? tradeObj.price ?? tradeObj.ap ?? null;
+  const x = Number(p);
+  return Number.isFinite(x) ? x : null;
+}
 
-export const parseTsMs = normalizeQuoteTsMs;
-
-export const isFresh = isFreshQuote;
-
-export const emaArr = (arr, span) => {
-  if (!arr?.length) return [];
-  const k = 2 / (span + 1);
-  let prev = arr[0];
-  const out = [prev];
-  for (let i = 1; i < arr.length; i++) {
-    prev = arr[i] * k + prev * (1 - k);
-    out.push(prev);
-  }
-  return out;
-};
-
-export const roundToTick = (px, tick) => Math.ceil(px / tick) * tick;
-
-export const isFractionalQty = (q) => Math.abs(q - Math.round(q)) > 1e-6;
-
-export const isoDaysAgo = (n) => new Date(Date.now() - n * 864e5).toISOString();
+export function safeUpper(s) {
+  return String(s || '').trim().toUpperCase();
+}
