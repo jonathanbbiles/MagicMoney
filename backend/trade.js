@@ -143,6 +143,9 @@ const EXIT_CANCELS_ENABLED = readEnvFlag('EXIT_CANCELS_ENABLED', false);
 const SELL_REPRICE_ENABLED = readEnvFlag('SELL_REPRICE_ENABLED', false);
 const EXIT_TAKER_ON_TOUCH_ENABLED = readEnvFlag('EXIT_TAKER_ON_TOUCH_ENABLED', false);
 const EXIT_MARKET_EXITS_ENABLED = readEnvFlag('EXIT_MARKET_EXITS_ENABLED', false);
+const DISABLE_IOC_EXITS = readEnvFlag('DISABLE_IOC_EXITS', true);
+const EXIT_LIMIT_SELL_TIF = String(process.env.EXIT_LIMIT_SELL_TIF || 'gtc').trim().toLowerCase();
+const EXIT_LIMIT_SELL_TIF_SAFE = ['gtc', 'ioc', 'fok'].includes(EXIT_LIMIT_SELL_TIF) ? EXIT_LIMIT_SELL_TIF : 'gtc';
 const TAKER_EXIT_ON_TOUCH = EXIT_POLICY_LOCKED ? false : EXIT_TAKER_ON_TOUCH_ENABLED;
 const REPLACE_THRESHOLD_BPS = Number(process.env.REPLACE_THRESHOLD_BPS || 8);
 const ORDER_TTL_MS = Number(process.env.ORDER_TTL_MS || 45000);
@@ -3270,13 +3273,19 @@ async function submitIocLimitSell({
   }
   const finalQty = sizeGuard.qty ?? adjustedQty;
 
-  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_ioc_limit_sell' });
+  if (DISABLE_IOC_EXITS) {
+    console.log('ioc_disabled_market_sell', { symbol, qty: finalQty, reason });
+    const order = await submitMarketSell({ symbol, qty: finalQty, reason: `${reason}_market` });
+    return { order, requestedQty: finalQty };
+  }
+
+  const url = buildAlpacaUrl({ baseUrl: ALPACA_BASE_URL, path: 'orders', label: 'orders_exit_limit_sell' });
   const payload = {
     symbol: toTradeSymbol(symbol),
     qty: finalQty,
     side: 'sell',
     type: 'limit',
-    time_in_force: 'ioc',
+    time_in_force: EXIT_LIMIT_SELL_TIF_SAFE,
     limit_price: roundedLimit,
     client_order_id: buildExitClientOrderId(symbol),
   };
@@ -3284,12 +3293,12 @@ async function submitIocLimitSell({
     symbol,
     url,
     payload,
-    label: 'orders_ioc_limit_sell',
+    label: 'orders_exit_limit_sell',
     reason,
     context: 'ioc_limit_sell',
   });
 
-  console.log('submit_ioc_limit_sell', { symbol, qty: finalQty, limitPrice: roundedLimit, reason, orderId: response?.id });
+  console.log('submit_exit_limit_sell', { symbol, qty: finalQty, limitPrice: roundedLimit, reason, orderId: response?.id });
 
   return { order: response, requestedQty: finalQty };
 }
