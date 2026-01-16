@@ -1,10 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { SafeAreaView, View, Text, StyleSheet, TouchableOpacity, ActivityIndicator } from 'react-native';
-import StatusPill from 'src/components/StatusPill';
-import SummaryTile from 'src/components/SummaryTile';
-import PagedHoldingsGrid from 'src/components/PagedHoldingsGrid';
-import { apiGet, buildSymbolsParam, getBaseUrl } from 'src/api/backend';
-import { formatAgo, formatUsd, pickTradePrice, safeUpper } from 'src/utils/format';
+import StatusPill from '../components/StatusPill';
+import SummaryTile from '../components/SummaryTile';
+import PagedHoldingsGrid from '../components/PagedHoldingsGrid';
+import { apiGet, buildSymbolsParam, getBaseUrl } from '../api/backend';
+import { formatAgo, formatUsd, pickTradePrice, safeUpper } from '../utils/format';
 
 function useInterval(callback, delayMs) {
   const cbRef = useRef(callback);
