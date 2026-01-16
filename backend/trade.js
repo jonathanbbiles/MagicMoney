@@ -2943,15 +2943,12 @@ async function cancelOrderSafe(orderId) {
 }
 
 function shouldCancelExitSell() {
-  return EXIT_CANCELS_ENABLED === true;
+  return false; // POLICY: never cancel TP sells
 }
 
 async function maybeCancelExitSell({ symbol, orderId, reason }) {
   if (!orderId) return false;
-  if (shouldCancelExitSell()) {
-    return cancelOrderSafe(orderId);
-  }
-  console.log('exit_cancel_suppressed', { symbol, orderId, reason });
+  console.log('exit_cancel_blocked_policy', { symbol, orderId, reason });
   return false;
 }
 
@@ -5123,7 +5120,26 @@ async function manageExitStates() {
           }
         }
 
-        if (order && ['canceled', 'expired', 'rejected'].includes(order.status)) {
+        const st = String(order?.status || '').toLowerCase();
+        if (order && ['canceled', 'expired', 'rejected'].includes(st)) {
+          console.warn('tp_order_became_terminal', {
+            symbol,
+            orderId: state.sellOrderId,
+            status: st,
+            canceled_at: order.canceled_at || null,
+            failed_at: order.failed_at || null,
+            expired_at: order.expired_at || null,
+            replaced_at: order.replaced_at || null,
+            replaced_by: order.replaced_by || null,
+            client_order_id: order.client_order_id || null,
+            limit_price: order.limit_price || null,
+            qty: order.qty || null,
+            filled_qty: order.filled_qty || null,
+            time_in_force: order.time_in_force || null,
+            type: order.type || null,
+            post_only: order.post_only ?? null,
+            note: 'Bot cancel is hard-disabled; terminal status is broker-side or external.',
+          });
           state.sellOrderId = null;
           state.sellOrderSubmittedAt = null;
           state.sellOrderLimit = null;
@@ -5180,7 +5196,11 @@ async function manageExitStates() {
               : null;
 
           if (SELL_REPRICE_ENABLED) {
-            if (
+            if (!shouldCancelExitSell()) {
+              actionTaken = 'hold_existing_order';
+              reasonCode = 'policy_no_cancel_no_reprice';
+              decisionPath = 'policy_lock';
+            } else if (
               existingOrderAgeMs != null &&
               existingOrderAgeMs > SELL_ORDER_TTL_MS &&
               Number.isFinite(awayBps) &&
@@ -5278,7 +5298,26 @@ async function manageExitStates() {
           } catch (err) {
             console.warn('order_fetch_failed', { symbol, orderId: state.sellOrderId, error: err?.message || err });
           }
-          if (order && ['canceled', 'expired', 'rejected'].includes(order.status)) {
+          const st = String(order?.status || '').toLowerCase();
+          if (order && ['canceled', 'expired', 'rejected'].includes(st)) {
+            console.warn('tp_order_became_terminal', {
+              symbol,
+              orderId: state.sellOrderId,
+              status: st,
+              canceled_at: order.canceled_at || null,
+              failed_at: order.failed_at || null,
+              expired_at: order.expired_at || null,
+              replaced_at: order.replaced_at || null,
+              replaced_by: order.replaced_by || null,
+              client_order_id: order.client_order_id || null,
+              limit_price: order.limit_price || null,
+              qty: order.qty || null,
+              filled_qty: order.filled_qty || null,
+              time_in_force: order.time_in_force || null,
+              type: order.type || null,
+              post_only: order.post_only ?? null,
+              note: 'Bot cancel is hard-disabled; terminal status is broker-side or external.',
+            });
             state.sellOrderId = null;
             state.sellOrderSubmittedAt = null;
             state.sellOrderLimit = null;
@@ -5300,7 +5339,11 @@ async function manageExitStates() {
                 ? ((currentLimit - desiredLimit) / desiredLimit) * 10000
                 : null;
             if (SELL_REPRICE_ENABLED) {
-              if (
+              if (!shouldCancelExitSell()) {
+                actionTaken = 'hold_existing_order';
+                reasonCode = 'policy_no_cancel_no_reprice';
+                decisionPath = 'policy_lock';
+              } else if (
                 existingOrderAgeMs != null &&
                 existingOrderAgeMs > SELL_ORDER_TTL_MS &&
                 Number.isFinite(awayBps) &&
