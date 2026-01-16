@@ -146,6 +146,7 @@ export default function DashboardScreen() {
 
           <View style={styles.headerRight}>
             <StatusPill tone={headerPill.tone} label={headerPill.label} />
+            <View style={{ width: 10 }} />
             <TouchableOpacity style={styles.refreshBtn} onPress={() => refreshAll({ silent: false })} disabled={refreshing}>
               {refreshing ? <ActivityIndicator /> : <Text style={styles.refreshTxt}>Refresh</Text>}
             </TouchableOpacity>
@@ -221,7 +222,7 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
   title: { color: '#F2F5FF', fontSize: 22, fontWeight: '900', letterSpacing: 0.2 },
   subtitle: { color: '#7F8AA8', marginTop: 4, fontSize: 12, fontWeight: '700' },
-  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  headerRight: { flexDirection: 'row', alignItems: 'center' },
   refreshBtn: {
     backgroundColor: '#11131A',
     borderColor: '#23283A',
