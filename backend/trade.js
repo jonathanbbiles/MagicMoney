@@ -3040,9 +3040,29 @@ async function submitLimitSell({
   const openSellCandidates = openList.filter((order) => {
     const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
     const side = String(order.side || '').toLowerCase();
+    const status = String(order.status || '').toLowerCase();
     if (orderSymbol !== normalizedSymbol || side !== 'sell') return false;
+
+    // IMPORTANT: only adopt sells that are actually OPEN-like
+    if (!isOpenLikeOrderStatus(status)) return false;
+
+    // Must be a real limit TP (avoid adopting market sells / weird records)
+    const type = String(order.type || order.order_type || '').toLowerCase();
+    if (type && type !== 'limit') return false;
+
+    // Must have a valid limit price
+    if (!orderHasValidLimit(order)) return false;
+
     return true;
   });
+  const anySellHistory = openList.some((order) => {
+    const orderSymbol = normalizePair(order.symbol || order.rawSymbol);
+    const side = String(order.side || '').toLowerCase();
+    return orderSymbol === normalizedSymbol && side === 'sell';
+  });
+  if (anySellHistory && openSellCandidates.length === 0) {
+    console.log('sell_history_present_but_no_open_sell', { symbol });
+  }
   if (openSellCandidates.length) {
     const taggedCandidates = openSellCandidates.filter((order) => hasExitIntentOrder(order, normalizedSymbol));
     const desiredLimit = roundedLimit;
@@ -3061,6 +3081,8 @@ async function submitLimitSell({
     console.log('adopt_existing_sell', {
       symbol,
       orderId: adoptedId,
+      status: String(bestOrder?.status || '').toLowerCase(),
+      type: String(bestOrder?.type || bestOrder?.order_type || '').toLowerCase(),
       limitPrice: adoptedLimit,
       matchedQty: requiredQty,
       intentTagged: hasExitIntentOrder(bestOrder, normalizedSymbol),
