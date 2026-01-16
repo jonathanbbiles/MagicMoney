@@ -1,6 +1,6 @@
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
-import { formatUsd, formatNum } from 'src/utils/format';
+import { formatUsd, formatNum } from '../utils/format';
 
 export default function HoldingCard({ item }) {
   const symbol = item?.symbol || '—';

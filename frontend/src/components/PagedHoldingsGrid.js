@@ -1,6 +1,6 @@
 import React, { useMemo, useRef, useState } from 'react';
 import { View, FlatList, StyleSheet, useWindowDimensions } from 'react-native';
-import HoldingCard from 'src/components/HoldingCard';
+import HoldingCard from './HoldingCard';
 
 function chunk(arr, size) {
   const out = [];
