@@ -182,7 +182,7 @@ const ENTRY_FALLBACK_MARKET = readFlag('ENTRY_FALLBACK_MARKET', false);
 const ALLOW_TAKER_BEFORE_TARGET = readFlag('ALLOW_TAKER_BEFORE_TARGET', false);
 const TAKER_TOUCH_MIN_INTERVAL_MS = readNumber('TAKER_TOUCH_MIN_INTERVAL_MS', 5000);
 
-const SIMPLE_SCALPER_ENABLED = readFlag('SIMPLE_SCALPER', true);
+const SIMPLE_SCALPER_ENABLED = readFlag('SIMPLE_SCALPER', false);
 const MAX_SPREAD_BPS_SIMPLE_DEFAULT = Number.isFinite(Number(process.env.MAX_SPREAD_BPS_TO_TRADE))
   ? Number(process.env.MAX_SPREAD_BPS_TO_TRADE)
   : 60;
@@ -190,6 +190,13 @@ const MAX_SPREAD_BPS_SIMPLE = readNumber('MAX_SPREAD_BPS_SIMPLE', MAX_SPREAD_BPS
 const PROFIT_NET_BPS = readNumber('PROFIT_NET_BPS', 100);
 const FEE_BPS_EST = readNumber('FEE_BPS_EST', 25);
 const BUYING_POWER_RESERVE_USD = readNumber('BUYING_POWER_RESERVE_USD', 0);
+const ORDERBOOK_GUARD_ENABLED = readFlag('ORDERBOOK_GUARD_ENABLED', true);
+const ORDERBOOK_MAX_AGE_MS = readNumber('ORDERBOOK_MAX_AGE_MS', 3000);
+const ORDERBOOK_BAND_BPS = readNumber('ORDERBOOK_BAND_BPS', 10);
+const ORDERBOOK_MIN_DEPTH_USD = readNumber('ORDERBOOK_MIN_DEPTH_USD', 250);
+const ORDERBOOK_IMPACT_NOTIONAL_USD = readNumber('ORDERBOOK_IMPACT_NOTIONAL_USD', 100);
+const ORDERBOOK_MAX_IMPACT_BPS = readNumber('ORDERBOOK_MAX_IMPACT_BPS', 6);
+const ORDERBOOK_IMBALANCE_BIAS_SCALE = readNumber('ORDERBOOK_IMBALANCE_BIAS_SCALE', 0.04);
 
 const PRICE_TICK = Number(process.env.PRICE_TICK || 0.01);
 const MAX_CONCURRENT_POSITIONS = Number(process.env.MAX_CONCURRENT_POSITIONS || 100);
@@ -404,6 +411,34 @@ async function computeEntrySignal(symbol) {
     return { entryReady: false, why: 'spread_gate', meta: { symbol: asset.symbol, spreadBps } };
   }
 
+  let orderbookMeta = null;
+  let obBias = 0;
+  let obImpactBpsBuy = null;
+
+  if (ORDERBOOK_GUARD_ENABLED) {
+    try {
+      const ob = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
+      const m = computeOrderbookMetrics(ob, { bid, ask });
+      orderbookMeta = m;
+      obBias = m.obBias || 0;
+      obImpactBpsBuy = m.impactBpsBuy;
+
+      if (!m.ok) {
+        return {
+          entryReady: false,
+          why: 'orderbook_liquidity_gate',
+          meta: { symbol: asset.symbol, spreadBps, ...m },
+        };
+      }
+    } catch (err) {
+      return {
+        entryReady: false,
+        why: 'orderbook_unavailable',
+        meta: { symbol: asset.symbol, spreadBps, error: err?.message || String(err) },
+      };
+    }
+  }
+
   let bars;
   try {
     bars = await fetchCryptoBars({ symbols: [asset.symbol], limit: 16, timeframe: '1Min' });
@@ -432,7 +467,9 @@ async function computeEntrySignal(symbol) {
   const spreadEwma = spreadAlpha * spreadBps + (1 - spreadAlpha) * prevSpread;
   spreadEwmaBySymbol.set(asset.symbol, spreadEwma);
 
-  const rawSlip = Number.isFinite(spreadBps) ? Math.min(SLIPPAGE_BPS, spreadBps) : SLIPPAGE_BPS;
+  const rawSlip = Number.isFinite(spreadBps)
+    ? Math.max(SLIPPAGE_BPS, Math.min(spreadBps, 250))
+    : SLIPPAGE_BPS;
   const prevSlip = slipEwmaBySymbol.get(asset.symbol) ?? rawSlip;
   const slipEwma = spreadAlpha * rawSlip + (1 - spreadAlpha) * prevSlip;
   slipEwmaBySymbol.set(asset.symbol, slipEwma);
@@ -448,7 +485,8 @@ async function computeEntrySignal(symbol) {
   const stopBps = Math.max(STOP_LOSS_BPS, sigmaEwma * STOP_VOL_MULT);
   const needBpsVol = Math.max(1, sigmaEwma * TP_VOL_SCALE);
   const desiredNetExitBps = DESIRED_NET_PROFIT_BASIS_POINTS;
-  const slippageBpsForExit = SLIPPAGE_BPS;
+  const obSlip = Number.isFinite(obImpactBpsBuy) ? obImpactBpsBuy : 0;
+  const slippageBpsForExit = Math.max(SLIPPAGE_BPS, obSlip, Number.isFinite(slipEwma) ? slipEwma : 0);
   const requiredGrossExitBps = requiredProfitBpsForSymbol({
     slippageBps: slippageBpsForExit,
     feeBps: feeBpsRoundTrip(),
@@ -457,7 +495,7 @@ async function computeEntrySignal(symbol) {
   const riskScale = [1.25, 1.1, 1.0, 0.9, 0.8][riskLvl] ?? 1.0;
   const needDyn = Math.max(requiredGrossExitBps, needBpsVol * riskScale) + momentumPenaltyBps;
   const pUpBarrier = barrierPTouchUpDriftless(requiredGrossExitBps, stopBps);
-  let pUp = 0.5 + micro.microBias + momBias + (pUpBarrier - 0.5) * 0.65;
+  let pUp = 0.5 + micro.microBias + momBias + obBias + (pUpBarrier - 0.5) * 0.65;
   pUp = clamp(pUp, 0.05, 0.95);
 
   const expectedBps = expectedValueBps({
@@ -506,6 +544,10 @@ async function computeEntrySignal(symbol) {
       needDyn,
       requiredGrossExitBps,
       feeBps: feeBpsRoundTrip(),
+      orderbookAskDepthUsd: orderbookMeta?.askDepthUsd,
+      orderbookBidDepthUsd: orderbookMeta?.bidDepthUsd,
+      orderbookImpactBpsBuy: orderbookMeta?.impactBpsBuy,
+      orderbookImbalance: orderbookMeta?.imbalance,
     },
   };
 }
@@ -528,6 +570,7 @@ const inFlightBySymbol = new Map();
 
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
+const orderbookCache = new Map(); // symbol -> { tsMs, receivedAtMs, asks, bids }
 const QUOTE_FAILURE_WINDOW_MS = 120000;
 const QUOTE_FAILURE_THRESHOLD = 3;
 const QUOTE_COOLDOWN_MS = 300000;
@@ -2822,6 +2865,111 @@ function normalizeSymbolsParam(rawSymbols) {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+function parseIsoTsMs(value) {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
+  const dataSymbols = symbols.map((s) => toDataSymbol(s));
+  const url = buildAlpacaUrl({
+    baseUrl: CRYPTO_DATA_URL,
+    path: `${location}/latest/orderbooks`,
+    params: { symbols: dataSymbols.join(',') },
+    label: 'crypto_latest_orderbooks_batch',
+  });
+  return requestMarketDataJson({ type: 'ORDERBOOK', url, symbol: dataSymbols.join(',') });
+}
+
+async function getLatestOrderbook(symbol, { maxAgeMs }) {
+  const now = Date.now();
+  const cached = orderbookCache.get(symbol);
+  if (
+    cached &&
+    Number.isFinite(cached.receivedAtMs) &&
+    (now - cached.receivedAtMs) <= Math.max(250, maxAgeMs)
+  ) {
+    return cached;
+  }
+
+  const resp = await fetchCryptoOrderbooks({ symbols: [symbol], limit: undefined });
+  const key = toDataSymbol(symbol);
+  const book =
+    resp?.orderbooks?.[key] ||
+    resp?.orderbooks?.[normalizePair(key)] ||
+    resp?.orderbooks?.[symbol] ||
+    null;
+
+  const asks = Array.isArray(book?.a) ? book.a : [];
+  const bids = Array.isArray(book?.b) ? book.b : [];
+  const tsMs = Number.isFinite(book?.t) ? Number(book.t) : parseIsoTsMs(book?.t);
+
+  if (!asks.length || !bids.length) throw new Error(`Orderbook missing levels for ${symbol}`);
+  if (!Number.isFinite(tsMs)) throw new Error(`Orderbook timestamp missing for ${symbol}`);
+
+  if (now - tsMs > maxAgeMs) throw new Error(`Orderbook stale for ${symbol}`);
+
+  const normalized = { asks, bids, tsMs, receivedAtMs: now };
+  orderbookCache.set(symbol, normalized);
+  return normalized;
+}
+
+function sumDepthUsdWithinBand(levels, bestPrice, bandBps, side) {
+  const band = Math.max(1, bandBps) / 10000;
+  const limit = side === 'ask' ? bestPrice * (1 + band) : bestPrice * (1 - band);
+  let total = 0;
+  for (const lvl of levels) {
+    const p = Number(lvl?.p ?? lvl?.price);
+    const s = Number(lvl?.s ?? lvl?.size ?? lvl?.q ?? lvl?.qty);
+    if (!Number.isFinite(p) || !Number.isFinite(s) || p <= 0 || s <= 0) continue;
+    if (side === 'ask') {
+      if (p > limit) continue;
+    } else if (p < limit) {
+      continue;
+    }
+    total += p * s;
+  }
+  return total;
+}
+
+function estimateBuyImpactBps(asks, bestAsk, notionalUsd) {
+  const target = Math.max(1, Number(notionalUsd) || 0);
+  let remaining = target;
+  let cost = 0;
+  let qty = 0;
+  for (const lvl of asks) {
+    const p = Number(lvl?.p ?? lvl?.price);
+    const s = Number(lvl?.s ?? lvl?.size ?? lvl?.q ?? lvl?.qty);
+    if (!Number.isFinite(p) || !Number.isFinite(s) || p <= 0 || s <= 0) continue;
+    const lvlNotional = p * s;
+    const takeNotional = Math.min(remaining, lvlNotional);
+    const takeQty = takeNotional / p;
+    cost += takeNotional;
+    qty += takeQty;
+    remaining -= takeNotional;
+    if (remaining <= 0) break;
+  }
+  if (remaining > 0 || qty <= 0) return Infinity;
+  const vwap = cost / qty;
+  return ((vwap - bestAsk) / bestAsk) * 10000;
+}
+
+function computeOrderbookMetrics({ asks, bids }, { bid, ask }) {
+  const askDepthUsd = sumDepthUsdWithinBand(asks, ask, ORDERBOOK_BAND_BPS, 'ask');
+  const bidDepthUsd = sumDepthUsdWithinBand(bids, bid, ORDERBOOK_BAND_BPS, 'bid');
+  const impactBpsBuy = estimateBuyImpactBps(asks, ask, ORDERBOOK_IMPACT_NOTIONAL_USD);
+
+  const denom = Math.max(1, bidDepthUsd + askDepthUsd);
+  const imbalance = (bidDepthUsd - askDepthUsd) / denom;
+  const obBias = clamp(imbalance * ORDERBOOK_IMBALANCE_BIAS_SCALE, -0.05, 0.05);
+
+  const okDepth = askDepthUsd >= ORDERBOOK_MIN_DEPTH_USD && bidDepthUsd >= (ORDERBOOK_MIN_DEPTH_USD * 0.5);
+  const okImpact = Number.isFinite(impactBpsBuy) && impactBpsBuy <= ORDERBOOK_MAX_IMPACT_BPS;
+
+  return { askDepthUsd, bidDepthUsd, impactBpsBuy, imbalance, obBias, ok: okDepth && okImpact };
 }
 
 async function fetchCryptoQuotes({ symbols, location = 'us' }) {
