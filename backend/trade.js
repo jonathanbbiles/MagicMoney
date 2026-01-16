@@ -3020,7 +3020,6 @@ async function submitLimitSell({
   reason,
   intentRef,
   openOrders,
-  postOnly = true,
 
 }) {
 
@@ -3118,16 +3117,14 @@ async function submitLimitSell({
     limit_price: roundedLimit,
     client_order_id: clientOrderId,
   };
-  const postOnlyPref = readFlag('POST_ONLY_SELL', Boolean(postOnly));
-  if (postOnlyPref && isCryptoSymbol(symbol)) {
-    payload.post_only = true;
-  }
   console.log('tp_sell_attempt', {
     symbol,
     qty: finalQty,
-    limitPrice: roundedLimit,
+    limit_price: roundedLimit,
     tif: payload.time_in_force,
     client_order_id: clientOrderId,
+    post_only: false,
+    post_only_disabled: true,
     sell_reason: 'TP_ATTACH',
   });
   let response;
@@ -3149,6 +3146,11 @@ async function submitLimitSell({
   }
 
   console.log('submit_limit_sell', { symbol, qty, limitPrice: roundedLimit, reason, orderId: response?.id });
+
+  const responseStatus = String(response?.status || response?.order_status || '').toLowerCase();
+  if (responseStatus === 'rejected' || responseStatus === 'canceled' || responseStatus === 'cancelled') {
+    console.error('tp_sell_error', { symbol, status: responseStatus, body: JSON.stringify(response) });
+  }
 
   if (!response?.id) {
     console.warn('tp_sell_missing_id', { symbol });
