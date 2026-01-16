@@ -39,16 +39,28 @@ export default function PagedHoldingsGrid({ holdings }) {
         }}
         renderItem={({ item: page }) => (
           <View style={[styles.page, { width, paddingHorizontal: padding }]}>
-            <View style={[styles.grid, { gap: cardGap }]}>
-              {page.map((h) => (
-                <View key={String(h.symbol)} style={{ width: cardWidth }}>
-                  <HoldingCard item={h} />
-                </View>
-              ))}
+            <View style={styles.grid}>
+              {page.map((h, idx) => {
+                const col = idx % cols;
+                const mr = col === cols - 1 ? 0 : cardGap;
+                return (
+                  <View key={String(h.symbol)} style={{ width: cardWidth, marginRight: mr, marginBottom: cardGap }}>
+                    <HoldingCard item={h} />
+                  </View>
+                );
+              })}
               {/* Fill empty slots to keep layout stable */}
-              {Array.from({ length: Math.max(0, perPage - page.length) }).map((_, i) => (
-                <View key={`empty_${i}`} style={{ width: cardWidth, opacity: 0 }} />
-              ))}
+              {Array.from({ length: Math.max(0, perPage - page.length) }).map((_, i) => {
+                const idx = page.length + i;
+                const col = idx % cols;
+                const mr = col === cols - 1 ? 0 : cardGap;
+                return (
+                  <View
+                    key={`empty_${i}`}
+                    style={{ width: cardWidth, marginRight: mr, marginBottom: cardGap, opacity: 0 }}
+                  />
+                );
+              })}
             </View>
           </View>
         )}
@@ -65,7 +77,7 @@ export default function PagedHoldingsGrid({ holdings }) {
 const styles = StyleSheet.create({
   wrap: { flex: 1 },
   page: { flex: 1 },
-  grid: { flex: 1, flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between' },
+  grid: { flex: 1, flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-start' },
   dots: { flexDirection: 'row', justifyContent: 'center', marginTop: 10 },
   dot: { width: 8, height: 8, borderRadius: 99, marginHorizontal: 5 },
   dotOn: { backgroundColor: '#F2F5FF' },
