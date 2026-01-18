@@ -2236,8 +2236,14 @@ function computeExitPlanNetAfterFees({
   entryFeeBps,
   exitFeeBps,
   effectiveEntryPriceOverride,
+  desiredNetExitBps,
 }) {
-  const netAfterFeesBps = EXIT_NET_PROFIT_AFTER_FEES_BPS;
+  const desired = Number.isFinite(Number(desiredNetExitBps))
+    ? Number(desiredNetExitBps)
+    : EXIT_NET_PROFIT_AFTER_FEES_BPS;
+
+  // Never target tiny net profits that can't realistically clear spread/slippage.
+  const netAfterFeesBps = Math.max(USER_MIN_PROFIT_BPS, desired);
   const effectiveEntryPrice = effectiveEntryPriceOverride ?? entryPrice;
   const requiredExitBps = computeRequiredExitBpsForNetAfterFees({
     entryFeeBps,
@@ -4008,6 +4014,7 @@ async function repairOrphanExits() {
         entryPrice: avgEntryPrice,
         entryFeeBps,
         exitFeeBps,
+        desiredNetExitBps,
       });
       netAfterFeesBps = plan.netAfterFeesBps;
       requiredExitBps = plan.requiredExitBps;
@@ -4510,6 +4517,7 @@ async function manageExitStates() {
             effectiveEntryPriceOverride: Number.isFinite(state.effectiveEntryPrice)
               ? state.effectiveEntryPrice
               : state.entryPrice,
+            desiredNetExitBps: state.desiredNetExitBps,
           });
           state.netAfterFeesBps = plan.netAfterFeesBps;
           state.effectiveEntryPrice = plan.effectiveEntryPrice;
