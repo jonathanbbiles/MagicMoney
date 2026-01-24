@@ -418,17 +418,39 @@ async function computeEntrySignal(symbol) {
   if (ORDERBOOK_GUARD_ENABLED) {
     try {
       const ob = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
-      const m = computeOrderbookMetrics(ob, { bid, ask });
-      orderbookMeta = m;
-      obBias = m.obBias || 0;
-      obImpactBpsBuy = m.impactBpsBuy;
+      if (ob?._synthetic) {
+        orderbookMeta = { ok: true, reason: 'orderbook_quote_fallback', synthetic: true };
+        const syntheticBid = Number(ob?.bids?.[0]?.p ?? ob?.bids?.[0]?.price);
+        const syntheticAsk = Number(ob?.asks?.[0]?.p ?? ob?.asks?.[0]?.price);
+        if (
+          Number.isFinite(syntheticBid) &&
+          Number.isFinite(syntheticAsk) &&
+          syntheticBid > 0 &&
+          syntheticAsk > 0
+        ) {
+          const syntheticMid = (syntheticBid + syntheticAsk) / 2;
+          const syntheticSpreadBps = ((syntheticAsk - syntheticBid) / syntheticMid) * BPS;
+          if (Number.isFinite(syntheticSpreadBps) && syntheticSpreadBps > MAX_SPREAD_BPS_TO_TRADE) {
+            return {
+              entryReady: false,
+              why: 'spread_gate',
+              meta: { symbol: asset.symbol, spreadBps: syntheticSpreadBps, orderbookFallback: true },
+            };
+          }
+        }
+      } else {
+        const m = computeOrderbookMetrics(ob, { bid, ask });
+        orderbookMeta = m;
+        obBias = m.obBias || 0;
+        obImpactBpsBuy = m.impactBpsBuy;
 
-      if (!m.ok) {
-        return {
-          entryReady: false,
-          why: 'orderbook_liquidity_gate',
-          meta: { symbol: asset.symbol, spreadBps, ...m },
-        };
+        if (!m.ok) {
+          return {
+            entryReady: false,
+            why: 'orderbook_liquidity_gate',
+            meta: { symbol: asset.symbol, spreadBps, ...m },
+          };
+        }
       }
     } catch (err) {
       return {
@@ -2879,6 +2901,12 @@ function parseIsoTsMs(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function normalizeOrderbookTimestampMs(book, res) {
+  const raw = book?.t ?? book?.timestamp ?? book?.time ?? res?.t ?? res?.timestamp ?? res?.time;
+  if (Number.isFinite(raw)) return Number(raw);
+  return parseIsoTsMs(raw);
+}
+
 async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
   const dataSymbols = symbols.map((s) => toDataSymbol(s));
   const url = buildAlpacaUrl({
@@ -2888,6 +2916,47 @@ async function fetchCryptoOrderbooks({ symbols, location = 'us' }) {
     label: 'crypto_latest_orderbooks_batch',
   });
   return requestMarketDataJson({ type: 'ORDERBOOK', url, symbol: dataSymbols.join(',') });
+}
+
+async function fetchLatestOrderbookBatch({ symbols, location = 'us' }) {
+  const res = await fetchCryptoOrderbooks({ symbols, location });
+  const results = {};
+  for (const symbol of symbols) {
+    const quoteKey = toDataSymbol(symbol);
+    const book =
+      res?.orderbooks?.[quoteKey] ||
+      res?.orderbooks?.[normalizePair(quoteKey)] ||
+      res?.orderbooks?.[symbol] ||
+      null;
+    const tsMs = normalizeOrderbookTimestampMs(book, res);
+    const hasAsks = Array.isArray(book?.a) && book.a.length > 0;
+    const hasBids = Array.isArray(book?.b) && book.b.length > 0;
+    if (!book || !hasAsks || !hasBids || !Number.isFinite(tsMs)) {
+      try {
+        const quote = await getLatestQuoteFromQuotesOnly(symbol, { maxAgeMs: MAX_QUOTE_AGE_MS });
+        const bid = Number(quote.bid);
+        const ask = Number(quote.ask);
+        if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0 && Number.isFinite(quote.tsMs)) {
+          const syntheticBook = {
+            t: new Date(quote.tsMs).toISOString(),
+            a: [{ p: ask, s: null }],
+            b: [{ p: bid, s: null }],
+            _synthetic: true,
+            _source: 'quote_fallback',
+          };
+          console.log('orderbook_fallback', { symbol, reason: 'orderbook_quote_fallback', bid, ask });
+          results[symbol] = { ok: true, reason: 'orderbook_quote_fallback', orderbookRaw: syntheticBook };
+          continue;
+        }
+      } catch (err) {
+        // Fall through to default error handling.
+      }
+      results[symbol] = { ok: false, reason: 'ob_http_empty', orderbookRaw: null };
+      continue;
+    }
+    results[symbol] = { ok: true, reason: null, orderbookRaw: book };
+  }
+  return results;
 }
 
 async function getLatestOrderbook(symbol, { maxAgeMs }) {
@@ -2901,24 +2970,30 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
     return cached;
   }
 
-  const resp = await fetchCryptoOrderbooks({ symbols: [symbol], limit: undefined });
-  const key = toDataSymbol(symbol);
-  const book =
-    resp?.orderbooks?.[key] ||
-    resp?.orderbooks?.[normalizePair(key)] ||
-    resp?.orderbooks?.[symbol] ||
-    null;
+  const resp = await fetchLatestOrderbookBatch({ symbols: [symbol] });
+  const obResult = resp?.[symbol] || null;
+  if (!obResult?.ok) {
+    throw new Error(`Orderbook missing levels for ${symbol}`);
+  }
+  const book = obResult.orderbookRaw || null;
 
   const asks = Array.isArray(book?.a) ? book.a : [];
   const bids = Array.isArray(book?.b) ? book.b : [];
-  const tsMs = Number.isFinite(book?.t) ? Number(book.t) : parseIsoTsMs(book?.t);
+  const tsMs = normalizeOrderbookTimestampMs(book, resp);
 
   if (!asks.length || !bids.length) throw new Error(`Orderbook missing levels for ${symbol}`);
   if (!Number.isFinite(tsMs)) throw new Error(`Orderbook timestamp missing for ${symbol}`);
 
   if (now - tsMs > maxAgeMs) throw new Error(`Orderbook stale for ${symbol}`);
 
-  const normalized = { asks, bids, tsMs, receivedAtMs: now };
+  const normalized = {
+    asks,
+    bids,
+    tsMs,
+    receivedAtMs: now,
+    _synthetic: book?._synthetic === true,
+    _source: book?._source ?? null,
+  };
   orderbookCache.set(symbol, normalized);
   return normalized;
 }
