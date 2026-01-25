@@ -18,6 +18,13 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
+import {
+  AUTO_TUNE_SWEEP_INTERVAL_MS,
+  EXIT_MANAGER_INTERVAL_MS,
+  HOLDINGS_POLL_INTERVAL_MS,
+  LOG_UI_FLUSH_INTERVAL_MS,
+  SUPPORTED_CRYPTO_REFRESH_MS,
+} from './src/config/polling';
 const normalizePair = (sym) => {
   if (!sym) return '';
   const raw = String(sym).trim().toUpperCase();
@@ -80,6 +87,7 @@ const BACKEND_BASE_URL = normalizeBaseUrl(
     ? (EX.BACKEND_BASE_URL || DEV_LAN_IP || 'http://localhost:3000')
     : (EX.BACKEND_BASE_URL || RENDER_BACKEND_URL)
 );
+const USING_HOSTED_BACKEND = BACKEND_BASE_URL.includes('onrender.com');
 
 // IMPORTANT: your account supports 'us' for crypto data. Do not call 'global' to avoid 400s.
 const DATA_LOCATIONS = ['us'];
@@ -96,12 +104,23 @@ const FORCE_ONE_TEST_BUY_NOTIONAL = Number(EX.FORCE_ONE_TEST_BUY_NOTIONAL || 2);
 let forceTestBuyUsed = false;
 console.log('[Backend ENV]', { base: BACKEND_BASE_URL });
 
+let connectionReporter = null;
+const setConnectionReporter = (fn) => {
+  connectionReporter = typeof fn === 'function' ? fn : null;
+};
+const reportConnection = (patch) => {
+  if (typeof connectionReporter === 'function') {
+    connectionReporter(patch);
+  }
+};
+
 function bootConnectivityCheck(setStatusFn) {
   let active = true;
   (async () => {
     const startedAt = Date.now();
+    const baseHeaders = { Accept: 'application/json' };
     try {
-      const res = await f(`${BACKEND_BASE_URL}/health`, { headers: BACKEND_HEADERS }, 8000, 1);
+      const res = await f(`${BACKEND_BASE_URL}/health`, { headers: baseHeaders }, 8000, 1);
       const ms = Date.now() - startedAt;
       const ok = !!res?.ok;
       const data = await res.json().catch(() => null);
@@ -110,17 +129,58 @@ function bootConnectivityCheck(setStatusFn) {
       if (!ok) {
         const message = data?.error || data?.message || `HTTP ${res?.status ?? 'NA'}`;
         console.log(`BACKEND_UNREACHABLE ${message}`);
-        setStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: message });
+        setStatusFn?.((prev) => ({
+          ...prev,
+          ok: false,
+          backendReachable: false,
+          checkedAt: new Date().toISOString(),
+          error: message,
+          lastError: message,
+        }));
         return;
       }
-      setStatusFn?.({ ok: true, checkedAt: new Date().toISOString(), error: null });
+      setStatusFn?.((prev) => ({
+        ...prev,
+        ok: true,
+        backendReachable: true,
+        checkedAt: new Date().toISOString(),
+        error: null,
+      }));
     } catch (e) {
       const ms = Date.now() - startedAt;
       const message = e?.message || String(e);
       console.log(`BACKEND health ok=false ms=${ms}`);
       console.log(`BACKEND_UNREACHABLE ${message}`);
       if (!active) return;
-      setStatusFn?.({ ok: false, checkedAt: new Date().toISOString(), error: message });
+      setStatusFn?.((prev) => ({
+        ...prev,
+        ok: false,
+        backendReachable: false,
+        checkedAt: new Date().toISOString(),
+        error: message,
+        lastError: message,
+      }));
+      return;
+    }
+
+    try {
+      const res = await f(`${BACKEND_BASE_URL}/debug/auth`, { headers: baseHeaders }, 8000, 1);
+      const data = await res.json().catch(() => null);
+      if (!active) return;
+      setStatusFn?.((prev) => ({
+        ...prev,
+        authRequired: Boolean(data?.apiTokenSet),
+        authCheckedAt: new Date().toISOString(),
+      }));
+    } catch (e) {
+      if (!active) return;
+      const message = e?.message || String(e);
+      setStatusFn?.((prev) => ({
+        ...prev,
+        authRequired: null,
+        authCheckedAt: new Date().toISOString(),
+        lastError: prev?.lastError || message,
+      }));
     }
   })();
   return () => { active = false; };
@@ -391,8 +451,55 @@ function computeRateLimitBackoff(attempt, headers = {}) {
   return base;
 }
 
+const REQUEST_CACHE_TTL_MS = 750;
+const requestCache = new Map();
+const backoffUntil = new Map();
+
+function buildCacheKey(url, opts = {}) {
+  const method = String(opts?.method || 'GET').toUpperCase();
+  return `${method}:${url}`;
+}
+
+function readRetryAfter(res) {
+  const header = res?.headers?.get?.('Retry-After') || res?.headers?.get?.('retry-after');
+  const parsed = Number(header);
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : null;
+}
+
+function buildCachedResponse(cached) {
+  return new Response(cached.body, {
+    status: cached.status,
+    statusText: cached.statusText,
+    headers: cached.headers,
+  });
+}
+
+function buildBackoffResponse(retryAfterSec) {
+  const payload = JSON.stringify({ ok: false, error: 'rate_limited', retryAfterSec });
+  return new Response(payload, {
+    status: 429,
+    headers: {
+      'Content-Type': 'application/json',
+      'Retry-After': String(retryAfterSec),
+    },
+  });
+}
+
 async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
   let lastErr = null;
+  const method = String(opts?.method || 'GET').toUpperCase();
+  const cacheKey = buildCacheKey(url, opts);
+  if (method === 'GET') {
+    const blockedUntil = backoffUntil.get(cacheKey);
+    if (blockedUntil && Date.now() < blockedUntil) {
+      const retryAfterSec = Math.ceil((blockedUntil - Date.now()) / 1000);
+      return buildBackoffResponse(retryAfterSec);
+    }
+    const cached = requestCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < REQUEST_CACHE_TTL_MS) {
+      return buildCachedResponse(cached);
+    }
+  }
   for (let i = 0; i <= retries; i++) {
     await __takeToken();
     const ac = new AbortController();
@@ -400,9 +507,37 @@ async function f(url, opts = {}, timeoutMs = 12000, retries = 3) {
     try {
       const res = await fetch(url, { ...opts, signal: ac.signal });
       clearTimeout(t);
+      if (method === 'GET') {
+        const clone = res.clone();
+        clone
+          .text()
+          .then((body) => {
+            requestCache.set(cacheKey, {
+              ts: Date.now(),
+              status: res.status,
+              statusText: res.statusText,
+              headers: Array.from(clone.headers.entries()),
+              body,
+            });
+          })
+          .catch(() => {});
+      }
+      if (res.status === 401 && API_TOKEN) {
+        reportConnection({
+          lastError: `Token mismatch (${BACKEND_BASE_URL}) API_TOKEN set: yes`,
+          lastStatus: 401,
+          lastErrorAt: new Date().toISOString(),
+        });
+      }
       if (res.status === 429 || res.status >= 500) {
         if (i === retries) return res;
         const headers = res.status === 429 ? readRateLimitHeaders(res) : null;
+        if (res.status === 429 && method === 'GET') {
+          const retryAfter = readRetryAfter(res);
+          if (Number.isFinite(retryAfter)) {
+            backoffUntil.set(cacheKey, Date.now() + retryAfter * 1000);
+          }
+        }
         const extra = res.status === 429 ? computeRateLimitBackoff(i, headers || {}) : 0;
         await sleep(400 * Math.pow(2, i) + Math.floor(Math.random() * 300) + extra);
         continue;
@@ -1219,7 +1354,6 @@ const STATIC_UNIVERSE = Array.from(
 /* ───────────────────────── 11) QUOTE CACHE / SUPPORT FLAGS ───────────────────────── */
 const SUPPORTED_CRYPTO_CACHE_KEY = 'supported_crypto_pairs_v1';
 const SUPPORTED_CRYPTO_CACHE_TS_KEY = 'supported_crypto_pairs_last_refresh_v1';
-const SUPPORTED_CRYPTO_REFRESH_MS = 24 * 60 * 60 * 1000;
 const quoteCache = new Map();
 const lastQuoteBatchMissing = new Map();
 const unsupportedSymbols = new Map();
@@ -3601,7 +3735,7 @@ const HoldingsChangeBarChart = () => {
         setRows(rowsOut);
         setLastAt(new Date().toISOString());
       } catch {}
-      if (!stopped) setTimeout(poll, 4000);
+      if (!stopped) setTimeout(poll, HOLDINGS_POLL_INTERVAL_MS);
     };
     poll();
     return () => { stopped = true; };
@@ -4227,7 +4361,6 @@ const sellReplaceCooldownBySymbol = new Map();
 const SELL_EPS_BPS = 0.2;
 const TP_START_PROFIT_BPS = 500;
 const TP_STEP_DOWN_BPS = 1;
-const TP_STEP_INTERVAL_MS = 20000;
 const TP_MIN_NET_BPS = 1;
 // Estimated round-trip fee bps (2 * maker fee as a conservative constant).
 const ESTIMATED_ROUND_TRIP_FEE_BPS = 2 * FEE_BPS_MAKER;
@@ -4512,7 +4645,7 @@ const ensureLimitTP = async (symbol, limitPrice, {
       return Number.isFinite(ts) ? ts : null;
     })();
     const cooldownMsRemaining = Number.isFinite(lastPlacementTs) && !Number.isFinite(overrideLimit)
-      ? Math.max(0, TP_STEP_INTERVAL_MS - (now - lastPlacementTs))
+      ? Math.max(0, EXIT_MANAGER_INTERVAL_MS - (now - lastPlacementTs))
       : null;
 
     let action = 'HOLD';
@@ -5836,7 +5969,24 @@ export default function App() {
   const [autoTrade, setAutoTrade] = useState(true);
   const [notification, setNotification] = useState(null);
   const [logHistory, setLogHistory] = useState([]);
-  const [connectivity, setConnectivity] = useState({ ok: null, checkedAt: null, error: null });
+  const [connectivity, setConnectivity] = useState({
+    ok: null,
+    checkedAt: null,
+    error: null,
+    backendReachable: null,
+    authRequired: null,
+    authCheckedAt: null,
+    lastError: null,
+    lastStatus: null,
+    lastErrorAt: null,
+  });
+
+  useEffect(() => {
+    setConnectionReporter((patch) => {
+      setConnectivity((prev) => ({ ...prev, ...patch }));
+    });
+    return () => setConnectionReporter(null);
+  }, []);
   const [haltState, setHaltState] = useState({ halted: TRADING_HALTED, reason: HALT_REASON });
 
   const [overrides, setOverrides] = useState({});
@@ -6047,7 +6197,7 @@ export default function App() {
         }
       }
       if (skipsChanged) setLastSkips({ ...lastSkipsRef.current });
-    }, 350);
+    }, LOG_UI_FLUSH_INTERVAL_MS);
 
     return () => {
       if (logFlushTimerRef.current) clearInterval(logFlushTimerRef.current);
@@ -7001,7 +7151,7 @@ export default function App() {
         }
       } catch {}
     };
-    const id = setInterval(sweep, 15000);
+    const id = setInterval(sweep, AUTO_TUNE_SWEEP_INTERVAL_MS);
     return () => clearInterval(id);
   }, [
     settings.autoTuneEnabled,
@@ -7401,7 +7551,7 @@ export default function App() {
       }
     };
     tick();
-    exitTimerRef.current = setInterval(tick, TP_STEP_INTERVAL_MS);
+    exitTimerRef.current = setInterval(tick, EXIT_MANAGER_INTERVAL_MS);
     return () => {
       cancelled = true;
       if (exitTimerRef.current) clearInterval(exitTimerRef.current);
@@ -7441,6 +7591,14 @@ export default function App() {
 
   const okWindowMs = Math.max(effectiveSettings.scanMs * 3, 6000);
   const statusColor = isLoading ? '#7fd180' : !lastScanAt ? '#9aa0a6' : Date.now() - lastScanAt < okWindowMs ? '#7fd180' : '#f7b801';
+  const authRequired = connectivity.authRequired === true;
+  const tokenMissing = authRequired && !API_TOKEN;
+  const tokenMismatch = connectivity.lastStatus === 401 && API_TOKEN;
+  const connectionBanner = tokenMissing
+    ? 'Backend requires API_TOKEN but app has none.'
+    : tokenMismatch
+      ? `Token mismatch — ${BACKEND_BASE_URL} (API_TOKEN set: yes)`
+      : null;
 
   const bump = (key, delta, opts = {}) => {
     setSettings((s) => ({ ...s, [key]: clamp((s[key] ?? 0) + delta, opts.min ?? -1e9, opts.max ?? 1e9) }));
@@ -7584,6 +7742,46 @@ export default function App() {
           {notification && (
             <View style={styles.topBanner}>
               <Text style={styles.topBannerText}>{notification}</Text>
+            </View>
+          )}
+          {connectionBanner && (
+            <View style={styles.topBanner}>
+              <Text style={styles.topBannerText}>{connectionBanner}</Text>
+            </View>
+          )}
+        </View>
+
+        <View style={styles.connectionPanel}>
+          <View style={styles.connectionRow}>
+            <Text style={styles.connectionLabel}>Backend</Text>
+            <Text style={styles.connectionValue}>{BACKEND_BASE_URL}</Text>
+          </View>
+          <View style={styles.connectionRow}>
+            <Text style={styles.connectionLabel}>Reachable</Text>
+            <Text style={styles.connectionValue}>
+              {connectivity.backendReachable == null ? '—' : connectivity.backendReachable ? 'yes' : 'no'}
+            </Text>
+          </View>
+          <View style={styles.connectionRow}>
+            <Text style={styles.connectionLabel}>Auth required</Text>
+            <Text style={styles.connectionValue}>
+              {connectivity.authRequired == null ? '—' : connectivity.authRequired ? 'yes' : 'no'}
+            </Text>
+          </View>
+          <View style={styles.connectionRow}>
+            <Text style={styles.connectionLabel}>API_TOKEN set</Text>
+            <Text style={styles.connectionValue}>{API_TOKEN ? 'yes' : 'no'}</Text>
+          </View>
+          <View style={styles.connectionRow}>
+            <Text style={styles.connectionLabel}>Last error</Text>
+            <Text style={styles.connectionValue}>
+              {connectivity.lastError ? connectivity.lastError : '—'}
+            </Text>
+          </View>
+          {USING_HOSTED_BACKEND && (
+            <View style={styles.connectionRow}>
+              <Text style={styles.connectionLabel}>Hosted</Text>
+              <Text style={styles.connectionValue}>Using hosted backend</Text>
             </View>
           )}
         </View>
@@ -7743,6 +7941,15 @@ const styles = StyleSheet.create({
   dot: { color: '#657788', fontWeight: '800' },
   topBanner: { marginTop: 6, paddingVertical: 6, paddingHorizontal: 10, backgroundColor: '#ead5ff', borderRadius: 8, width: '100%' },
   topBannerText: { color: '#355070', textAlign: 'center', fontWeight: '700', fontSize: 12 },
+  connectionPanel: {
+    backgroundColor: '#121824',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 12,
+  },
+  connectionRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 },
+  connectionLabel: { fontSize: 11, color: '#a4b2c5', fontWeight: '600' },
+  connectionValue: { fontSize: 11, color: '#e1e8f0', flexShrink: 1, textAlign: 'right', marginLeft: 8 },
 
   accountSnapshot: {
     backgroundColor: '#ffffff',
