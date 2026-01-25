@@ -81,6 +81,35 @@ const VERSION =
   process.env.COMMIT_SHA ||
   'dev';
 
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection', reason);
+});
+
+process.on('uncaughtException', (error) => {
+  console.error('uncaughtException', error);
+});
+
+const HEARTBEAT_INTERVAL_MS = 60000;
+setInterval(() => {
+  console.log('backend_heartbeat', { ts: new Date().toISOString() });
+}, HEARTBEAT_INTERVAL_MS);
+
+const PUBLIC_BASE_URL = String(process.env.PUBLIC_BASE_URL || '').trim();
+const KEEPALIVE_INTERVAL_MS = 4 * 60 * 1000;
+if (PUBLIC_BASE_URL) {
+  const keepaliveUrl = `${PUBLIC_BASE_URL.replace(/\/+$/, '')}/health`;
+  setInterval(async () => {
+    try {
+      const res = await fetch(keepaliveUrl, { method: 'GET' });
+      if (!res?.ok) {
+        throw new Error(`status_${res?.status || 'unknown'}`);
+      }
+    } catch (error) {
+      console.warn('keepalive_failed', { error: error?.message || error, url: keepaliveUrl });
+    }
+  }, KEEPALIVE_INTERVAL_MS);
+}
+
 function extractOrderSummary(order) {
   if (!order) {
     return { orderId: null, status: null, submittedAt: null };
