@@ -25,7 +25,7 @@ Setup
 
 npm install
 
-Copy .env.example to .env.local
+Copy .env.example to .env or .env.local
 
 Start backend (Node.js Express server)
 

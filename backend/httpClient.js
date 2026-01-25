@@ -3,6 +3,11 @@ const { alpacaLimiter, quoteLimiter } = require('./limiters');
 const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_RETRIES = 2;
 
+const getDefaultTimeoutMs = () => {
+  const value = Number(process.env.HTTP_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_TIMEOUT_MS;
+};
+
 function parseUrlDetails(url) {
   try {
     const parsed = new URL(url);
@@ -204,7 +209,7 @@ async function httpJson({
   url,
   headers,
   body,
-  timeoutMs = DEFAULT_TIMEOUT_MS,
+  timeoutMs = getDefaultTimeoutMs(),
   retries = DEFAULT_RETRIES,
 } = {}) {
   const limiter = getLimiterForUrl(url);

@@ -4,6 +4,8 @@ const express = require('express');
 const cors = require('cors');
 const { requireApiToken } = require('./auth');
 const { rateLimit } = require('./rateLimit');
+const { validateEnv } = require('./config/validateEnv');
+const { corsOptionsDelegate } = require('./middleware/corsPolicy');
 
 const {
   placeMakerLimitBuyThenSell,
@@ -45,29 +47,25 @@ const {
 const { getLimiterStatus } = require('./limiters');
 const { getFailureSnapshot } = require('./symbolFailures');
 
+validateEnv();
+
 const app = express();
 
 app.set('trust proxy', 1);
 
-const allowedOrigins = String(process.env.CORS_ALLOWED_ORIGINS || '')
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) {
-      return callback(null, true);
-    }
-    if (!allowedOrigins.length) {
-      return callback(null, true);
-    }
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error('Not allowed by CORS'));
-  },
-}));
+app.use(cors({ origin: corsOptionsDelegate }));
+app.use((err, req, res, next) => {
+  if (err?.cors) {
+    res.status(403).json({
+      ok: false,
+      error: 'cors_blocked',
+      origin: err.cors.origin,
+      hint: 'Update CORS_ALLOWED_ORIGINS/CORS_ALLOWED_ORIGIN_REGEX or set CORS_ALLOW_LAN=true.',
+    });
+    return;
+  }
+  next(err);
+});
 app.use(express.json({ limit: '100kb' }));
 
 const apiToken = String(process.env.API_TOKEN || '').trim();
@@ -121,7 +119,7 @@ function extractOrderSummary(order) {
 }
 
 app.use((req, res, next) => {
-  if (req.method === 'GET' && req.path === '/health') {
+  if (req.method === 'GET' && (req.path === '/health' || req.path === '/debug/auth')) {
     return next();
   }
   return rateLimit(req, res, next);
@@ -131,7 +129,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
     return next();
   }
-  if (req.method === 'GET' && req.path === '/health') {
+  if (req.method === 'GET' && (req.path === '/health' || req.path === '/debug/auth')) {
     return next();
   }
   return requireApiToken(req, res, next);
@@ -139,6 +137,15 @@ app.use((req, res, next) => {
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, ts: new Date().toISOString(), version: VERSION });
+});
+
+app.get('/debug/auth', (req, res) => {
+  res.json({
+    ok: true,
+    apiTokenSet: Boolean(String(process.env.API_TOKEN || '').trim()),
+    version: VERSION,
+    serverTime: new Date().toISOString(),
+  });
 });
 
 app.get('/account', async (req, res) => {
