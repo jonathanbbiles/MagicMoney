@@ -380,35 +380,57 @@ function microMetrics({ mid, prevMid, spreadBps }) {
 async function computeEntrySignal(symbol) {
   const asset = { symbol: normalizeSymbol(symbol) };
   const riskLvl = clamp(Math.round(RISK_LEVEL), 0, 4);
+  let orderbookFallbackUsed = false;
   let quote;
   try {
     quote = await getLatestQuote(asset.symbol, { maxAgeMs: ENTRY_QUOTE_MAX_AGE_MS });
   } catch (err) {
-    return { entryReady: false, why: 'stale_quote', meta: { symbol: asset.symbol, error: err?.message || err } };
+    return {
+      entryReady: false,
+      why: 'stale_quote',
+      meta: { symbol: asset.symbol, error: err?.message || err },
+      orderbookFallbackUsed,
+    };
   }
 
   const bid = Number(quote.bid);
   const ask = Number(quote.ask);
   const mid = Number.isFinite(bid) && Number.isFinite(ask) ? (bid + ask) / 2 : Number(quote.mid || bid || ask);
   if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || !Number.isFinite(mid)) {
-    return { entryReady: false, why: 'invalid_quote', meta: { symbol: asset.symbol, bid, ask } };
+    return {
+      entryReady: false,
+      why: 'invalid_quote',
+      meta: { symbol: asset.symbol, bid, ask },
+      orderbookFallbackUsed,
+    };
   }
 
   const spreadBps = ((ask - bid) / mid) * BPS;
   if (SIMPLE_SCALPER_ENABLED) {
     if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_SIMPLE) {
-      return { entryReady: false, why: 'spread_gate', meta: { symbol: asset.symbol, spreadBps } };
+      return {
+        entryReady: false,
+        why: 'spread_gate',
+        meta: { symbol: asset.symbol, spreadBps },
+        orderbookFallbackUsed,
+      };
     }
     return {
       entryReady: true,
       symbol: asset.symbol,
       spreadBps,
       meta: { spreadBps },
+      orderbookFallbackUsed,
     };
   }
 
   if (Number.isFinite(spreadBps) && spreadBps > MAX_SPREAD_BPS_TO_TRADE) {
-    return { entryReady: false, why: 'spread_gate', meta: { symbol: asset.symbol, spreadBps } };
+    return {
+      entryReady: false,
+      why: 'spread_gate',
+      meta: { symbol: asset.symbol, spreadBps },
+      orderbookFallbackUsed,
+    };
   }
 
   let orderbookMeta = null;
@@ -419,6 +441,7 @@ async function computeEntrySignal(symbol) {
     try {
       const ob = await getLatestOrderbook(asset.symbol, { maxAgeMs: ORDERBOOK_MAX_AGE_MS });
       if (ob?._synthetic) {
+        orderbookFallbackUsed = true;
         orderbookMeta = { ok: true, reason: 'orderbook_quote_fallback', synthetic: true };
         const syntheticBid = Number(ob?.bids?.[0]?.p ?? ob?.bids?.[0]?.price);
         const syntheticAsk = Number(ob?.asks?.[0]?.p ?? ob?.asks?.[0]?.price);
@@ -435,6 +458,7 @@ async function computeEntrySignal(symbol) {
               entryReady: false,
               why: 'spread_gate',
               meta: { symbol: asset.symbol, spreadBps: syntheticSpreadBps, orderbookFallback: true },
+              orderbookFallbackUsed,
             };
           }
         }
@@ -449,6 +473,7 @@ async function computeEntrySignal(symbol) {
             entryReady: false,
             why: 'orderbook_liquidity_gate',
             meta: { symbol: asset.symbol, spreadBps, ...m },
+            orderbookFallbackUsed,
           };
         }
       }
@@ -457,6 +482,7 @@ async function computeEntrySignal(symbol) {
         entryReady: false,
         why: 'orderbook_unavailable',
         meta: { symbol: asset.symbol, spreadBps, error: err?.message || String(err) },
+        orderbookFallbackUsed,
       };
     }
   }
@@ -465,7 +491,12 @@ async function computeEntrySignal(symbol) {
   try {
     bars = await fetchCryptoBars({ symbols: [asset.symbol], limit: 16, timeframe: '1Min' });
   } catch (err) {
-    return { entryReady: false, why: 'bars_unavailable', meta: { symbol: asset.symbol, error: err?.message || err } };
+    return {
+      entryReady: false,
+      why: 'bars_unavailable',
+      meta: { symbol: asset.symbol, error: err?.message || err },
+      orderbookFallbackUsed,
+    };
   }
 
   const barKey = normalizeSymbol(asset.symbol);
@@ -475,7 +506,12 @@ async function computeEntrySignal(symbol) {
   ).filter((value) => Number.isFinite(value) && value > 0);
 
   if (closes.length < 3) {
-    return { entryReady: false, why: 'insufficient_bars', meta: { symbol: asset.symbol, barCount: closes.length } };
+    return {
+      entryReady: false,
+      why: 'insufficient_bars',
+      meta: { symbol: asset.symbol, barCount: closes.length },
+      orderbookFallbackUsed,
+    };
   }
 
   const sigmaRawBps = ewmaSigmaFromCloses(closes, VOL_HALF_LIFE_MIN);
@@ -534,6 +570,7 @@ async function computeEntrySignal(symbol) {
       entryReady: false,
       why: 'ev_guard',
       meta: { symbol: asset.symbol, expectedBps, pUp, requiredGrossExitBps, stopBps },
+      orderbookFallbackUsed,
     };
   }
 
@@ -571,6 +608,7 @@ async function computeEntrySignal(symbol) {
       orderbookImpactBpsBuy: orderbookMeta?.impactBpsBuy,
       orderbookImbalance: orderbookMeta?.imbalance,
     },
+    orderbookFallbackUsed,
   };
 }
 
@@ -593,6 +631,8 @@ const inFlightBySymbol = new Map();
 const cfeeCache = { ts: 0, items: [] };
 const quoteCache = new Map();
 const orderbookCache = new Map(); // symbol -> { tsMs, receivedAtMs, asks, bids }
+const orderbookFallbackLogAtBySymbol = new Map();
+const ORDERBOOK_FALLBACK_LOG_THROTTLE_MS = 60000;
 const QUOTE_FAILURE_WINDOW_MS = 120000;
 const QUOTE_FAILURE_THRESHOLD = 3;
 const QUOTE_COOLDOWN_MS = 300000;
@@ -2972,14 +3012,52 @@ async function getLatestOrderbook(symbol, { maxAgeMs }) {
 
   const resp = await fetchLatestOrderbookBatch({ symbols: [symbol] });
   const obResult = resp?.[symbol] || null;
-  if (!obResult?.ok) {
-    throw new Error(`Orderbook missing levels for ${symbol}`);
-  }
   const book = obResult.orderbookRaw || null;
 
   const asks = Array.isArray(book?.a) ? book.a : [];
   const bids = Array.isArray(book?.b) ? book.b : [];
   const tsMs = normalizeOrderbookTimestampMs(book, resp);
+
+  const needsFallback = !obResult?.ok || !asks.length || !bids.length || !Number.isFinite(tsMs);
+  if (needsFallback) {
+    try {
+      const fallbackQuote = await getLatestQuoteFromQuotesOnly(symbol, {
+        maxAgeMs: Number.isFinite(maxAgeMs) ? Math.max(maxAgeMs, MAX_QUOTE_AGE_MS) : MAX_QUOTE_AGE_MS,
+      });
+      const bid = Number(fallbackQuote.bid);
+      const ask = Number(fallbackQuote.ask);
+      if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+        const tsMsFallback = Number.isFinite(fallbackQuote.tsMs) ? fallbackQuote.tsMs : now;
+        const syntheticOb = {
+          asks: [{ p: ask, s: 1 }],
+          bids: [{ p: bid, s: 1 }],
+          tsMs: tsMsFallback,
+          receivedAtMs: now,
+          _synthetic: true,
+          _source: 'quote_fallback',
+          source: 'quote_fallback',
+          ok: true,
+          symbol,
+          ob: {
+            asks: [{ p: ask, s: 1 }],
+            bids: [{ p: bid, s: 1 }],
+            tsMs: tsMsFallback,
+            source: 'quote_fallback',
+          },
+          isFallback: true,
+        };
+        const lastLogAt = orderbookFallbackLogAtBySymbol.get(symbol) || 0;
+        if (now - lastLogAt >= ORDERBOOK_FALLBACK_LOG_THROTTLE_MS) {
+          console.log('orderbook_fallback_quote', { symbol, bid, ask });
+          orderbookFallbackLogAtBySymbol.set(symbol, now);
+        }
+        orderbookCache.set(symbol, syntheticOb);
+        return syntheticOb;
+      }
+    } catch (err) {
+      // Fall through to default error handling.
+    }
+  }
 
   if (!asks.length || !bids.length) throw new Error(`Orderbook missing levels for ${symbol}`);
   if (!Number.isFinite(tsMs)) throw new Error(`Orderbook timestamp missing for ${symbol}`);
@@ -5800,6 +5878,7 @@ async function runEntryScanOnce() {
           scanned: 0,
           placed: 0,
           skipped: 1,
+          orderbookFallbackUsedCount: 0,
           topSkipReasons: { halted_orphans: 1 },
         });
         return;
@@ -5863,6 +5942,7 @@ async function runEntryScanOnce() {
     let skipped = 0;
     let attempts = 0;
     const skipCounts = new Map();
+    let orderbookFallbackUsedCount = 0;
 
     for (const symbol of scanSymbols) {
       if (attempts >= maxAttemptsPerScan) {
@@ -5900,6 +5980,9 @@ async function runEntryScanOnce() {
       const signal = await computeEntrySignal(symbol);
       if (DEBUG_ENTRY) {
         console.log('entry_signal', { symbol, entryReady: signal.entryReady, why: signal.why, meta: signal.meta });
+      }
+      if (signal?.orderbookFallbackUsed) {
+        orderbookFallbackUsedCount += 1;
       }
       if (!signal.entryReady) {
         skipped += 1;
@@ -5945,6 +6028,7 @@ async function runEntryScanOnce() {
       scanned,
       placed,
       skipped,
+      orderbookFallbackUsedCount,
       topSkipReasons,
     });
   } finally {
