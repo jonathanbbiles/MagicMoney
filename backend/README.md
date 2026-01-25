@@ -38,6 +38,18 @@ Optional:
 - `CRYPTO_QUOTE_MAX_AGE_MS` (default `600000`, overrides quote/trade staleness checks for crypto only; stock quotes remain strict)
 - `DATASET_DIR` (path for persisted dataset/output files, if used)
 
+## Trading Gates
+
+Entries are filtered by multiple hard gates before any order is placed:
+- Spread gate (skip if spread is wider than the configured maximum)
+- Orderbook gate (skip if depth/impact fails configured thresholds)
+- Probability + EV gates (skip if `pUp` is below `PUP_MIN` or if expected value is below `EV_MIN_BPS` when enabled)
+- Required gross exit cap (skip if the modeled required gross take-profit exceeds `MAX_REQUIRED_GROSS_EXIT_BPS`)
+
+## Exit Policy
+
+After a buy fills, the bot immediately attaches a limit sell with a target equal to estimated round-trip fees plus `EXIT_FIXED_NET_PROFIT_BPS` (default 5 bps). Optional refresh logic can cancel and reprice stale exit orders when `EXIT_REFRESH_ENABLED` is on.
+
 ## Notes
 
 - `GET /health` remains public for uptime checks.
